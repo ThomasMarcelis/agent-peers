@@ -247,3 +247,75 @@ test("an unverified listener at the deterministic inbox pathname is never overwr
     assert.equal(existsSync(f.registry), false);
   } finally { await new Promise((resolve) => occupied.close(resolve)); }
 });
+
+
+test("a live legacy registry cannot be taken over until its process exits", async (t) => {
+  const f = await fixture(t), legacy = await f.start();
+  await legacy.call("list_peers");
+  const record = JSON.parse(readFileSync(f.registry, "utf8")), socket = peerSocket(record.address);
+  const identity = lstatSync(socket);
+  delete record.addresses;
+  writeFileSync(f.registry, JSON.stringify(record));
+  const replacement = await f.start();
+  const refused = await replacement.call("send_peer", { to: "claude:test", message: "too early" });
+  assert.equal(refused.isError, true);
+  assert.match(refused.content[0].text, /legacy agent-peers inbox still running/);
+  assert.equal(lstatSync(socket).ino, identity.ino);
+  assert.equal(JSON.parse(readFileSync(f.registry, "utf8")).pid, legacy.transport.pid);
+  await legacy.close();
+  const retried = await replacement.call("send_peer", { to: "claude:test", message: "after exit" });
+  assert.match(retried.content[0].text, /Delivered/);
+});
+
+test("a missing primary repairs on the next tool call only while its registry token is current", async (t) => {
+  const f = await fixture(t), peer = await f.start();
+  await peer.call("list_peers");
+  const record = JSON.parse(readFileSync(f.registry, "utf8")), socket = peerSocket(record.address);
+  rmSync(socket);
+  const repaired = await peer.call("list_peers");
+  assert.doesNotMatch(repaired.content[0].text, /replaced/);
+  assert.equal(lstatSync(socket).isSocket(), true);
+  assert.equal(JSON.parse(readFileSync(f.registry, "utf8")).token, record.token);
+  const sent = await peer.call("send_peer", { to: "claude:test", message: "after repair" });
+  assert.match(sent.content[0].text, /Delivered/);
+  await post(socket, messageLine({ from: address(f.inbox), body: "repaired primary receives" }));
+  await until(() => f.turns.length === 1);
+  rmSync(socket);
+  writeFileSync(f.registry, JSON.stringify({ ...record, token: "a-new-owner" }));
+  const superseded = await peer.call("send_peer", { to: "claude:test", message: "must not rebind" });
+  assert.equal(superseded.isError, true);
+  assert.match(superseded.content[0].text, /replaced/);
+  assert.equal(existsSync(socket), false);
+});
+
+test("refresh takes over prior permitted aliases without live Claude records, and missing aliases repair", async (t) => {
+  const f = await fixture(t), previousTmpdir = process.env.TMPDIR;
+  process.env.TMPDIR = f.dir;
+  t.after(() => { previousTmpdir === undefined ? delete process.env.TMPDIR : process.env.TMPDIR = previousTmpdir; });
+  const hiddenDir = join(f.dir, "cc-socks"); mkdirSync(hiddenDir, { mode: 0o700 });
+  const destination = join(hiddenDir, "hermes-hidden.sock");
+  const receiver = createServer((connection) => readLines(connection, (line) => {
+    void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "delivered" }).catch(() => {});
+  }));
+  receiver.listen(destination); await once(receiver, "listening");
+  try {
+    const old = await f.start(); await old.call("list_peers");
+    await old.call("send_peer", { to: address(destination), message: "create a non-live-directory alias" });
+    const previous = JSON.parse(readFileSync(f.registry, "utf8"));
+    const alias = previous.addresses.find((addr) => dirname(peerSocket(addr)) === hiddenDir), socket = peerSocket(alias);
+    const original = lstatSync(socket);
+    const current = await f.start(); await current.call("list_peers");
+    assert.notEqual(lstatSync(socket).ino, original.ino, "prior alias is replaced before an outgoing send");
+    assert.ok(JSON.parse(readFileSync(f.registry, "utf8")).addresses.includes(alias));
+    await old.close();
+    await post(socket, messageLine({ from: address(destination), body: "eager alias receives" }));
+    await until(() => f.turns.length === 1);
+    rmSync(socket);
+    await current.call("list_peers");
+    assert.equal(lstatSync(socket).isSocket(), true);
+    await post(socket, messageLine({ from: address(destination), body: "repaired alias receives" }));
+    await until(() => f.turns.length === 2);
+    const result = await current.call("send_peer", { to: address(destination), message: "after alias repair" });
+    assert.match(result.content[0].text, /Delivered/);
+  } finally { await new Promise((resolve) => receiver.close(resolve)); }
+});

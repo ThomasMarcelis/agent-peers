@@ -44,7 +44,14 @@ const bind = (meta) => (binding = binding.then(() => bindNow(meta), () => bindNo
 async function bindNow(meta) {
   const threadId = meta?.threadId;
   if (!validThreadId(threadId)) throw new Error("Codex did not identify this session with a valid thread ID");
-  if (self?.threadId === threadId) return self;
+  if (self?.threadId === threadId) {
+    if (!self.subagent) {
+      const caller = self;
+      await inboxFor(caller, dirname(caller.socket));
+      for (const directory of caller.inboxes.keys()) await inboxFor(caller, directory);
+    }
+    return self;
+  }
   unbind();
   // Delivery goes through the shared app-server daemon. A Codex started with -c overrides or
   // --no-daemon hosts its thread in its own embedded server, which peers cannot reach.
@@ -82,6 +89,9 @@ async function bindNow(meta) {
     const entry = readPeerRecord(registry);
     if (entry.threadId === threadId && isSafePeerRecord(entry) && alive(entry.pid) && basename(peerSocket(entry.address)) === filename) previous = entry;
   } catch {}
+  if (previous && !Array.isArray(previous.addresses)) {
+    throw new Error("legacy agent-peers inbox still running; retry after it exits");
+  }
   dropDeadOwners();
   // An MCP refresh preserves the primary public address even if a newer Claude changed
   // the preferred directory. Additional deterministic aliases preserve older reply paths.
@@ -97,7 +107,11 @@ async function bindNow(meta) {
   self = caller;
   try { publishRegistry(caller); }
   catch (error) { unbind(); throw error; }
-  for (const dir of socketDirectories().slice(0, INBOXES_MAX)) {
+  const previousDirectories = (previous?.addresses ?? []).flatMap((addr) => {
+    const socket = peerSocket(addr);
+    return socket ? [dirname(socket)] : [];
+  });
+  for (const dir of [...new Set([...previousDirectories, ...socketDirectories()])].slice(0, INBOXES_MAX)) {
     try { await inboxFor(caller, dir); }
     catch (error) { log(`could not create inbox alias in ${dir}:`, error.message); }
   }
@@ -116,7 +130,7 @@ function publishRegistry(caller) {
   } finally { rmSync(temporary, { force: true }); }
 }
 
-async function createInbox(caller, directory) {
+async function createInbox(caller, directory, { requireMissing = false } = {}) {
   const socket = join(directory, caller.filename);
   const temporary = join(directory, `.ap-${randomUUID().slice(0, 8)}.sock`);
   if ([socket, temporary].some((path) => Buffer.byteLength(path) > MAX_SOCKET_PATH)) {
@@ -151,6 +165,13 @@ async function createInbox(caller, directory) {
     });
     chmodSync(temporary, 0o600);
     inbox.identity = lstatSync(temporary);
+    if (requireMissing) {
+      if (!ownsRegistry(caller)) throw new Error("this inbox was replaced; restart this MCP connection");
+      try {
+        lstatSync(socket);
+        throw new Error("this inbox was replaced; restart this MCP connection");
+      } catch (error) { if (error.code !== "ENOENT") throw error; }
+    }
     renameSync(temporary, socket);
     return inbox;
   } catch (error) {
@@ -161,17 +182,55 @@ async function createInbox(caller, directory) {
   }
 }
 
+function ownsRegistry(caller) {
+  try {
+    const entry = readPeerRecord(caller.registry);
+    return entry.pid === process.pid && entry.token === caller.token &&
+      entry.threadId === caller.threadId && entry.address === caller.address;
+  } catch { return false; }
+}
+
+async function repairInbox(caller, directory) {
+  const current = caller.inboxes.get(directory);
+  if (!current) return undefined;
+  if (ownsSocket(current)) return current;
+  // A replaced socket belongs to another listener. Only a genuinely missing endpoint,
+  // with this sidecar's registry token still current, is eligible for repair.
+  if (self !== caller || !ownsRegistry(caller)) throw new Error("this inbox was replaced; restart this MCP connection");
+  try {
+    lstatSync(current.socket);
+    throw new Error("this inbox was replaced; restart this MCP connection");
+  } catch (error) { if (error.code !== "ENOENT") throw error; }
+  closeInbox(current);
+  const repaired = await createInbox(caller, directory, { requireMissing: true });
+  if (self !== caller || !ownsRegistry(caller)) {
+    closeInbox(repaired);
+    throw new Error("this inbox was replaced; restart this MCP connection");
+  }
+  const primary = directory === dirname(caller.socket);
+  caller.inboxes.set(directory, repaired);
+  if (primary) Object.assign(caller, repaired);
+  try { publishRegistry(caller); }
+  catch (error) {
+    closeInbox(repaired);
+    caller.inboxes.set(directory, current);
+    if (primary) Object.assign(caller, current);
+    throw error;
+  }
+  log(`repaired missing inbox at ${repaired.socket}`);
+  return repaired;
+}
+
 function inboxFor(caller, directory) {
   const bind = async () => {
-    if (self !== caller || !ownsSocket(caller)) throw new Error("this inbox was replaced; restart this MCP connection");
-    const current = caller.inboxes.get(directory);
-    if (current) {
-      if (!ownsSocket(current)) throw new Error("this reply inbox was replaced; restart this MCP connection");
-      return current;
-    }
+    if (self !== caller || !ownsRegistry(caller)) throw new Error("this inbox was replaced; restart this MCP connection");
+    await repairInbox(caller, dirname(caller.socket));
+    if (!ownsSocket(caller)) throw new Error("this inbox was replaced; restart this MCP connection");
+    const current = await repairInbox(caller, directory);
+    if (current) return current;
     if (caller.inboxes.size >= INBOXES_MAX) throw new Error("too many Codex reply inbox directories");
     const inbox = await createInbox(caller, directory);
-    if (self !== caller || !ownsSocket(caller)) {
+    if (self !== caller || !ownsSocket(caller) || !ownsRegistry(caller)) {
       closeInbox(inbox);
       throw new Error("this inbox was replaced; restart this MCP connection");
     }

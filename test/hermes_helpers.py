@@ -17,7 +17,8 @@ ROOT = Path(__file__).resolve().parent.parent
 def network(tmp_path, monkeypatch):
     # A short socket directory matters on Linux (AF_UNIX's pathname limit is 108 bytes).
     import tempfile
-    with tempfile.TemporaryDirectory(prefix="ap-") as short:
+    # Hermes can change tempfile.tempdir after importing its host modules.
+    with tempfile.TemporaryDirectory(prefix="ap-", dir="/tmp") as short:
         sockets = Path(short)
         claude = tmp_path / "claude"
         (claude / "sessions").mkdir(parents=True)
@@ -77,4 +78,3 @@ def reply(from_address, to_address, body="reply to Hermes"):
                 f"{body}\n</cross-session-message>"
             )},
         }) + "\n").encode())
-
