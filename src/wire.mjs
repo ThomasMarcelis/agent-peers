@@ -41,6 +41,13 @@ export const address = (path) =>
   "uds:" + path.replace(/[^A-Za-z0-9:_/.\\-]/gu, (c) =>
     [...Buffer.from(c)].map((b) => "%" + b.toString(16).toUpperCase().padStart(2, "0")).join(""));
 
+// A reply address must name a socket in Claude's socket directory, as Claude itself requires.
+export function peerSocket(addr) {
+  if (typeof addr !== "string" || !/^uds:[A-Za-z0-9%:_/.\\-]{1,300}$/.test(addr)) return undefined;
+  const path = socketPath(addr);
+  return path.endsWith(".sock") && dirname(path) === socketDir() ? path : undefined;
+}
+
 export function socketPath(addr) {
   if (!addr.startsWith("uds:")) return undefined;
   try {
@@ -137,9 +144,11 @@ export function messageLine({ from, fromName, fromMode, body }) {
 // Claude closes connections that send no complete line within 30 seconds.
 export function post(socket, line) {
   const data = JSON.stringify(line) + "\n";
-  if (data.length > MAX_LINE) return Promise.reject(new Error(`message too large (${data.length} bytes)`));
+  const bytes = Buffer.byteLength(data);
+  if (bytes > MAX_LINE) return Promise.reject(new Error(`message too large (${bytes} bytes)`));
   return new Promise((resolve, reject) => {
     const c = connect(socket);
+    c.setTimeout(5000, () => c.destroy(new Error("peer inbox did not accept the message within 5 s")));
     c.on("error", reject);
     c.on("connect", () => c.end(data, resolve));
   });
@@ -152,7 +161,7 @@ export function readLines(conn, onLine) {
   conn.setTimeout(30_000, () => conn.destroy());
   conn.on("data", (d) => {
     buf += d;
-    if (buf.length > MAX_LINE) return conn.destroy();
+    if (Buffer.byteLength(buf) > MAX_LINE) return conn.destroy();
     let i;
     while ((i = buf.indexOf("\n")) >= 0) {
       const raw = buf.slice(0, i);

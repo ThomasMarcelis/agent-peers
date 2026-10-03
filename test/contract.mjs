@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Contract test for the two undocumented surfaces agent-peers relies on: Claude Code's inbox
-// line format and Codex's thread/inject_items. Run it after upgrading either CLI.
+// line format and steering a Codex thread with app-server turn/start. Run it after upgrading
+// either CLI.
 //
 // It starts its own Codex app-server (with codex-peer as an MCP server) and a throwaway
 // `claude -p`, and never touches other sessions. It spends a few model turns on each side.
@@ -13,7 +14,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AppServer } from "../src/app-server.mjs";
-import { address, envelope, escapeBody, messageLine, parseEnvelope, post, readLines, socketDir } from "../src/wire.mjs";
+import { address, envelope, escapeBody, messageLine, parseEnvelope, peerSocket, post, readLines, socketDir } from "../src/wire.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const tmp = mkdtempSync(join(tmpdir(), "agent-peers-contract-"));
@@ -68,6 +69,9 @@ step("envelope escapes a closing tag in the body and parses back");
   assert.equal(parseEnvelope(env).body, escapeBody(body));
   assert.match(escapeBody(body), /<\\\/cross-session-message>/);
   assert.equal(escapeBody("a < b </div>"), "a < b </div>");
+  assert.ok(peerSocket(address(join(socketDir(), "codex-0123456789abcdef.sock"))));
+  assert.equal(peerSocket('uds:/x" reply_to="evil.sock'), undefined);
+  assert.equal(peerSocket("uds:/etc/passwd.sock"), undefined);
 }
 
 // --- 2. Codex inbox: busy and idle delivery, reply via send_peer ------------------------------
@@ -131,6 +135,7 @@ await until("busy turn", () => active === t2, 30_000);
 await sleep(3000);
 await post(codexPeer.address.slice(4), ask("KIWI-9"));
 const r1 = await until("KIWI-9 reply", () => replied("KIWI-9"));
+assert.ok(!completed.has(t2), "the busy turn answered the peer before it finished, so it was steered");
 assert.equal(r1.from, codexPeer.address);
 assert.equal(r1.fromName, codexPeer.name);
 await until("busy turn completion", () => completed.has(t2));
@@ -175,7 +180,7 @@ const results = transcript.split("\n").map((l) => { try { return JSON.parse(l); 
 assert.ok(results.some((r) => r.result?.includes("PLUM-2")), "Codex's reply reached Claude");
 const toClaude = events.find((m) => m.method === "item/completed" && m.params.item.tool === "send_peer" &&
   m.params.item.arguments.to === address(claudeSocket));
-assert.match(toClaude?.params.item.result?.content?.[0]?.text ?? "", /^Sent to/, "Codex answered Claude with send_peer");
+assert.match(toClaude?.params.item.result?.content?.[0]?.text ?? "", /^Delivered to/, "Codex answered Claude with send_peer");
 
 console.log("\ncontract OK");
 process.exit(0);

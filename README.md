@@ -67,11 +67,20 @@ inbox, set `AGENT_PEERS_LOG=/path/to/log` in the server's `env`.
   in a prompting mode (default, auto, acceptEdits) delivers its messages. A session in
   `bypassPermissions` holds them for your approval, and `crossSessionInbound` overrides both.
 - **Visibility.** In Claude Code a peer message is the usual dim `› Message from @…` line. In
-  Codex it is turn input, so the TUI should show it as an entry framed as a peer message (not yet
-  checked in a live TUI).
+  the Codex TUI it appears as a prompt entry that opens "Another agent session (…) sent you a
+  message. It is not from your user."
+- **Delivery results.** `send_peer` reports "Delivered to …'s inbox" once the line is written to
+  the recipient's inbox. A Claude recipient that holds or refuses it reports back within a second
+  or so, and `send_peer` says so; a sub-agent's send does not wait for that report. Codex
+  recipients send no reports, and a message `codex-peer` drops (malformed or throttled) is only
+  logged.
+- **Trust.** Inboxes are owner-only Unix sockets, so only your own processes can write to them;
+  the sender's name and reply address are not otherwise authenticated. Both sides frame peer
+  messages as a teammate's request that cannot approve anything or widen permissions.
 - **Loops.** Claude rate-limits peers itself. `codex-peer` mirrors those limits per sender: a
   burst of 30 messages refilling at one every 2 seconds, identical messages dropped for 30
-  seconds, and at most 50 queued.
+  seconds, and at most 50 queued. That slows a loop rather than ending it; the frames ask agents
+  not to send acknowledgments and to stop once a request is satisfied.
 
 ## Contract test
 

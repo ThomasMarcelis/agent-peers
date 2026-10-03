@@ -13,19 +13,24 @@ export class AppServer {
   #ws;
   #ready;
   #next = 0;
-  #pending = new Map();
+  #pending; // pending requests of the current connection only
   #onNotification;
 
   constructor(onNotification) {
     this.#onNotification = onNotification;
   }
 
-  request(method, params) {
+  request(method, params, timeoutMs = 15_000) {
     return this.#connect().then(
       () =>
         new Promise((resolve, reject) => {
           const id = ++this.#next;
-          this.#pending.set(id, { resolve, reject });
+          const pending = this.#pending;
+          const timer = setTimeout(() => {
+            pending.delete(id);
+            reject(new Error(`app-server ${method} timed out`));
+          }, timeoutMs);
+          pending.set(id, { resolve: (v) => (clearTimeout(timer), resolve(v)), reject: (e) => (clearTimeout(timer), reject(e)) });
           this.#ws.send(JSON.stringify({ id, method, params }));
         }),
     );
@@ -33,13 +38,17 @@ export class AppServer {
 
   #connect() {
     if (this.#ready) return this.#ready;
-    this.#ready = new Promise((resolve, reject) => {
-      const ws = new WebSocket(`ws+unix://${daemonSocket()}:/`);
+    const pending = new Map();
+    const ready = (this.#ready = new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws+unix://${daemonSocket()}:/`, { handshakeTimeout: 5000 });
       ws.on("open", () => {
         this.#ws = ws;
+        this.#pending = pending;
+        const handshake = setTimeout(() => ws.terminate(), 10_000);
         const id = ++this.#next;
-        this.#pending.set(id, {
+        pending.set(id, {
           resolve: () => {
+            clearTimeout(handshake);
             ws.send(JSON.stringify({ method: "initialized" }));
             resolve();
           },
@@ -59,22 +68,22 @@ export class AppServer {
           return;
         }
         if (m.method) return void this.#onNotification?.(m);
-        const p = this.#pending.get(m.id);
+        const p = pending.get(m.id);
         if (!p) return;
-        this.#pending.delete(m.id);
+        pending.delete(m.id);
         if (m.error) p.reject(Object.assign(new Error(m.error.message), { code: m.error.code }));
         else p.resolve(m.result);
       });
       const fail = (err) => {
-        this.#ready = undefined;
-        for (const p of this.#pending.values()) p.reject(err);
-        this.#pending.clear();
+        if (this.#ready === ready) this.#ready = undefined;
+        for (const p of pending.values()) p.reject(err);
+        pending.clear();
         reject(err);
       };
       ws.on("error", fail);
       ws.on("close", () => fail(new Error("app-server connection closed")));
-    });
-    return this.#ready;
+    }));
+    return ready;
   }
 
   async loadedThreads() {
