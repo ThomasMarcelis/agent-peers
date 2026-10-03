@@ -7,7 +7,7 @@ import { createServer } from "node:net";
 import { join } from "node:path";
 import { AppServer } from "./app-server.mjs";
 import {
-  MAX_LINE, address, allPeers, messageLine, parseEnvelope, peerSocket, post, readLines, socketDir,
+  MAX_LINE, MAX_SOCKET_PATH, address, allPeers, messageLine, parseEnvelope, peerSocket, post, readLines, socketDir,
 } from "./wire.mjs";
 
 const BUCKET = 30, REFILL_PER_S = 0.5, DEDUP_MS = 30_000, IDLE_MS = 600_000;
@@ -120,6 +120,9 @@ export class HermesBridge {
     }
     if (this.#routes.size >= SESSIONS_MAX) throw new Error("too many open Hermes conversation inboxes");
     const socket = join(socketDir(), `hermes-${randomUUID().replaceAll("-", "")}.sock`);
+    if (Buffer.byteLength(socket) > MAX_SOCKET_PATH) {
+      throw new Error("peer socket path exceeds the 103-byte Unix limit; use a shorter XDG_RUNTIME_DIR for all participating agents");
+    }
     const route = {
       session, name, socket, address: address(socket), closed: false, connections: new Set(),
       buckets: new Map(), recent: new Map(), pending: new Map(), queued: 0, chain: Promise.resolve(),
@@ -130,18 +133,22 @@ export class HermesBridge {
       conn.once("close", () => route.connections.delete(conn));
       readLines(conn, (line) => this.#receive(route, line));
     });
-    await new Promise((resolve, reject) => {
-      route.server.once("error", reject);
-      // Never unlink before binding, even in the unlikely event of an address collision.
-      route.server.listen(socket, resolve);
-    });
     route.server.on("error", (error) => this.#log(`inbox error: ${error.message}`));
-    route.owner = lstatSync(socket);
-    this.#routes.set(session, route);
     try {
+      await new Promise((resolve, reject) => {
+        route.server.once("error", reject);
+        // Never unlink before binding, even in the unlikely event of an address collision.
+        route.server.listen(socket, () => { route.server.off("error", reject); resolve(); });
+      });
+      route.owner = lstatSync(socket);
       chmodSync(socket, 0o600);
+      this.#routes.set(session, route);
     } catch (error) {
-      await this.#retire(route);
+      route.closed = true;
+      for (const conn of route.connections) conn.destroy();
+      // Binding is not yet published in #routes: clean the listener even if stat or
+      // chmod fails, otherwise close() cannot find it and the process stays alive.
+      await new Promise((resolve) => route.server.close(resolve));
       throw error;
     }
     return route;

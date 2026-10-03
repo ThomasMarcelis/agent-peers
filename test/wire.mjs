@@ -1,16 +1,19 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
+import { createServer } from "node:net";
+import { once } from "node:events";
 import { join } from "node:path";
 import { test } from "node:test";
-import { MAX_LINE, address, alive, claudeSessions, codexPeers, ensurePrivateDir, peerSocket, post, readLines, socketPath } from "../src/wire.mjs";
+import { MAX_LINE, address, alive, claudeSessions, codexPeers, ensurePrivateDir, peerSocket, post, readLines, socketDir, socketPath } from "../src/wire.mjs";
 
 function fixture(t) {
   const dir = mkdtempSync(join(tmpdir(), "ap-wire-"));
   const claude = join(dir, "claude"), peers = join(dir, "peers"), sockets = join(dir, "sockets");
   for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true, mode: 0o700 });
-  const before = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME };
+  const before = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME,
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, TMPDIR: process.env.TMPDIR };
   Object.assign(process.env, { CLAUDE_CONFIG_DIR: claude, AGENT_PEERS_HOME: peers });
   writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "fixture", messagingSocketPath: join(sockets, "claude.sock") }));
   t.after(() => {
@@ -39,6 +42,7 @@ test("private directories reject shared modes and symlinks", (t) => {
 test("addresses reject escapes, traversal, invalid encoding, and substituted symlinks", (t) => {
   const f = fixture(t), target = join(f.sockets, "peer.sock");
   assert.equal(peerSocket(address(target)), target);
+  assert.equal(peerSocket(address(join(f.sockets, "é".repeat(50) + ".sock"))), undefined);
   for (const invalid of ["uds:/outside/a.sock", `uds:${f.sockets}/../x.sock`, `uds:${f.sockets}/%00.sock`, `uds:${f.sockets}/%ZZ.sock`, `uds:${f.sockets}/%70eer.sock`]) {
     assert.equal(peerSocket(invalid), undefined);
   }
@@ -97,4 +101,44 @@ test("posting validates paths and size before opening a connection", async (t) =
   await assert.rejects(post("/outside/a.sock", {}), /invalid peer inbox/);
   await assert.rejects(post(join(f.sockets, "missing.sock"), { text: "x".repeat(MAX_LINE) }), /message too large/);
   await assert.rejects(post(join(f.sockets, "missing.sock"), {}), /ENOENT/);
+});
+
+
+test("peers started before Claude retain their inbox when Claude publishes its first registry record", async (t) => {
+  const f = fixture(t);
+  rmSync(join(f.claude, "sessions", `${process.pid}.json`));
+  delete process.env.XDG_RUNTIME_DIR;
+  process.env.TMPDIR = f.dir;
+  const before = socketDir();
+  assert.equal(before, join(f.dir, "cc-socks"));
+  const socket = join(before, "codex-early.sock"), messages = [];
+  const server = createServer((connection) => readLines(connection, (line) => messages.push(line)));
+  server.listen(socket); await once(server, "listening");
+  try {
+    writeFileSync(join(f.peers, "codex-early.json"), JSON.stringify({
+      pid: process.pid, name: "codex:early", threadId: "early", address: address(socket),
+    }));
+    assert.equal(codexPeers()[0].address, address(socket));
+    await post(socket, { text: "before Claude" });
+    // This is Claude 2.1.288's directory rule: XDG_RUNTIME_DIR || os.tmpdir(), then cc-socks.
+    writeFileSync(join(f.claude, "sessions", `${process.pid}.json`), JSON.stringify({
+      pid: process.pid, name: "late", messagingSocketPath: join(f.dir, "cc-socks", `${process.pid}.sock`),
+    }));
+    assert.equal(socketDir(), before);
+    assert.equal(peerSocket(address(socket)), socket);
+    assert.equal(codexPeers()[0].address, address(socket));
+    await post(socket, { text: "after Claude" });
+    for (let i = 0; messages.length < 2 && i < 100; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(messages, [{ text: "before Claude" }, { text: "after Claude" }]);
+  } finally { await new Promise((resolve) => server.close(resolve)); }
+});
+
+test("Claude's runtime-directory preference and long-path fallback apply before it starts", (t) => {
+  const f = fixture(t);
+  rmSync(join(f.claude, "sessions", `${process.pid}.json`));
+  process.env.TMPDIR = join(f.dir, "temp");
+  process.env.XDG_RUNTIME_DIR = join(f.dir, "runtime");
+  assert.equal(socketDir({ create: false }), join(f.dir, "runtime", "cc-socks"));
+  process.env.XDG_RUNTIME_DIR = join(f.dir, "x".repeat(110));
+  assert.equal(socketDir({ create: false }), `/tmp/cc-socks-${userInfo().uid}`);
 });

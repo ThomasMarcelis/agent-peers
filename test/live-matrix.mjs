@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -19,8 +19,11 @@ const coordinationOnly = process.argv.includes("--coordination-only");
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const output = join(root, "artifacts", `live-${stamp}`);
 const tmp = mkdtempSync(join(tmpdir(), "agent-peers-live-"));
+// Keep all test inboxes in one private, short namespace on Linux and macOS.
+const socketRoot = mkdtempSync(join(realpathSync("/tmp"), "ap-matrix-"));
+process.env.XDG_RUNTIME_DIR = socketRoot;
 const registry = join(tmp, "peers"), claudeRegistry = join(tmp, "claude-discovery");
-const appSocket = join(tmp, "app.sock");
+const appSocket = join(socketRoot, "app.sock");
 const nonce = randomUUID().slice(0, 8);
 const processes = [], participants = [], codexEvents = [], checks = [];
 const completed = new Map(), active = new Map();
@@ -84,6 +87,7 @@ async function cleanup() {
     if (p.kind === "claude") rmSync(join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "sessions", `${p.process.pid}.json`), { force: true });
   }
   rmSync(tmp, { recursive: true, force: true });
+  rmSync(socketRoot, { recursive: true, force: true });
 }
 
 const protocol =
@@ -163,6 +167,7 @@ async function coordinationCheck() {
 
 async function run() {
   report.versions = {
+    node: process.version,
     codex: execFileSync("codex", ["--version"], { encoding: "utf8" }).trim(),
     ...(!codexOnly ? { claude: execFileSync("claude", ["--version"], { encoding: "utf8" }).trim() } : {}),
   };
@@ -216,7 +221,7 @@ async function run() {
   const overrides = [...disable, "features.hooks=false", "features.memories=false",
     'mcp_servers.agent-peers.enabled=true', `mcp_servers.agent-peers.command=${JSON.stringify(process.execPath)}`, 'mcp_servers.agent-peers.default_tools_approval_mode="approve"',
     `mcp_servers.agent-peers.args=[${JSON.stringify(join(root, "src/codex-peer.mjs"))}]`,
-    `mcp_servers.agent-peers.env={AGENT_PEERS_CODEX_APP_SERVER=${JSON.stringify(appSocket)},AGENT_PEERS_HOME=${JSON.stringify(registry)},CLAUDE_CONFIG_DIR=${JSON.stringify(claudeRegistry)},AGENT_PEERS_LOG=${JSON.stringify(join(output, "codex-peer.log"))}}`,
+    `mcp_servers.agent-peers.env={XDG_RUNTIME_DIR=${JSON.stringify(socketRoot)},AGENT_PEERS_CODEX_APP_SERVER=${JSON.stringify(appSocket)},AGENT_PEERS_HOME=${JSON.stringify(registry)},CLAUDE_CONFIG_DIR=${JSON.stringify(claudeRegistry)},AGENT_PEERS_LOG=${JSON.stringify(join(output, "codex-peer.log"))}}`,
   ];
   const daemon = launch("codex-app-server", "codex", [...overrides.flatMap((s) => ["-c", s]), "app-server", "--listen", `unix://${appSocket}`]);
   daemon.stdout.on("data", (data) => appendFileSync(join(output, "codex-app-server.stdout.log"), data));

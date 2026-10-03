@@ -17,7 +17,7 @@ import { AppServer } from "./app-server.mjs";
 import { codexDiscovery, formatCodexPeer } from "./discovery.mjs";
 import { coordinationGuidance } from "./guidance.mjs";
 import {
-  MAX_LINE, address, alive, allPeers, codexPeers, ensurePrivateDir, isSafePeerRecord, messageLine, parseEnvelope, peerSocket, peersHome, post,
+  MAX_LINE, MAX_SOCKET_PATH, address, alive, allPeers, codexPeers, ensurePrivateDir, isSafePeerRecord, messageLine, parseEnvelope, peerSocket, peersHome, post,
   readLines, readPeerRecord, slug, socketDir, validThreadId,
 } from "./wire.mjs";
 
@@ -49,16 +49,23 @@ async function bindNow(meta) {
   // Delivery goes through the shared app-server daemon. A Codex started with -c overrides or
   // --no-daemon hosts its thread in its own embedded server, which peers cannot reach.
   // thread/read would load a thread from disk, so check the daemon has it live.
-  if (!(await app.loadedThreads()).includes(threadId)) {
+  const loaded = new Set(await app.loadedThreads());
+  if (!loaded.has(threadId)) {
     throw new Error("this Codex session runs its own embedded app-server (started with -c or --no-daemon), " +
       "so peers cannot reach it; start codex without config overrides to use agent-peers");
   }
   const t = await app.readThread(threadId);
-  let rootId = threadId;
-  for (let p = t.parentThreadId, depth = 0; p && depth < 16; depth++) {
-    if (!validThreadId(p)) throw new Error("app-server returned an invalid parent thread ID");
-    rootId = p;
-    p = (await app.readThread(p)).parentThreadId;
+  let rootId = threadId, parentId = t.parentThreadId;
+  const ancestors = new Set([threadId]);
+  while (parentId !== undefined && parentId !== null) {
+    if (!validThreadId(parentId)) throw new Error("app-server returned an invalid parent thread ID");
+    if (ancestors.has(parentId)) throw new Error("app-server returned cyclic thread ancestry");
+    if (ancestors.size > 16) throw new Error("app-server thread ancestry exceeds 16 parents");
+    // Reading an unloaded ancestor would restore historical state as a side effect.
+    if (!loaded.has(parentId)) throw new Error("this Codex session has an unloaded parent; its root inbox cannot be resolved safely");
+    ancestors.add(parentId);
+    rootId = parentId;
+    parentId = (await app.readThread(parentId)).parentThreadId;
   }
   const name = `codex:${slug(t.name || t.agentNickname || "") || slug(t.cwd || "session")}-${threadId.replace(/-/g, "").slice(-4)}`;
   if (rootId !== threadId) {
@@ -71,11 +78,14 @@ async function bindNow(meta) {
   dropDeadOwners();
   const directory = socketDir();
   const socket = join(directory, `codex-${threadId.replace(/-/g, "").slice(-16)}.sock`);
-  if (!peerSocket(address(socket))) throw new Error("unsafe existing Codex inbox path");
   // libuv unlinks the original bind path when server.close() runs. Bind a unique path and
   // rename it into place, so an old listener can never unlink a replacement's public socket.
   const token = randomUUID();
   const temporary = join(directory, `.ap-${token.slice(0, 8)}.sock`);
+  if ([socket, temporary].some((path) => Buffer.byteLength(path) > MAX_SOCKET_PATH)) {
+    throw new Error(`Codex inbox path exceeds the ${MAX_SOCKET_PATH}-byte Unix socket limit; use a shorter XDG_RUNTIME_DIR for Claude and Codex`);
+  }
+  if (!peerSocket(address(socket))) throw new Error("unsafe existing Codex inbox path");
   const connections = new Set();
   const server = createServer((conn) => {
     if (connections.size >= CONNECTION_MAX) return conn.destroy();

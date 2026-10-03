@@ -49,10 +49,10 @@ Messages are framed as coming from another agent, with a reply address. They car
 Install as a native plugin; the standalone tools remain independent of Hermes:
 
 ```sh
-hermes plugins install ThomasMarcelis/agent-peers --ref v0.1.0 --enable
+hermes plugins install ThomasMarcelis/agent-peers --enable
 ```
 
-**Hermes 0.1.0 support requires the documented Hermes fork.** Stock Hermes can discover peers but lacks the conversation-routing APIs needed for automatic replies; sending fails clearly. See [Hermes setup](docs/hermes.md) for dependencies, the explicit injection grant, and the exact tested host revision.
+**Automatic replies require the documented Hermes fork.** Stock Hermes can discover peers but lacks the conversation-routing APIs needed for automatic replies; sending fails clearly. See [Hermes setup](docs/hermes.md) for dependencies, the explicit injection grant, and the exact tested host revision.
 
 Hermes stays hidden from discovery. Each conversation creates a private reply inbox on its first send; replies return to that conversation and Discord thread, including when another tab is active.
 

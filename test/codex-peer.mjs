@@ -22,11 +22,14 @@ async function until(check) {
 
 async function fixture(t, options = {}) {
   const dir = mkdtempSync(join(tmpdir(), "ap-codex-"));
-  const claude = join(dir, "claude"), peers = join(dir, "peers"), sockets = join(dir, "socks"), daemon = join(dir, "daemon.sock");
+  const claude = join(dir, "claude"), peers = join(dir, "peers"), daemon = join(dir, "daemon.sock");
+  const sockets = options.longSocketDir
+    ? join(dir, "é".repeat(Math.max(1, Math.ceil((80 - Buffer.byteLength(dir) - 1) / 2))))
+    : join(dir, "socks");
   for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true, mode: 0o700 });
   const before = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME };
   Object.assign(process.env, { CLAUDE_CONFIG_DIR: claude, AGENT_PEERS_HOME: peers });
-  const inbox = join(sockets, "claude.sock"), messages = [], turns = [], clients = [], held = [];
+  const inbox = join(sockets, "claude.sock"), messages = [], turns = [], reads = [], clients = [], held = [];
   const receiver = createServer((conn) => readLines(conn, (line) => {
     messages.push(line);
     void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "delivered" }).catch(() => {});
@@ -40,7 +43,11 @@ async function fixture(t, options = {}) {
     const message = JSON.parse(data);
     if (message.method === "initialize") reply(ws, message, {});
     if (message.method === "thread/loaded/list") reply(ws, message, { data: options.loaded ?? [thread], nextCursor: null });
-    if (message.method === "thread/read") reply(ws, message, { thread: { id: message.params.threadId, name: "fixture", cwd: dir, status: { type: "idle" } } });
+    if (message.method === "thread/read") {
+      reads.push(message.params.threadId);
+      reply(ws, message, { thread: { id: message.params.threadId, parentThreadId: options.parents?.[message.params.threadId],
+        name: "fixture", cwd: dir, status: { type: "idle" } } });
+    }
     if (message.method === "turn/start") {
       turns.push(message.params);
       if (hold) held.push(() => reply(ws, message, {}));
@@ -67,7 +74,7 @@ async function fixture(t, options = {}) {
     for (const [key, value] of Object.entries(before)) value === undefined ? delete process.env[key] : process.env[key] = value;
     rmSync(dir, { recursive: true, force: true });
   });
-  return { dir, peers, sockets, inbox, messages, turns, start,
+  return { dir, peers, sockets, inbox, messages, turns, reads, start,
     registry: join(peers, `codex-${thread}.json`),
     release: () => { hold = false; held.splice(0).forEach((release) => release()); } };
 }
@@ -150,4 +157,32 @@ test("queue saturation is bounded and idle connections cannot exceed the listene
   for (const conn of connections) { conn.on("error", () => {}); conn.on("close", () => closed++); }
   await until(() => closed >= 8);
   connections.forEach((conn) => conn.destroy());
+});
+
+
+test("binding never reads a parent absent from the loaded-thread snapshot", async (t) => {
+  const f = await fixture(t, { parents: { [thread]: "historical-parent" } }), peer = await f.start();
+  const result = await peer.call("send_peer", { to: "claude:test", message: "hello" });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /unloaded parent/);
+  assert.deepEqual(f.reads, [thread]);
+  assert.deepEqual(readdirSync(f.peers), []);
+});
+
+test("binding rejects cyclic ancestry before rereading an ancestor", async (t) => {
+  const f = await fixture(t, { loaded: [thread, "parent"], parents: { [thread]: "parent", parent: thread } }), peer = await f.start();
+  const result = await peer.call("send_peer", { to: "claude:test", message: "hello" });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /cyclic thread ancestry/);
+  assert.deepEqual(f.reads, [thread, "parent"]);
+  assert.deepEqual(readdirSync(f.peers), []);
+});
+
+test("binding rejects an oversized UTF-8 pathname before creating or renaming a socket", async (t) => {
+  const f = await fixture(t, { longSocketDir: true }), peer = await f.start();
+  const result = await peer.call("send_peer", { to: "claude:test", message: "hello" });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /103-byte Unix socket limit/);
+  assert.deepEqual(readdirSync(f.sockets), ["claude.sock"]);
+  assert.deepEqual(readdirSync(f.peers), []);
 });

@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -22,10 +22,11 @@ const codexOnly = process.argv.includes("--codex-only");
 const sourceEnv = { ...process.env };
 const sourceClaudeHome = sourceEnv.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 const tmp = mkdtempSync(join(tmpdir(), "agent-peers-contract-"));
+const socketRoot = mkdtempSync(join(realpathSync("/tmp"), "ap-contract-"));
 const work = join(tmp, "work");
 const peersHome = join(tmp, "peers");
 const claudeRegistry = join(tmp, "claude-discovery");
-const appSock = join(tmp, "app.sock");
+const appSock = join(socketRoot, "app.sock");
 const children = [];
 const ownedSockets = new Set();
 const step = (s) => console.log(`\n== ${s}`);
@@ -35,7 +36,7 @@ mkdirSync(work, { mode: 0o700 });
 mkdirSync(peersHome, { mode: 0o700 });
 mkdirSync(join(claudeRegistry, "sessions"), { recursive: true, mode: 0o700 });
 Object.assign(process.env, { AGENT_PEERS_HOME: peersHome, CLAUDE_CONFIG_DIR: claudeRegistry,
-  AGENT_PEERS_CODEX_APP_SERVER: appSock });
+  AGENT_PEERS_CODEX_APP_SERVER: appSock, XDG_RUNTIME_DIR: socketRoot });
 
 function launch(command, args, options) {
   const child = spawn(command, args, { detached: true, ...options });
@@ -89,6 +90,7 @@ function cleanup() {
   }
   for (const socket of ownedSockets) rmSync(socket, { force: true });
   rmSync(tmp, { recursive: true, force: true });
+  rmSync(socketRoot, { recursive: true, force: true });
 }
 process.on("exit", cleanup);
 process.on("SIGINT", () => process.exit(130));
@@ -121,7 +123,7 @@ const overrides = [
   'mcp_servers.agent-peers.enabled=true', `mcp_servers.agent-peers.command=${JSON.stringify(process.execPath)}`,
   'mcp_servers.agent-peers.default_tools_approval_mode="approve"',
   `mcp_servers.agent-peers.args=[${JSON.stringify(join(root, "src", "codex-peer.mjs"))}]`,
-  `mcp_servers.agent-peers.env={AGENT_PEERS_CODEX_APP_SERVER=${JSON.stringify(appSock)},AGENT_PEERS_HOME=${JSON.stringify(peersHome)},CLAUDE_CONFIG_DIR=${JSON.stringify(claudeRegistry)},AGENT_PEERS_LOG=${JSON.stringify(join(tmp, "codex-peer.log"))}}`,
+  `mcp_servers.agent-peers.env={XDG_RUNTIME_DIR=${JSON.stringify(socketRoot)},AGENT_PEERS_CODEX_APP_SERVER=${JSON.stringify(appSock)},AGENT_PEERS_HOME=${JSON.stringify(peersHome)},CLAUDE_CONFIG_DIR=${JSON.stringify(claudeRegistry)},AGENT_PEERS_LOG=${JSON.stringify(join(tmp, "codex-peer.log"))}}`,
 ];
 launch("codex", [...overrides.flatMap((o) => ["-c", o]), "app-server", "--listen", `unix://${appSock}`], {
   cwd: tmp,
@@ -189,7 +191,7 @@ const claude = launch("claude", [
   "--settings", JSON.stringify({ crossSessionInbound: "accept", disableAllHooks: true }),
   "--allowedTools", "Bash(sleep *),SendMessage",
   "--append-system-prompt", readFileSync(join(root, "CLAUDE-snippet.md"), "utf8"),
-], { cwd: work, env: { ...sourceEnv, AGENT_PEERS_HOME: peersHome }, stdio: ["pipe", "pipe", "inherit"] });
+], { cwd: work, env: { ...sourceEnv, AGENT_PEERS_HOME: peersHome, XDG_RUNTIME_DIR: socketRoot }, stdio: ["pipe", "pipe", "inherit"] });
 claude.stdin.end(
   `Use SendMessage to send this to "${codexPeer.address}": "Reply to me with send_peer; include the codeword PLUM-2." ` +
     "Then run `sleep 40` with Bash. Answer every peer message you receive as it asks. Finally print every codeword you received.",

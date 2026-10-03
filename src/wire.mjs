@@ -8,11 +8,12 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync } from "node:fs";
 import { connect } from "node:net";
-import { homedir, userInfo } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 
 export const TAG = "cross-session-message";
 export const MAX_LINE = 1_000_000;
+export const MAX_SOCKET_PATH = 103;
 const uid = userInfo().uid;
 
 export const claudeHome = () => process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
@@ -64,7 +65,7 @@ export function readPeerRecord(path) {
 }
 
 const safeText = (s, limit = 512) => typeof s === "string" && s.length > 0 && s.length <= limit && !/[\x00-\x1f\x7f]/.test(s);
-const validSocketPath = (path) => typeof path === "string" && isAbsolute(path) && normalize(path) === path &&
+const validSocketPath = (path) => typeof path === "string" && Buffer.byteLength(path) <= MAX_SOCKET_PATH && isAbsolute(path) && normalize(path) === path &&
   path.endsWith(".sock") && !/[\x00-\x1f\x7f]/.test(path);
 const validPid = (pid) => Number.isInteger(pid) && pid > 0 && pid <= 0x7fffffff;
 export const validThreadId = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id);
@@ -91,10 +92,12 @@ function claudeRecords() {
 export function socketDir({ create = true } = {}) {
   const sessions = claudeRecords();
   if (sessions.length) return dirname(sessions[0].messagingSocketPath);
-  const run = `/run/user/${uid}`;
-  let dir;
-  try { safeDirectory(run, true); dir = join(run, "cc-socks"); }
-  catch { dir = `/tmp/cc-socks-${uid}`; }
+  // Match Claude Code even when it has not started yet. Merely finding /run/user/<uid>
+  // does not mean Claude uses it: without XDG_RUNTIME_DIR it uses the OS temp directory.
+  // The 103-byte threshold is Claude's cross-platform Unix socket pathname limit.
+  const base = process.env.XDG_RUNTIME_DIR || tmpdir();
+  let dir = join(base, "cc-socks");
+  if (Buffer.byteLength(join(dir, `${process.pid}.sock`)) > MAX_SOCKET_PATH) dir = `/tmp/cc-socks-${uid}`;
   if (create) return ensurePrivateDir(dir);
   try { safeDirectory(dir, true); } catch (error) { if (error.code !== "ENOENT") throw error; }
   return dir;

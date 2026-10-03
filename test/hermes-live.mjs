@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -19,8 +19,10 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const codexOnly = process.argv.includes("--codex-only");
 const output = join(root, "artifacts", "hermes-live", new Date().toISOString().replace(/[:.]/g, "-"));
 const tmp = mkdtempSync(join(tmpdir(), "agent-peers-hermes-live-"));
+// macOS TMPDIR can already approach the Unix socket pathname limit.
+const socketRoot = mkdtempSync(join(realpathSync("/tmp"), "ap-hermes-"));
 const registry = join(tmp, "peers"), claudeRegistry = join(tmp, "claude-discovery");
-const appSocket = join(tmp, "app.sock");
+const appSocket = join(socketRoot, "app.sock");
 const sourceClaudeHome = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 const sourceEnv = { ...process.env };
 const nonce = randomUUID().slice(0, 8);
@@ -36,9 +38,9 @@ mkdirSync(output, { recursive: true });
 mkdirSync(registry, { mode: 0o700 });
 mkdirSync(join(claudeRegistry, "sessions"), { recursive: true, mode: 0o700 });
 const isolatedEnv = { ...sourceEnv, AGENT_PEERS_HOME: registry, CLAUDE_CONFIG_DIR: claudeRegistry,
-  AGENT_PEERS_CODEX_APP_SERVER: appSocket };
+  AGENT_PEERS_CODEX_APP_SERVER: appSocket, XDG_RUNTIME_DIR: socketRoot };
 Object.assign(process.env, { AGENT_PEERS_HOME: registry, CLAUDE_CONFIG_DIR: claudeRegistry,
-  AGENT_PEERS_CODEX_APP_SERVER: appSocket });
+  AGENT_PEERS_CODEX_APP_SERVER: appSocket, XDG_RUNTIME_DIR: socketRoot });
 
 async function until(label, fn, timeoutMs = 180_000) {
   const end = Date.now() + timeoutMs;
@@ -187,7 +189,7 @@ async function roundtrip(peer, session, phase, busyTurn) {
 }
 
 async function run() {
-  report.versions = { codex: execFileSync("codex", ["--version"], { encoding: "utf8" }).trim(),
+  report.versions = { node: process.version, codex: execFileSync("codex", ["--version"], { encoding: "utf8" }).trim(),
     ...(!codexOnly ? { claude: execFileSync("claude", ["--version"], { encoding: "utf8" }).trim() } : {}) };
   log(`evidence: ${output}`);
   const configPath = join(sourceEnv.CODEX_HOME || join(homedir(), ".codex"), "config.toml");
@@ -197,7 +199,7 @@ async function run() {
   const overrides = [...disable, "features.hooks=false", "features.memories=false",
     'mcp_servers.agent-peers.enabled=true', `mcp_servers.agent-peers.command=${JSON.stringify(process.execPath)}`, 'mcp_servers.agent-peers.default_tools_approval_mode="approve"',
     `mcp_servers.agent-peers.args=[${JSON.stringify(join(root, "src", "codex-peer.mjs"))}]`,
-    `mcp_servers.agent-peers.env={AGENT_PEERS_CODEX_APP_SERVER=${JSON.stringify(appSocket)},AGENT_PEERS_HOME=${JSON.stringify(registry)},CLAUDE_CONFIG_DIR=${JSON.stringify(claudeRegistry)},AGENT_PEERS_LOG=${JSON.stringify(join(output, "codex-peer.log"))}}`];
+    `mcp_servers.agent-peers.env={XDG_RUNTIME_DIR=${JSON.stringify(socketRoot)},AGENT_PEERS_CODEX_APP_SERVER=${JSON.stringify(appSocket)},AGENT_PEERS_HOME=${JSON.stringify(registry)},CLAUDE_CONFIG_DIR=${JSON.stringify(claudeRegistry)},AGENT_PEERS_LOG=${JSON.stringify(join(output, "codex-peer.log"))}}`];
   const daemon = launch("codex-app-server", "codex", [...overrides.flatMap((value) => ["-c", value]), "app-server", "--listen", `unix://${appSocket}`]);
   daemon.stdout.on("data", (data) => appendFileSync(join(output, "codex-app-server.stdout.log"), data));
   await until("private Codex app-server", () => existsSync(appSocket), 30_000);
@@ -239,7 +241,7 @@ async function run() {
       "--settings", JSON.stringify({ crossSessionInbound: "accept", disableAllHooks: true }),
       "--allowedTools", "Bash(sleep *),SendMessage,ListAgents",
       "--append-system-prompt", readFileSync(join(root, "CLAUDE-snippet.md"), "utf8")],
-    { cwd: work, env: { ...sourceEnv, AGENT_PEERS_HOME: registry } });
+    { cwd: work, env: { ...sourceEnv, AGENT_PEERS_HOME: registry, XDG_RUNTIME_DIR: socketRoot } });
     lines(claude.process.stdout, "claude.jsonl", (event) => claude.events.push(event));
     claudeTurn(claude, protocol + "For now, reply READY.");
     const claudeMeta = await until("Claude real inbox", () => {
@@ -281,6 +283,7 @@ async function cleanup() {
   }
   for (const inbox of hidden.values()) rmSync(decodeURIComponent(inbox.slice(4)), { force: true });
   rmSync(tmp, { recursive: true, force: true });
+  rmSync(socketRoot, { recursive: true, force: true });
 }
 
 try { await run(); }

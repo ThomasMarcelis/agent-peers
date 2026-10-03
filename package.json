@@ -35,7 +35,9 @@
     "LICENSE",
     "after-install.md",
     "!**/__pycache__/**",
-    "!**/*.pyc"
+    "!**/*.pyc",
+    "CONTRIBUTING.md",
+    "SECURITY.md"
   ],
   "os": [
     "linux",

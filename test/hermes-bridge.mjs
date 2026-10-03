@@ -3,7 +3,6 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { connect, createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -22,8 +21,10 @@ async function until(check, description = "condition") {
 }
 
 async function fixture(t, options = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "hermes-peer-"));
-  const claude = join(dir, "claude"), peers = join(dir, "peers"), sockets = join(dir, "socks");
+  // macOS TMPDIR can already consume half of sun_path; keep transport fixtures short.
+  const dir = mkdtempSync("/tmp/ap-hermes-");
+  const claude = join(dir, "claude"), peers = join(dir, "peers");
+  const sockets = join(dir, options.longSockets ? "s".repeat(69 - Buffer.byteLength(dir)) : "socks");
   for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true, mode: 0o700 });
   const before = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME };
   process.env.CLAUDE_CONFIG_DIR = claude;
@@ -68,6 +69,14 @@ async function fixture(t, options = {}) {
     bridge.request("send_peer", { session, name, to, message });
   return { bridge, dir, peers, sockets, claude, events, reads, messages, send };
 }
+
+test("long inbox paths fail before listening and leave no sockets or live handles", async (t) => {
+  const f = await fixture(t, { longSockets: true });
+  const before = readdirSync(f.sockets).sort();
+  await assert.rejects(f.send("too-long"), /103-byte Unix limit/);
+  await f.bridge.close();
+  assert.deepEqual(readdirSync(f.sockets).sort(), before);
+});
 
 test("listing sees Claude and live Codex status without creating a Hermes inbox", async (t) => {
   const f = await fixture(t);
