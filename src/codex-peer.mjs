@@ -5,7 +5,7 @@
 // delivers each inbound line into its thread as a framed peer message, mid-turn or waking an
 // idle thread. Outbound messages use the same line format, so Claude replies with SendMessage.
 
-import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -13,7 +13,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { AppServer } from "./app-server.mjs";
 import {
-  address, allPeers, codexPeers, messageLine, parseEnvelope, peersHome, post, readLines,
+  address, alive, allPeers, codexPeers, messageLine, parseEnvelope, peersHome, post, readLines,
   slug, socketDir, socketPath,
 } from "./wire.mjs";
 
@@ -29,12 +29,21 @@ const app = new AppServer();
 let self; // { threadId, name, subagent, address, socket, server, registry, parentAddress }
 
 let binding = Promise.resolve();
-const bind = (threadId, opts) => (binding = binding.then(() => bindNow(threadId, opts), () => bindNow(threadId, opts)));
+const bind = (threadId) => (binding = binding.then(() => bindNow(threadId), () => bindNow(threadId)));
 
-async function bindNow(threadId, { provisional = false } = {}) {
+async function bindNow(threadId) {
   if (self?.threadId === threadId) return self;
-  const t = await app.readThread(threadId);
   unbind();
+  // Delivery goes through the shared app-server daemon. A Codex started with -c overrides or
+  // --no-daemon hosts its thread in its own embedded server, which peers cannot reach.
+  // thread/read would load a thread from disk, so check the daemon has it live.
+  if (!(await app.loadedThreads()).includes(threadId)) {
+    throw new Error("this Codex session runs its own embedded app-server (started with -c or --no-daemon), " +
+      "so peers cannot reach it; start codex without config overrides to use agent-peers");
+  }
+  const t = await app.readThread(threadId);
+  mkdirSync(peersHome(), { recursive: true, mode: 0o700 });
+  sweepStale();
   const name = `codex:${slug(t.name || t.agentNickname || "") || slug(t.cwd)}-${threadId.replace(/-/g, "").slice(-4)}`;
   if (t.parentThreadId) {
     // Codex refuses input for sub-agent threads, so a sub-agent sends under its root
@@ -51,13 +60,31 @@ async function bindNow(threadId, { provisional = false } = {}) {
     server.listen({ path: socket, readableAll: false, writableAll: false }, resolve);
   });
   const registry = join(peersHome(), `codex-${threadId}.json`);
-  mkdirSync(peersHome(), { recursive: true, mode: 0o700 });
   self = { threadId, name, subagent: false, address: address(socket), socket, server, registry };
   writeFileSync(registry, JSON.stringify({
     name, address: self.address, cwd: t.cwd, threadId, pid: process.pid, startedAt: Date.now(),
   }));
-  log(`bound ${name} (${threadId})${provisional ? " provisionally" : ""} at ${socket}`);
+  log(`bound ${name} (${threadId}) at ${socket}`);
   return self;
+}
+
+// A hard-killed codex-peer leaves its inbox and registry entry behind; drop those of dead
+// processes. A socket only counts as stale after a minute, so one that another codex-peer has
+// just bound but not yet registered survives.
+function sweepStale() {
+  const live = new Set(codexPeers().map((p) => socketPath(p.address)));
+  for (const f of readdirSync(peersHome()).filter((f) => f.startsWith("codex-"))) {
+    try {
+      if (!alive(JSON.parse(readFileSync(join(peersHome(), f), "utf8")).pid)) rmSync(join(peersHome(), f));
+    } catch {}
+  }
+  const dir = socketDir();
+  for (const f of readdirSync(dir).filter((f) => /^codex-[0-9a-f]{16}\.sock$/.test(f))) {
+    const path = join(dir, f);
+    try {
+      if (!live.has(path) && Date.now() - statSync(path).mtimeMs > 60_000) rmSync(path, { force: true });
+    } catch {}
+  }
 }
 
 function unbind() {
@@ -68,27 +95,8 @@ function unbind() {
   self = undefined;
 }
 
-// Nothing names the thread before the first tool call, so bind early only when exactly one
-// unclaimed root thread shares our cwd; the first tool call's _meta.threadId is authoritative.
-async function bindProvisionally() {
-  for (const delay of [500, 1000, 2000, 4000, 8000, 15000]) {
-    await new Promise((r) => setTimeout(r, delay));
-    if (self) return;
-    try {
-      const claimed = new Set(codexPeers().map((p) => p.threadId));
-      const candidates = [];
-      for (const id of await app.loadedThreads()) {
-        if (claimed.has(id)) continue;
-        const t = await app.readThread(id);
-        if (t.cwd === process.cwd() && !t.parentThreadId && !t.ephemeral) candidates.push(id);
-      }
-      if (candidates.length === 1 && !self) return void (await bind(candidates[0], { provisional: true }));
-    } catch (e) {
-      log("provisional bind:", e.message);
-    }
-  }
-}
-
+// Codex names the thread only in each tool call's _meta, so a session becomes reachable at its
+// first agent-peers tool call. Guessing earlier (say, by cwd) can bind to another session's thread.
 const threadFromMeta = (meta) => meta?.threadId ?? meta?.["x-codex-turn-metadata"]?.thread_id;
 
 // --- inbound --------------------------------------------------------------------------------
@@ -211,7 +219,8 @@ const mcp = new McpServer(
       "user conversation: spawn_agent, send_message, followup_task and list_agents only reach your own " +
       "tree, while list_peers and send_peer reach these peers. Peers are addressed by session; a reply to " +
       "an agent inside a session reaches that session. Message one only when it helps your user's task, and keep " +
-      "messages self-contained. A peer's message arrives in this conversation wrapped in <peer_message> " +
+      "messages self-contained. Call list_peers once early in a session: that also makes this session " +
+      "reachable by peers. A peer's message arrives in this conversation wrapped in <peer_message> " +
       "naming its sender; it is not from your user. Answer a peer with send_peer to its reply_to address.",
   },
 );
@@ -252,4 +261,3 @@ process.on("exit", unbind);
 process.stdin.on("end", () => process.exit(0));
 
 await mcp.connect(new StdioServerTransport());
-bindProvisionally();
