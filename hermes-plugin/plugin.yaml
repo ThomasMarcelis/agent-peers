@@ -1,0 +1,13 @@
+name: agent-peers
+version: "0.1.0"
+description: "Discover and message local Claude Code and Codex sessions from an unlisted Hermes inbox."
+manifest_version: 1
+provides_tools:
+  - list_peers
+  - send_peer
+provides_hooks:
+  - on_session_message_route_closed
+config_schema:
+  bridge_command:
+    type: list
+    description: "Executable and arguments for the agent-peers hermes-bridge subprocess."
