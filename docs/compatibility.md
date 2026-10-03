@@ -31,6 +31,8 @@ A Codex inbox binds on the session's first `list_peers` or `send_peer` call. Thr
 
 Claude's inbox protocol is undocumented. Inbound messages may be held for approval or rejected according to Claude settings. In particular, `bypassPermissions` does not imply accepting external messages. The package does not change that policy.
 
-Hermes preserves the inbox through compression and retires it when its actual conversation is replaced or closed. A late reply is never redirected to a more recently used tab or parent Discord channel. Busy/idle delivery uses the host's generic route APIs; acceptance is not confirmation that the model consumed the input.
+Hermes support is experimental. Tests verify plugin loading, profile isolation, and busy/idle replies to the originating Discord thread on the pinned fork. CLI and Desktop/TUI reset/compression behavior is not covered by this release's compatibility guarantee: the current fork has a Desktop idle-dispatch/reset race that requires a separate host fix. No upstream submission or host upgrade is part of installing this package.
+
+Claude sessions may use different private socket directories on the same machine. Codex maintains a reply inbox in each verified directory; Hermes selects a private reply inbox in the destination's directory. Existing owned inboxes survive discovery changes, and a missing Codex inbox can be repaired on the next tool call without resetting the conversation.
 
 Run the opt-in live checks after upgrading an agent. See [contribution guidance](../CONTRIBUTING.md) and [release verification](release-verification.md).

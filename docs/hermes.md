@@ -1,4 +1,4 @@
-# Hermes plugin
+# Hermes plugin (experimental)
 
 The repository is a native Hermes plugin and an npm package. Both use the same Node transport. Hermes starts its own bridge subprocess lazily; a separate standalone daemon is unnecessary.
 
@@ -36,9 +36,11 @@ If saved platform tool selections exclude new plugins, enable the `agent-peers` 
 
 - Every conversation and profile has an independent reply route.
 - Busy conversations receive input through the host's steering boundary; idle conversations start a turn.
-- Compression preserves the route. Reset, replacement, closure, unload, or host shutdown retires it.
+- Routes belong to the originating host conversation. Unload or host shutdown closes their inboxes; Hermes must send again to establish fresh return addresses.
 - Discord replies return to the original thread. Switching chats does not change the return destination.
 - There is no transcript scraping, history polling, offline mailbox, or automatic retry of an ambiguous send.
+
+Discord gateway routing is the verified surface. CLI and Desktop/TUI lifecycle behavior remains experimental on the current fork; see the [host limitation](compatibility.md#what-to-expect).
 
 ## Configuration
 

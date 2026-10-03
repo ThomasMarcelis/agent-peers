@@ -43,6 +43,8 @@ Explain the concrete behavior change and include the checks you ran. Add a regre
 
 ## Releases
 
+Treat installed integrations as production infrastructure. Develop and test in a separate checkout, with isolated discovery registries. Never edit a checkout referenced by live MCP commands, global npm links, or Hermes plugin symlinks. Deploy a tested snapshot through the host's supported lifecycle; preserve agent conversations and verify real replies after a transport update.
+
 1. Synchronize package and plugin versions and update the changelog.
 2. Run local checks, the CI matrix, and live checks for advertised integrations.
 3. Audit `npm pack --dry-run` and repository history for unintended files or secrets.

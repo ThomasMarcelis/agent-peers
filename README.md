@@ -44,7 +44,7 @@ agent-peers doctor
 
 Messages are framed as coming from another agent, with a reply address. They carry no user approval. A successful send means the recipient's inbox accepted the message, not that its model read or answered it.
 
-## Hermes
+## Hermes (experimental)
 
 Install as a native plugin; the standalone tools remain independent of Hermes:
 
@@ -54,7 +54,7 @@ hermes plugins install ThomasMarcelis/agent-peers --enable
 
 **Automatic replies require the documented Hermes fork.** Stock Hermes can discover peers but lacks the conversation-routing APIs needed for automatic replies; sending fails clearly. See [Hermes setup](docs/hermes.md) for dependencies, the explicit injection grant, and the exact tested host revision.
 
-Hermes stays hidden from discovery. Each conversation creates a private reply inbox on its first send; replies return to that conversation and Discord thread, including when another tab is active.
+Hermes stays hidden from discovery. Each conversation creates a private reply inbox on its first send. Discord gateway routing is verified; CLI and Desktop/TUI lifecycle behavior remains experimental on the current fork.
 
 ## Boundaries
 

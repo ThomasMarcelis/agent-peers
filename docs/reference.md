@@ -56,3 +56,11 @@ Messages use Claude's `<cross-session-message>` envelope. Incoming agent input i
 - **Missing plugin dependencies:** run the exact install command in the plugin error, then reload through the host's supported lifecycle.
 - **Permission failure:** inspect directory ownership and modes. Do not make the socket directory globally writable.
 - **Old reply address:** ask the peer to discover or send again after the original conversation closes; addresses are not durable mailboxes.
+
+## Updating active integrations
+
+Keep production launchers pointed at a tested installed snapshot, separate from development checkouts. Running Node processes cache their modules: changing a file does not update an existing sidecar.
+
+Use the agent host's supported MCP refresh with the new snapshot's launcher. Codex can preserve conversations and active work while replacing an MCP connection; an already captured tool step may still use the previous connection. A live legacy inbox owner blocks unsafe takeover. Verify the new registry owner, all inbox paths, and a real reply before considering an update complete.
+
+Missing Codex inboxes repair on the next tool call only while the sidecar still owns its registry token. An inbox owned by a replacement is never reclaimed. A Hermes bridge restart retires its private reply addresses, so the Hermes conversation must send again to establish a fresh return route.
