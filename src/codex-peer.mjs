@@ -9,7 +9,7 @@ import { VERSION } from "./version.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, lstatSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -18,7 +18,7 @@ import { codexDiscovery, formatCodexPeer } from "./discovery.mjs";
 import { coordinationGuidance } from "./guidance.mjs";
 import {
   MAX_LINE, MAX_SOCKET_PATH, address, alive, allPeers, codexPeers, ensurePrivateDir, isSafePeerRecord, messageLine, parseEnvelope, peerSocket, peersHome, post,
-  readLines, readPeerRecord, slug, socketDir, validThreadId,
+  readLines, readPeerRecord, slug, socketDir, socketDirectories, validThreadId,
 } from "./wire.mjs";
 
 const log = (...a) => {
@@ -75,52 +75,118 @@ async function bindNow(meta) {
     return self;
   }
   ensurePrivateDir(peersHome());
+  const registry = join(peersHome(), `codex-${threadId}.json`);
+  const filename = `codex-${threadId.replace(/-/g, "").slice(-16)}.sock`;
+  let previous;
+  try {
+    const entry = readPeerRecord(registry);
+    if (entry.threadId === threadId && isSafePeerRecord(entry) && alive(entry.pid) && basename(peerSocket(entry.address)) === filename) previous = entry;
+  } catch {}
   dropDeadOwners();
-  const directory = socketDir();
-  const socket = join(directory, `codex-${threadId.replace(/-/g, "").slice(-16)}.sock`);
-  // libuv unlinks the original bind path when server.close() runs. Bind a unique path and
-  // rename it into place, so an old listener can never unlink a replacement's public socket.
-  const token = randomUUID();
-  const temporary = join(directory, `.ap-${token.slice(0, 8)}.sock`);
+  // An MCP refresh preserves the primary public address even if a newer Claude changed
+  // the preferred directory. Additional deterministic aliases preserve older reply paths.
+  const directory = previous ? dirname(peerSocket(previous.address)) : socketDir();
+  const caller = {
+    threadId, rootId, name, subagent: false, registry, token: randomUUID(), cwd: t.cwd,
+    startedAt: Date.now(), filename, inboxes: new Map(), aliasBinding: Promise.resolve(),
+    takeover: new Set(previous ? [previous.address, ...(Array.isArray(previous.addresses) ? previous.addresses : [])] : []),
+  };
+  const primary = await createInbox(caller, directory);
+  Object.assign(caller, primary);
+  caller.inboxes.set(directory, primary);
+  self = caller;
+  try { publishRegistry(caller); }
+  catch (error) { unbind(); throw error; }
+  for (const dir of socketDirectories().slice(0, INBOXES_MAX)) {
+    try { await inboxFor(caller, dir); }
+    catch (error) { log(`could not create inbox alias in ${dir}:`, error.message); }
+  }
+  log(`bound ${name} (${threadId}) at ${caller.socket}`);
+  return caller;
+}
+
+function publishRegistry(caller) {
+  const temporary = join(peersHome(), `.codex-${randomUUID()}.json`);
+  try {
+    writeFileSync(temporary, JSON.stringify({
+      name: caller.name, address: caller.address, addresses: [...caller.inboxes.values()].map((inbox) => inbox.address),
+      cwd: caller.cwd, threadId: caller.threadId, pid: process.pid, startedAt: caller.startedAt, token: caller.token,
+    }), { mode: 0o600, flag: "wx" });
+    renameSync(temporary, caller.registry);
+  } finally { rmSync(temporary, { force: true }); }
+}
+
+async function createInbox(caller, directory) {
+  const socket = join(directory, caller.filename);
+  const temporary = join(directory, `.ap-${randomUUID().slice(0, 8)}.sock`);
   if ([socket, temporary].some((path) => Buffer.byteLength(path) > MAX_SOCKET_PATH)) {
     throw new Error(`Codex inbox path exceeds the ${MAX_SOCKET_PATH}-byte Unix socket limit; use a shorter XDG_RUNTIME_DIR for Claude and Codex`);
   }
-  if (!peerSocket(address(socket))) throw new Error("unsafe existing Codex inbox path");
+  const inboxAddress = address(socket);
+  if (!peerSocket(inboxAddress)) throw new Error("unsafe existing Codex inbox path");
+  try {
+    lstatSync(socket);
+    if (!caller.takeover.has(inboxAddress)) throw new Error("Codex inbox path is already occupied by an unverified listener");
+  } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (codexPeers().some((peer) => peer.threadId !== caller.threadId &&
+      [peer.address, ...(peer.addresses ?? [])].includes(inboxAddress))) {
+    throw new Error("Codex inbox path belongs to a different thread");
+  }
   const connections = new Set();
-  const server = createServer((conn) => {
+  const inbox = { socket, address: inboxAddress, connections };
+  const server = inbox.server = createServer((conn) => {
     if (connections.size >= CONNECTION_MAX) return conn.destroy();
     connections.add(conn);
     conn.once("close", () => connections.delete(conn));
-    readLines(conn, (line) => { if (self?.token === token && ownsSocket(self)) receive(line); });
+    readLines(conn, (line) => {
+      if (self === caller && ownsSocket(caller) && ownsSocket(inbox)) receive(line);
+    });
   });
   server.maxConnections = CONNECTION_MAX;
   server.on("error", (error) => log("inbox error:", error.message));
-  const registry = join(peersHome(), `codex-${threadId}.json`);
-  const registryTemp = join(peersHome(), `.codex-${token}.json`);
-  let identity;
   try {
     await new Promise((resolve, reject) => {
       server.once("error", reject);
       server.listen(temporary, () => { server.off("error", reject); resolve(); });
     });
     chmodSync(temporary, 0o600);
-    identity = lstatSync(temporary);
+    inbox.identity = lstatSync(temporary);
     renameSync(temporary, socket);
-    writeFileSync(registryTemp, JSON.stringify({
-      name, address: address(socket), cwd: t.cwd, threadId, pid: process.pid, startedAt: Date.now(), token,
-    }), { mode: 0o600, flag: "wx" });
-    renameSync(registryTemp, registry);
-    self = { threadId, rootId, name, subagent: false, address: address(socket), socket, server, registry,
-      token, identity, connections };
+    return inbox;
   } catch (error) {
     server.close();
     rmSync(temporary, { force: true });
-    rmSync(registryTemp, { force: true });
-    if (identity && sameFile(socket, identity)) rmSync(socket, { force: true });
+    if (ownsSocket(inbox)) rmSync(socket, { force: true });
     throw error;
   }
-  log(`bound ${name} (${threadId}) at ${socket}`);
-  return self;
+}
+
+function inboxFor(caller, directory) {
+  const bind = async () => {
+    if (self !== caller || !ownsSocket(caller)) throw new Error("this inbox was replaced; restart this MCP connection");
+    const current = caller.inboxes.get(directory);
+    if (current) {
+      if (!ownsSocket(current)) throw new Error("this reply inbox was replaced; restart this MCP connection");
+      return current;
+    }
+    if (caller.inboxes.size >= INBOXES_MAX) throw new Error("too many Codex reply inbox directories");
+    const inbox = await createInbox(caller, directory);
+    if (self !== caller || !ownsSocket(caller)) {
+      closeInbox(inbox);
+      throw new Error("this inbox was replaced; restart this MCP connection");
+    }
+    caller.inboxes.set(directory, inbox);
+    try { publishRegistry(caller); }
+    catch (error) { caller.inboxes.delete(directory); closeInbox(inbox); throw error; }
+    return inbox;
+  };
+  return caller.aliasBinding = caller.aliasBinding.then(bind, bind);
+}
+
+function closeInbox(inbox) {
+  for (const connection of inbox.connections ?? []) connection.destroy();
+  inbox.server?.close();
+  if (ownsSocket(inbox)) rmSync(inbox.socket, { force: true });
 }
 
 function sameFile(path, expected) {
@@ -133,9 +199,7 @@ function unbind() {
   if (!self) return;
   const old = self;
   self = undefined;
-  for (const connection of old.connections ?? []) connection.destroy();
-  old.server?.close();
-  if (ownsSocket(old)) rmSync(old.socket, { force: true });
+  for (const inbox of old.inboxes?.values() ?? []) closeInbox(inbox);
   if (old.registry) {
     try {
       if (readPeerRecord(old.registry).token === old.token) rmSync(old.registry, { force: true });
@@ -151,9 +215,12 @@ function dropDeadOwners() {
     try {
       const entry = readPeerRecord(join(peersHome(), f));
       if (!isSafePeerRecord(entry) || f !== `codex-${entry.threadId}.json` || alive(entry.pid)) continue;
-      const socket = peerSocket(entry.address);
-      const expected = join(socketDir(), `codex-${entry.threadId.replace(/-/g, "").slice(-16)}.sock`);
-      if (socket === expected) rmSync(socket, { force: true });
+      const expected = `codex-${entry.threadId.replace(/-/g, "").slice(-16)}.sock`;
+      const addresses = [entry.address, ...(Array.isArray(entry.addresses) ? entry.addresses.slice(0, INBOXES_MAX) : [])];
+      for (const addr of addresses) {
+        const socket = peerSocket(addr);
+        if (socket && basename(socket) === expected) rmSync(socket, { force: true });
+      }
       rmSync(join(peersHome(), f), { force: true });
     } catch {}
   }
@@ -162,6 +229,7 @@ function dropDeadOwners() {
 // --- inbound --------------------------------------------------------------------------------
 
 const BUCKET = 30, REFILL_PER_S = 0.5, DEDUP_MS = 30_000, QUEUE_MAX = 50, IDLE_MS = 600_000;
+const INBOXES_MAX = 16;
 const CONNECTION_MAX = 32, SENDERS_MAX = 1024, RECENT_MAX = 2048, QUEUE_BYTES_MAX = 8_000_000;
 const buckets = new Map(); // from -> { tokens, at }
 const recent = new Map(); // from + body -> time
@@ -196,7 +264,7 @@ function receive(line) {
   // Only a well-formed envelope with a valid peer reply address is delivered; anything else
   // could not be answered and might not be framed safely.
   const env = parseEnvelope(line.message.content);
-  if (!env || !peerSocket(env.from) || env.from === self.address || (line.from && line.from !== env.from)) return log("dropped malformed message");
+  if (!env || !peerSocket(env.from) || [...self.inboxes.values()].some((inbox) => env.from === inbox.address) || (line.from && line.from !== env.from)) return log("dropped malformed message");
   if (!admit(env.from, env.body)) return log("dropped message from", env.from);
   const sender = /^[A-Za-z0-9:_ .-]{1,80}$/.test(env.fromName ?? "") ? env.fromName : "an unnamed peer";
   queued++;
@@ -250,9 +318,16 @@ function resolveTarget(to) {
 async function send(to, message, meta) {
   const caller = await bind(meta);
   if (!caller.subagent && !ownsSocket(caller)) throw new Error("this inbox was replaced; restart this MCP connection");
-  const from = caller.subagent ? codexPeers().find((p) => p.threadId === caller.rootId)?.address : caller.address;
-  if (!from) throw new Error("your root Codex session has no inbox yet, so replies could not reach you; ask your root agent to call list_peers first");
   const target = resolveTarget(to);
+  const targetSocket = peerSocket(target.address);
+  if (!targetSocket) throw new Error("invalid peer inbox address; call list_peers again");
+  const directory = dirname(targetSocket);
+  let from;
+  if (caller.subagent) {
+    const root = codexPeers().find((peer) => peer.threadId === caller.rootId);
+    from = [root?.address, ...(root?.addresses ?? [])].find((addr) => addr && dirname(peerSocket(addr) ?? "") === directory);
+    if (!from) throw new Error("your root Codex session has no inbox in this peer's directory; ask your root agent to call list_peers or send_peer first");
+  } else from = (await inboxFor(caller, directory)).address;
   if (target.address === from) throw new Error("that address is this session's own inbox");
   // Claude Code frames every peer as "another Claude session", so tell Claude what this is.
   const body = target.kind === "codex" || /\/codex-[0-9a-f]{16}\.sock$/.test(target.socket ?? "") ? message :

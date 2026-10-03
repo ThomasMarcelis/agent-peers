@@ -88,19 +88,70 @@ function claudeRecords() {
   return out;
 }
 
-// Claude vets reply targets to its own socket directory, so Codex inboxes live there too.
-export function socketDir({ create = true } = {}) {
-  const sessions = claudeRecords();
-  if (sessions.length) return dirname(sessions[0].messagingSocketPath);
-  // Match Claude Code even when it has not started yet. Merely finding /run/user/<uid>
-  // does not mean Claude uses it: without XDG_RUNTIME_DIR it uses the OS temp directory.
-  // The 103-byte threshold is Claude's cross-platform Unix socket pathname limit.
+// The preferred directory is only for NEW inboxes. It must never invalidate an address
+// created in another directory: Claude versions and launch environments may coexist.
+function defaultSocketDir() {
   const base = process.env.XDG_RUNTIME_DIR || tmpdir();
-  let dir = join(base, "cc-socks");
-  if (Buffer.byteLength(join(dir, `${process.pid}.sock`)) > MAX_SOCKET_PATH) dir = `/tmp/cc-socks-${uid}`;
+  const dir = join(base, "cc-socks");
+  return Buffer.byteLength(join(dir, `${process.pid}.sock`)) <= MAX_SOCKET_PATH ? dir : `/tmp/cc-socks-${uid}`;
+}
+
+function standardSocketDirectories() {
+  return new Set([
+    defaultSocketDir(), join(tmpdir(), "cc-socks"), "/tmp/cc-socks", `/tmp/cc-socks-${uid}`,
+    `/run/user/${uid}/cc-socks`,
+    ...(process.env.XDG_RUNTIME_DIR ? [join(process.env.XDG_RUNTIME_DIR, "cc-socks")] : []),
+  ]);
+}
+
+// Hermes reply inboxes deliberately have no registry. Remember directories authorized by
+// this profile's Claude records so their replies still work after a Claude registry expires.
+// Keep the cache scoped to the configured registries, and recheck ownership and inode on use.
+let directoryScope;
+const observedDirectories = new Map();
+function refreshDirectoryScope() {
+  const scope = JSON.stringify([resolve(claudeHome()), resolve(peersHome()), process.env.XDG_RUNTIME_DIR, tmpdir()]);
+  if (directoryScope !== scope) { directoryScope = scope; observedDirectories.clear(); }
+}
+function verifiedSocketDirectories() {
+  refreshDirectoryScope();
+  const live = new Set(claudeRecords().map((session) => dirname(session.messagingSocketPath)));
+  for (const dir of live) {
+    try {
+      safeDirectory(dir, true);
+      const st = lstatSync(dir);
+      if (observedDirectories.has(dir) || observedDirectories.size < 256) {
+        observedDirectories.set(dir, { dev: st.dev, ino: st.ino });
+      }
+    } catch { live.delete(dir); }
+  }
+  return live;
+}
+
+// Enumerate only directories verified in this registry scope. Standard host directories
+// remain valid explicit destinations, but must not create cross-profile eager aliases.
+export function socketDirectories() {
+  const live = verifiedSocketDirectories();
+  return [...new Set([...live, ...observedDirectories.keys()])].filter(permittedSocketDirectory);
+}
+
+export function socketDir({ create = true } = {}) {
+  const live = verifiedSocketDirectories();
+  if (live.size) return live.values().next().value;
+  const dir = defaultSocketDir();
   if (create) return ensurePrivateDir(dir);
   try { safeDirectory(dir, true); } catch (error) { if (error.code !== "ENOENT") throw error; }
   return dir;
+}
+
+function permittedSocketDirectory(dir) {
+  const live = verifiedSocketDirectories();
+  try {
+    safeDirectory(dir, true);
+    if (standardSocketDirectories().has(dir) || live.has(dir)) return true;
+    const previous = observedDirectories.get(dir), current = lstatSync(dir);
+    return previous?.dev === current.dev && previous?.ino === current.ino;
+  } catch { return false; }
 }
 
 // Claude's address encoding: percent-encode everything outside [A-Za-z0-9:_/.\-].
@@ -112,7 +163,7 @@ export const address = (path) =>
 export function peerSocket(addr) {
   if (typeof addr !== "string" || !/^uds:[A-Za-z0-9%:_/.\\-]{1,1000}$/.test(addr)) return undefined;
   const path = socketPath(addr);
-  if (!validSocketPath(path) || address(path) !== addr || dirname(path) !== socketDir({ create: false })) return undefined;
+  if (!validSocketPath(path) || address(path) !== addr || !permittedSocketDirectory(dirname(path))) return undefined;
   try {
     const st = lstatSync(path);
     if (!st.isSocket() || st.isSymbolicLink() || st.uid !== uid) return undefined;
@@ -151,7 +202,8 @@ export function codexPeers() {
       const p = readPeerRecord(join(dir, f));
       if (!isSafePeerRecord(p) || !alive(p.pid)) continue;
       out.push({ kind: "codex", name: p.name, address: p.address, socket: peerSocket(p.address), cwd: p.cwd,
-        threadId: p.threadId, pid: p.pid, startedAt: p.startedAt });
+        threadId: p.threadId, pid: p.pid, startedAt: p.startedAt,
+        addresses: Array.isArray(p.addresses) ? p.addresses.slice(0, 16).filter((addr) => peerSocket(addr)) : [p.address] });
     } catch {}
   }
   return out;

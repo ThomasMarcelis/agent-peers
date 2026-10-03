@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { createServer } from "node:net";
 import { once } from "node:events";
@@ -141,4 +142,78 @@ test("Claude's runtime-directory preference and long-path fallback apply before 
   assert.equal(socketDir({ create: false }), join(f.dir, "runtime", "cc-socks"));
   process.env.XDG_RUNTIME_DIR = join(f.dir, "x".repeat(110));
   assert.equal(socketDir({ create: false }), `/tmp/cc-socks-${userInfo().uid}`);
+});
+
+
+test("mixed Claude directories preserve old Codex and unregistered Hermes reply addresses through churn", async (t) => {
+  const f = fixture(t), newer = join(f.dir, "new-socks"), untrusted = join(f.dir, "untrusted");
+  mkdirSync(newer, { mode: 0o700 }); mkdirSync(untrusted, { mode: 0o700 });
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  await once(child, "spawn");
+  t.after(async () => { const exited = once(child, "exit"); child.kill(); await exited; });
+  const [newPid, oldPid] = [process.pid, child.pid].sort((a, b) => String(a).localeCompare(String(b)));
+  const record = (pid, dir) => writeFileSync(join(f.claude, "sessions", `${pid}.json`), JSON.stringify({
+    pid, name: String(pid), messagingSocketPath: join(dir, `${pid}.sock`),
+  }));
+  rmSync(join(f.claude, "sessions", `${process.pid}.json`));
+  record(oldPid, f.sockets);
+  const codex = join(f.sockets, "codex-existing.sock"), hermes = join(f.sockets, "hermes-hidden.sock");
+  const messages = [], servers = [];
+  for (const path of [codex, hermes]) {
+    const server = createServer((connection) => readLines(connection, (line) => messages.push(line)));
+    server.listen(path); await once(server, "listening"); servers.push(server);
+  }
+  try {
+    writeFileSync(join(f.peers, "codex-existing.json"), JSON.stringify({
+      pid: process.pid, name: "codex:existing", threadId: "existing", address: address(codex),
+    }));
+    assert.equal(socketDir(), f.sockets);
+    await post(hermes, { phase: "before" });
+    record(newPid, newer);
+    assert.equal(socketDir(), newer, "new lowest registry PID changes the preferred bind directory");
+    assert.equal(claudeSessions().length, 2);
+    assert.equal(codexPeers()[0].address, address(codex));
+    assert.equal(peerSocket(address(hermes)), hermes);
+    await post(codex, { phase: "mixed" });
+    rmSync(join(f.claude, "sessions", `${oldPid}.json`));
+    assert.equal(codexPeers()[0].address, address(codex));
+    assert.equal(peerSocket(address(hermes)), hermes);
+    await post(hermes, { phase: "retired registry" });
+    assert.equal(peerSocket(address(join(untrusted, "hermes-forged.sock"))), undefined);
+    for (let i = 0; messages.length < 3 && i < 100; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(messages.map((message) => message.phase), ["before", "mixed", "retired registry"]);
+    chmodSync(f.sockets, 0o777);
+    assert.equal(peerSocket(address(hermes)), undefined);
+    chmodSync(f.sockets, 0o700);
+    assert.equal(peerSocket(address(hermes)), hermes);
+  } finally { await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve)))); }
+});
+
+test("remembered directories require the same owned inode and are scoped to the configured registries", (t) => {
+  const f = fixture(t), target = address(join(f.sockets, "hermes-hidden.sock"));
+  assert.equal(peerSocket(target), join(f.sockets, "hermes-hidden.sock"));
+  rmSync(join(f.claude, "sessions", `${process.pid}.json`));
+  assert.equal(peerSocket(target), join(f.sockets, "hermes-hidden.sock"));
+  const saved = join(f.dir, "saved");
+  renameSync(f.sockets, saved); symlinkSync(saved, f.sockets);
+  assert.equal(peerSocket(target), undefined);
+  rmSync(f.sockets); mkdirSync(f.sockets, { mode: 0o700 });
+  assert.equal(peerSocket(target), undefined);
+  rmSync(f.sockets, { recursive: true }); renameSync(saved, f.sockets);
+  assert.equal(peerSocket(target), join(f.sockets, "hermes-hidden.sock"));
+  process.env.CLAUDE_CONFIG_DIR = join(f.dir, "different-profile");
+  assert.equal(peerSocket(target), undefined);
+});
+
+test("both configured runtime and temp socket directories allow unregistered replies without Claude records", (t) => {
+  const f = fixture(t);
+  rmSync(join(f.claude, "sessions", `${process.pid}.json`));
+  process.env.TMPDIR = f.dir;
+  process.env.XDG_RUNTIME_DIR = join(f.dir, "runtime");
+  const runtime = join(process.env.XDG_RUNTIME_DIR, "cc-socks"), temp = join(f.dir, "cc-socks");
+  ensurePrivateDir(runtime); ensurePrivateDir(temp);
+  for (const directory of [runtime, temp]) {
+    const path = join(directory, "hermes-in-flight.sock");
+    assert.equal(peerSocket(address(path)), path);
+  }
 });

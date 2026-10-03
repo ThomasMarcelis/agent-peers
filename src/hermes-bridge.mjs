@@ -4,10 +4,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { AppServer } from "./app-server.mjs";
 import {
-  MAX_LINE, MAX_SOCKET_PATH, address, allPeers, messageLine, parseEnvelope, peerSocket, post, readLines, socketDir,
+  MAX_LINE, MAX_SOCKET_PATH, address, allPeers, messageLine, parseEnvelope, peerSocket, post, readLines,
 } from "./wire.mjs";
 
 const BUCKET = 30, REFILL_PER_S = 0.5, DEDUP_MS = 30_000, IDLE_MS = 600_000;
@@ -64,9 +64,9 @@ export class HermesBridge {
     const operation = previous.catch(() => {}).then(async () => {
       if (this.#closed) throw new Error("Hermes bridge is closed");
       if (method === "send_peer") return this.#send(session, params);
-      const route = this.#routes.get(session);
-      if (route) await this.#retire(route);
-      return { closed: Boolean(route) };
+      const routes = [...this.#routes.values()].filter((route) => route.session === session);
+      await Promise.all(routes.map((route) => this.#retire(route)));
+      return { closed: routes.length > 0 };
     });
     this.#locks.set(session, operation);
     try {
@@ -112,19 +112,28 @@ export class HermesBridge {
     };
   }
 
-  async #bind(session, name) {
-    const previous = this.#routes.get(session);
+  async #bind(session, name, directory) {
+    // Claude only accepts reply addresses in its own runtime directory. A
+    // conversation needs one private endpoint per destination directory.
+    const key = JSON.stringify([session, directory]);
+    for (const route of this.#routes.values()) {
+      if (route.session === session && route.name !== name) {
+        throw new Error("this conversation already belongs to a different Hermes identity");
+      }
+    }
+    const previous = this.#routes.get(key);
     if (previous) {
       if (previous.name !== name) throw new Error("this conversation already belongs to a different Hermes identity");
       return previous;
     }
     if (this.#routes.size >= SESSIONS_MAX) throw new Error("too many open Hermes conversation inboxes");
-    const socket = join(socketDir(), `hermes-${randomUUID().replaceAll("-", "")}.sock`);
+    const socket = join(directory, `hermes-${randomUUID().replaceAll("-", "")}.sock`);
     if (Buffer.byteLength(socket) > MAX_SOCKET_PATH) {
       throw new Error("peer socket path exceeds the 103-byte Unix limit; use a shorter XDG_RUNTIME_DIR for all participating agents");
     }
+    if (!peerSocket(address(socket))) throw new Error("unsafe Hermes reply inbox directory");
     const route = {
-      session, name, socket, address: address(socket), closed: false, connections: new Set(),
+      key, session, name, socket, address: address(socket), closed: false, connections: new Set(),
       buckets: new Map(), recent: new Map(), pending: new Map(), queued: 0, chain: Promise.resolve(),
     };
     route.server = createServer((conn) => {
@@ -142,7 +151,7 @@ export class HermesBridge {
       });
       route.owner = lstatSync(socket);
       chmodSync(socket, 0o600);
-      this.#routes.set(session, route);
+      this.#routes.set(key, route);
     } catch (error) {
       route.closed = true;
       for (const conn of route.connections) conn.destroy();
@@ -162,7 +171,7 @@ export class HermesBridge {
     const target = resolveTarget(to);
     const targetSocket = peerSocket(target.address);
     if (!targetSocket) throw new Error("the peer registry contains an invalid inbox address; call list_peers again");
-    const route = await this.#bind(session, name);
+    const route = await this.#bind(session, name, dirname(targetSocket));
     if (target.address === route.address) throw new Error("that address is this conversation's own inbox");
     // Claude labels every external envelope as another Claude session. Correct that frame.
     const body = target.kind === "codex" ? message : `${message}\n\n` +
@@ -235,7 +244,7 @@ export class HermesBridge {
 
   async #retire(route) {
     route.closed = true;
-    this.#routes.delete(route.session);
+    this.#routes.delete(route.key);
     for (const resolve of route.pending.values()) resolve("closed");
     route.pending.clear();
     for (const conn of route.connections) conn.destroy();

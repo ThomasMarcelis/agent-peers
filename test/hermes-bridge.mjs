@@ -144,6 +144,37 @@ test("private sessions send, receive replies, and remain absent from every regis
   assert.equal((await f.bridge.request("list_peers")).peers.length, 2);
 });
 
+test("one conversation keeps reply inboxes in each peer directory and closes them together", async (t) => {
+  const f = await fixture(t);
+  const otherDir = join(f.dir, "other");
+  mkdirSync(otherDir, { mode: 0o700 });
+  const otherSocket = join(otherDir, "claude-other.sock");
+  const other = createServer((conn) => readLines(conn, (line) => {
+    const sender = peerSocket(parseEnvelope(line.message.content).from);
+    assert.equal(dirname(sender), otherDir, "Claude can reply only within its own directory");
+    void post(sender, { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "delivered" });
+  }));
+  other.listen(otherSocket); await once(other, "listening");
+  t.after(() => new Promise((resolve) => other.close(resolve)));
+  const first = await f.send("mixed", "claude:test");
+  // A registry change must not invalidate the existing conversation's first endpoint.
+  writeFileSync(join(f.claude, "sessions", `${process.pid}.json`), JSON.stringify({
+    pid: process.pid, name: "other", messagingSocketPath: otherSocket,
+  }));
+  const second = await f.send("mixed", "claude:other");
+  assert.notEqual(first.address, second.address);
+  assert.equal(second.status, "delivered");
+  for (const [sent, source] of [[first, join(f.sockets, "claude-test.sock")], [second, otherSocket]]) {
+    await post(peerSocket(sent.address), messageLine({ from: address(source), body: source }));
+  }
+  await until(() => f.events.length === 2);
+  assert.ok(f.events.every((e) => e.params.session === "mixed"));
+  assert.equal((await f.send("mixed", address(join(f.sockets, "claude-test.sock")))).address, first.address);
+  await f.bridge.request("close_session", { session: "mixed" });
+  assert.equal(existsSync(first.address.slice(4)), false);
+  assert.equal(existsSync(second.address.slice(4)), false);
+});
+
 test("receipt controls never become chat, and held delivery status is preserved", async (t) => {
   const f = await fixture(t, { status: "held" });
   const sent = await f.send("held");

@@ -186,3 +186,64 @@ test("binding rejects an oversized UTF-8 pathname before creating or renaming a 
   assert.deepEqual(readdirSync(f.sockets), ["claude.sock"]);
   assert.deepEqual(readdirSync(f.peers), []);
 });
+
+
+test("MCP refresh preserves its primary address and eagerly restores destination-specific aliases", async (t) => {
+  const f = await fixture(t), old = await f.start();
+  await old.call("list_peers");
+  const original = JSON.parse(readFileSync(f.registry, "utf8"));
+  const newer = join(f.dir, "new-socks"); mkdirSync(newer, { mode: 0o700 });
+  const destination = join(newer, "claude-new.sock"), received = [];
+  const receiver = createServer((connection) => readLines(connection, (line) => {
+    received.push(line);
+    void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "delivered" }).catch(() => {});
+    void post(peerSocket(line.from), messageLine({ from: address(destination), body: "reply through the new alias" })).catch(() => {});
+  }));
+  receiver.listen(destination); await once(receiver, "listening");
+  try {
+    // Preserve the old directory's verified record, while a lexically earlier registry
+    // switches the preferred directory before the replacement MCP process starts.
+    const claude = join(f.dir, "claude", "sessions");
+    writeFileSync(join(claude, `${old.transport.pid}.json`), JSON.stringify({
+      pid: old.transport.pid, name: "old", messagingSocketPath: f.inbox,
+    }));
+    writeFileSync(join(claude, `${process.pid}.json`), JSON.stringify({
+      pid: process.pid, name: "new", messagingSocketPath: destination,
+    }));
+    const current = await f.start(); await current.call("list_peers");
+    const record = JSON.parse(readFileSync(f.registry, "utf8"));
+    assert.equal(record.address, original.address);
+    assert.equal(record.addresses.length, 2);
+    const alias = record.addresses.find((addr) => dirname(peerSocket(addr)) === newer);
+    assert.ok(alias, "an alias exists before the first outgoing send");
+    await old.close();
+    assert.equal(existsSync(peerSocket(original.address)), true);
+    assert.equal(existsSync(peerSocket(alias)), true);
+    const result = await current.call("send_peer", { to: "claude:new", message: "same-directory reply please" });
+    assert.match(result.content[0].text, /Delivered/);
+    assert.equal(parseEnvelope(received[0].message.content).from, alias);
+    await until(() => f.turns.length === 1);
+    assert.equal(f.turns[0].threadId, thread);
+    const oldTarget = await current.call("send_peer", { to: address(f.inbox), message: "old reply path" });
+    assert.match(oldTarget.content[0].text, /Delivered/);
+    assert.equal(parseEnvelope(f.messages.at(-1).message.content).from, original.address);
+    await current.close();
+    for (const addr of record.addresses) assert.equal(existsSync(addr.slice(4)), false);
+    assert.deepEqual(readdirSync(f.sockets), ["claude.sock"]);
+    assert.deepEqual(readdirSync(newer), ["claude-new.sock"]);
+  } finally { await new Promise((resolve) => receiver.close(resolve)); }
+});
+
+test("an unverified listener at the deterministic inbox pathname is never overwritten", async (t) => {
+  const f = await fixture(t), socket = join(f.sockets, `codex-${thread.replace(/-/g, "").slice(-16)}.sock`);
+  const occupied = createServer(); occupied.listen(socket); await once(occupied, "listening");
+  const identity = lstatSync(socket);
+  try {
+    const peer = await f.start();
+    const result = await peer.call("send_peer", { to: "claude:test", message: "hello" });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /unverified listener/);
+    assert.equal(lstatSync(socket).ino, identity.ino);
+    assert.equal(existsSync(f.registry), false);
+  } finally { await new Promise((resolve) => occupied.close(resolve)); }
+});
