@@ -1,6 +1,6 @@
 # Compatibility
 
-agent-peers 0.1.0 is an initial release. Its CLI and MCP tools are small, but the agent runtimes it connects expose version-sensitive interfaces. A newer agent release is not automatically compatible.
+agent-peers 0.1.x is the initial release line. Its CLI and MCP tools are small, but the agent runtimes it connects expose version-sensitive interfaces. A newer agent release is not automatically compatible.
 
 ## Runtime requirements
 

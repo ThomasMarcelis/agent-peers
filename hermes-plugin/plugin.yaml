@@ -1,5 +1,5 @@
 name: agent-peers
-version: "0.1.0"
+version: "0.1.1"
 description: "Discover and message local Claude Code and Codex sessions from an unlisted Hermes inbox."
 manifest_version: 1
 provides_tools:

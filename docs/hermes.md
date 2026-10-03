@@ -12,7 +12,7 @@ Use the [verified Hermes fork](compatibility.md#tested-agent-builds), Python 3.1
 hermes plugins install ThomasMarcelis/agent-peers --enable
 ```
 
-For a reproducible release install, add `--ref` followed by the full 40-character commit from the [GitHub release](https://github.com/ThomasMarcelis/agent-peers/releases/tag/v0.1.0). Hermes does not accept tag names for this flag. Use `hermes --profile NAME plugins install ...` for a named profile. Current Hermes installers can offer to install the plugin's Node dependencies; accept that step. Older fork installers need a separate install in the plugin directory printed by Hermes:
+For a reproducible release install, add `--ref` followed by the full 40-character commit from the [GitHub release](https://github.com/ThomasMarcelis/agent-peers/releases/tag/v0.1.1). Hermes does not accept tag names for this flag. Use `hermes --profile NAME plugins install ...` for a named profile. Current Hermes installers can offer to install the plugin's Node dependencies; accept that step. Older fork installers need a separate install in the plugin directory printed by Hermes:
 
 ```sh
 npm --prefix /absolute/plugin/directory ci --omit=dev --ignore-scripts

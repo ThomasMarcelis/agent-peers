@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1 — 2026-10-03
+
+- Clearer quick start for independent Claude Code and Codex sessions, with separate setup instructions and a practical coordination example.
+- More descriptive npm search metadata and an MCP Registry ownership marker for a future listing.
+- Empty discovery now explains how to open a Codex inbox instead of claiming no agents are running.
+- Unsupported Hermes conversations link to the required host and setup instead of suggesting a stock Hermes update.
+
+Documentation, package metadata, and diagnostic wording only; transport behavior is unchanged from 0.1.0.
+
 ## 0.1.0 — 2026-10-03
 
 First public release.

@@ -70,7 +70,11 @@ class PeerTools:
         if not isinstance(args.get("message"), str) or not args["message"].strip():
             return {"error": "message must be nonempty text"}
         if not session_id or not self._supports_replies():
-            return {"error": "This Hermes runtime has no conversation-addressed reply route; update Hermes and open a supported conversation."}
+            return {"error": (
+                "No conversation-addressed reply route is available. "
+                "Use a supported conversation on the documented Hermes fork: "
+                "https://github.com/ThomasMarcelis/agent-peers/blob/main/docs/hermes.md"
+            )}
         with self._lock:
             if self._closed:
                 return {"error": "agent-peers plugin has been unloaded"}

@@ -2,6 +2,8 @@
 
 Verified on 2026-10-03 for 0.1.0. Raw live transcripts are excluded from the repository and package.
 
+Version 0.1.1 changes documentation, package metadata, and diagnostic wording only. Its transport is unchanged from the live-verified 0.1.0 release.
+
 ## Automated checks
 
 | Check | Result |

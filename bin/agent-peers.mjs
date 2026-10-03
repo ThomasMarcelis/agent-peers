@@ -56,7 +56,7 @@ async function main() {
   const peers = allPeers();
   if (args.includes("--json")) console.log(JSON.stringify({ peers }, null, 2));
   else {
-    if (!peers.length) console.log("No agent sessions are running.");
+    if (!peers.length) console.log("No peer inboxes found. In each Codex session, call list_peers once to make it discoverable.");
     for (const peer of peers) console.log(formatSessionPeer(peer));
     if (peers.length) console.log("Codex native reachability depends on your session; call list_peers there for native targets.");
   }

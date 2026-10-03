@@ -4,73 +4,65 @@
 [![npm](https://img.shields.io/npm/v/agent-peers)](https://www.npmjs.com/package/agent-peers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Let **Claude Code, Codex, and Hermes conversations message each other** on one machine. Discover a session, send a message, and receive its reply in the conversation that asked. No broker, task board, or polling loop.
+**Agent-to-agent messaging for Claude Code and Codex.** Independent sessions working in different tools and projects can ask each other questions, coordinate changes, and return answers to the conversation that asked. Each keeps its own context and workflow.
 
-[Hermes plugin](docs/hermes.md) · [Compatibility](docs/compatibility.md) · [Protocol and configuration](docs/reference.md)
+Ask Codex:
 
-## Install
+> Find the Claude session working on the API. Ask which response shape it chose, then use its answer for the client.
 
-Requires **Node.js 22+** on Linux or macOS. Agent integration compatibility is version-sensitive; see the [tested configurations](docs/compatibility.md).
+[Get started](#get-started) · [Hermes plugin](#hermes-experimental) · [Compatibility](docs/compatibility.md) · [Reference](docs/reference.md)
+
+## Why agent-peers
+
+- **Coordinate independent sessions.** Claude ↔ Codex, Claude ↔ Claude, and Codex ↔ Codex, across repositories.
+- **Replies arrive in context.** Agents receive messages while idle or busy, through their host's normal conversation handling.
+- **Local transport.** Direct Unix sockets on the same machine and OS user. No extra service to run or account to configure.
+
+Backed by [live Claude/Codex round trips, Hermes routing tests, and Linux/macOS CI](docs/release-verification.md).
+
+## Get started
+
+Requires **Node.js 22+**, Linux or macOS, and [compatible agent versions](docs/compatibility.md#tested-agent-builds).
 
 ```sh
-npm install -g agent-peers@0.1.0
+npm install -g agent-peers@0.1.1
+```
+
+### Codex (MCP server)
+
+```sh
 codex mcp add agent-peers -- codex-peer
 ```
 
-Start a new Codex session. Ask it to call `list_peers` once to open its inbox. Codex must use its shared app-server; sessions started with `-c` overrides or `--no-daemon` are unsupported.
+Start a new Codex session. **Ask each Codex session to call `list_peers` once** to open its inbox. It can then use `send_peer(to, message)` to contact a listed peer and receive replies automatically.
 
-Claude Code already provides messaging. Add this to its instructions:
+Codex must use its shared app-server. Sessions started with `-c` overrides or `--no-daemon` are unsupported.
 
-> Run `agent-peers list` to discover Codex and Claude sessions. Use `SendMessage` with a listed `uds:` address as `to`. Replies arrive in this conversation. Keep coordination concise and relevant to the user's task.
+### Claude Code
 
-## Use
+Uses Claude's native `SendMessage`; no MCP server is needed. Add this to your agent instructions:
 
-Ask your agent:
+> Run `agent-peers list` to discover peers. Use `SendMessage` with a listed `uds:` address as `to`. Replies arrive in this conversation. Keep coordination concise and relevant to the task.
 
-> Find the agent working on the API, ask which response shape it chose, and use its answer for the client.
-
-Or inspect discovery yourself:
+Inspect available peers or check your installation:
 
 ```sh
 agent-peers list
-agent-peers list --json
 agent-peers doctor
 ```
 
-| Tool | Purpose |
-| --- | --- |
-| `list_peers()` | Discover sessions and their exact messaging targets. Codex also identifies reachable native subagents. |
-| `send_peer(to, message)` | Send to a listed name, inbox address, or an incoming message's reply address. |
+### Hermes (experimental)
 
-Messages are framed as coming from another agent, with a reply address. They carry no user approval. A successful send means the recipient's inbox accepted the message, not that its model read or answered it.
-
-## Hermes (experimental)
-
-Install as a native plugin; the standalone tools remain independent of Hermes:
+A native plugin lets Hermes contact Claude and Codex, with private replies to the originating conversation. **Sending requires the [documented Hermes fork](docs/compatibility.md#tested-agent-builds); stock Hermes supports discovery only.**
 
 ```sh
 hermes plugins install ThomasMarcelis/agent-peers --enable
 ```
 
-**Automatic replies require the documented Hermes fork.** Stock Hermes can discover peers but lacks the conversation-routing APIs needed for automatic replies; sending fails clearly. See [Hermes setup](docs/hermes.md) for dependencies, the explicit injection grant, and the exact tested host revision.
+Complete the [dependency setup and injection grant](docs/hermes.md). Hermes stays hidden from discovery and opens a private reply inbox on its first send. Discord routing is verified; CLI/Desktop lifecycle behavior remains experimental.
 
-Hermes stays hidden from discovery. Each conversation creates a private reply inbox on its first send. Discord gateway routing is verified; CLI and Desktop/TUI lifecycle behavior remains experimental on the current fork.
+## Scope
 
-## Boundaries
+Messages are peer input, never user approval. Host approval rules still apply. Delivery confirms inbox acceptance, not a model response. There is no offline mailbox; closed conversations become unreachable. See [delivery and troubleshooting](docs/reference.md) and the [security boundary](SECURITY.md).
 
-- Same machine and OS user, using owner-controlled Unix sockets. Sender identities are not cryptographically authenticated.
-- No offline mailbox or automatic delivery retry. Closed conversations become unreachable.
-- Claude's inbound approval rules still apply. Rate limits and duplicate suppression reduce accidental chatter; they do not guarantee an agent conversation ends.
-
-## Development
-
-```sh
-npm ci
-npm run check
-npm test
-npm run test:package
-```
-
-These checks use local fixtures and no model credentials. Python and real-host checks are described in [CONTRIBUTING.md](CONTRIBUTING.md). Live model tests are separate and consume your agent subscriptions.
-
-MIT. See [LICENSE](LICENSE).
+[Contributing and tests](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [MIT license](LICENSE)
