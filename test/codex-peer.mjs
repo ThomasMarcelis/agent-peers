@@ -55,9 +55,9 @@ async function fixture(t, options = {}) {
     }
   }));
   http.listen(daemon); await once(http, "listening");
-  const start = async () => {
+  const start = async (extraEnv = {}) => {
     const transport = new StdioClientTransport({ command: process.execPath, args: [join(root, "src", "codex-peer.mjs")],
-      env: { ...process.env, CLAUDE_CONFIG_DIR: claude, AGENT_PEERS_HOME: peers, AGENT_PEERS_CODEX_APP_SERVER: daemon }, stderr: "pipe" });
+      env: { ...process.env, CLAUDE_CONFIG_DIR: claude, AGENT_PEERS_HOME: peers, AGENT_PEERS_CODEX_APP_SERVER: daemon, ...extraEnv }, stderr: "pipe" });
     const client = new Client({ name: "test", version: "1" });
     transport.stderr.resume();
     await client.connect(transport);
@@ -318,4 +318,42 @@ test("refresh takes over prior permitted aliases without live Claude records, an
     const result = await current.call("send_peer", { to: address(destination), message: "after alias repair" });
     assert.match(result.content[0].text, /Delivered/);
   } finally { await new Promise((resolve) => receiver.close(resolve)); }
+});
+
+test("a replacement appearing between repair validation and publication is never overwritten", async (t) => {
+  const f = await fixture(t), marker = join(f.dir, "race"), contenderPath = join(f.sockets, "contender.sock");
+  const socket = join(f.sockets, `codex-${thread.replaceAll("-", "").slice(-16)}.sock`);
+  const contender = createServer((connection) => connection.end());
+  contender.listen(contenderPath); await once(contender, "listening");
+  const original = lstatSync(contenderPath);
+  const preload = join(f.dir, "race.mjs");
+  writeFileSync(preload, `
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    const link = fs.linkSync, rename = fs.renameSync;
+    function interleave(destination) {
+      if (destination === ${JSON.stringify(socket)} && fs.existsSync(${JSON.stringify(marker)})) {
+        fs.unlinkSync(${JSON.stringify(marker)});
+        link(${JSON.stringify(contenderPath)}, destination);
+      }
+    }
+    fs.linkSync = (source, destination) => { interleave(destination); return link(source, destination); };
+    fs.renameSync = (source, destination) => { interleave(destination); return rename(source, destination); };
+    syncBuiltinESMExports();
+  `);
+  try {
+    const peer = await f.start({ NODE_OPTIONS: `--import=${preload}` });
+    await peer.call("list_peers");
+    rmSync(socket); writeFileSync(marker, "inject the competing listener at publication");
+    const result = await peer.call("send_peer", { to: "claude:test", message: "must fail safely" });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /replaced/);
+    assert.equal(existsSync(marker), false, "race was injected after the validation check");
+    assert.equal(lstatSync(socket).ino, original.ino);
+    await peer.close();
+    assert.equal(lstatSync(socket).ino, original.ino, "failed repair cleanup preserves the competitor");
+  } finally {
+    rmSync(socket, { force: true });
+    await new Promise((resolve) => contender.close(resolve));
+  }
 });

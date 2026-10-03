@@ -7,7 +7,7 @@
 
 import { VERSION } from "./version.mjs";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, lstatSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, linkSync, lstatSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { basename, dirname, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -153,7 +153,7 @@ async function createInbox(caller, directory, { requireMissing = false } = {}) {
     connections.add(conn);
     conn.once("close", () => connections.delete(conn));
     readLines(conn, (line) => {
-      if (self === caller && ownsSocket(caller) && ownsSocket(inbox)) receive(line);
+      if (self === caller && ownsRegistry(caller) && ownsSocket(caller) && ownsSocket(inbox)) receive(line);
     });
   });
   server.maxConnections = CONNECTION_MAX;
@@ -172,7 +172,19 @@ async function createInbox(caller, directory, { requireMissing = false } = {}) {
         throw new Error("this inbox was replaced; restart this MCP connection");
       } catch (error) { if (error.code !== "ENOENT") throw error; }
     }
-    renameSync(temporary, socket);
+    if (!requireMissing && caller.takeover.has(inboxAddress)) {
+      renameSync(temporary, socket);
+    } else {
+      // Publish a missing endpoint without replacing a socket another process
+      // created after our checks. A bound Unix socket can have a second link;
+      // libuv still owns only its unique temporary pathname for close cleanup.
+      try { linkSync(temporary, socket); }
+      catch (error) {
+        if (error.code === "EEXIST") throw new Error("this inbox was replaced; retry after the current owner is ready");
+        throw error;
+      }
+      rmSync(temporary);
+    }
     return inbox;
   } catch (error) {
     server.close();
