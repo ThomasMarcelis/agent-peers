@@ -1,0 +1,22 @@
+name: Bug report
+description: Report reproducible messaging, installation, or routing failures.
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include what you expected and the smallest reproduction. Do not paste credentials or private transcripts.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: agent-peers, Node, OS, and affected agent versions. For Hermes, include the host revision and surface (CLI, gateway, or Desktop/TUI).
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Relevant diagnostics
+      description: Review and redact local paths and session details before sharing logs or doctor output.

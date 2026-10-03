@@ -11,6 +11,7 @@ import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { AppServer } from "../src/app-server.mjs";
+import { address } from "../src/wire.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const codexOnly = process.argv.includes("--codex-only");
@@ -31,14 +32,15 @@ const quote = (s) => `'${s.replaceAll("'", "'\\''")}'`;
 const log = (s) => console.log(`${new Date().toISOString()} ${s}`);
 const saveReport = () => writeFileSync(join(output, "report.json"), JSON.stringify(report, null, 2) + "\n");
 mkdirSync(output, { recursive: true });
-mkdirSync(registry);
-mkdirSync(join(claudeRegistry, "sessions"), { recursive: true });
+mkdirSync(registry, { mode: 0o700 });
+mkdirSync(join(claudeRegistry, "sessions"), { recursive: true, mode: 0o700 });
 
 async function until(label, fn, timeoutMs = 240_000) {
   const end = Date.now() + timeoutMs;
   let progress = Date.now();
   while (Date.now() < end) {
     if (cancelled) throw new Error(`Test interrupted by ${cancelled}`);
+    if (report.processError) throw new Error(report.processError);
     for (const p of participants) {
       const failure = p.events?.find((e) => e.type === "result" && e.is_error);
       if (failure) throw new Error(`${p.label}: ${failure.result ?? failure.terminal_reason}`);
@@ -62,11 +64,13 @@ function launch(label, command, args, options = {}) {
   p.testLabel = label;
   processes.push(p);
   p.on("error", (e) => { report.processError = `${label}: ${e.message}`; });
+  p.stdin.on("error", (e) => { report.processError ??= `${label} input: ${e.message}`; });
   p.stderr.on("data", (data) => appendFileSync(join(output, `${label}.stderr.log`), data));
   return p;
 }
 
 async function cleanup() {
+  await app?.close?.();
   for (const p of [...processes].reverse()) {
     try { process.kill(-p.pid, "SIGTERM"); } catch {}
   }
@@ -160,7 +164,7 @@ async function coordinationCheck() {
 async function run() {
   report.versions = {
     codex: execFileSync("codex", ["--version"], { encoding: "utf8" }).trim(),
-    claude: execFileSync("claude", ["--version"], { encoding: "utf8" }).trim(),
+    ...(!codexOnly ? { claude: execFileSync("claude", ["--version"], { encoding: "utf8" }).trim() } : {}),
   };
   log(`evidence: ${output}`);
   const sourceClaudeHome = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
@@ -198,18 +202,19 @@ async function run() {
     }, 90_000);
     // Mirror only these real session metadata entries for isolated discovery. The processes
     // and sockets are the real Claude sessions; no credentials are copied or changed.
-    writeFileSync(join(claudeRegistry, "sessions", `${p.process.pid}.json`), JSON.stringify(meta));
-    p.address = "uds:" + meta.messagingSocketPath;
+    writeFileSync(join(claudeRegistry, "sessions", `${p.process.pid}.json`), JSON.stringify(meta), { mode: 0o600 });
+    p.address = address(meta.messagingSocketPath);
     p.name = `claude:${meta.name ?? meta.pid}`;
     await until(`${p.label} ready`, () => assistantText(p).includes(`READY ${p.label}`));
     log(`${p.label} ready: ${p.name}`);
   }
 
-  const config = readFileSync(join(process.env.CODEX_HOME || join(homedir(), ".codex"), "config.toml"), "utf8");
-  const disable = [...config.matchAll(/^\[mcp_servers\.("?)([^\]."]+)\1\]/gm)]
-    .filter((m) => m[2] !== "agent-peers").map((m) => `mcp_servers.${m[2]}.enabled=false`);
+  const configPath = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "config.toml");
+  const config = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+  const disable = [...new Set([...config.matchAll(/^\s*\[\s*mcp_servers\s*\.\s*("(?:[^"\\]|\\.)*"|'[^']*'|[A-Za-z0-9_-]+)(?:\s*\.[^\]\n]*)?\s*\]/gm)]
+    .map((match) => `mcp_servers.${match[1]}.enabled=false`))];
   const overrides = [...disable, "features.hooks=false", "features.memories=false",
-    'mcp_servers.agent-peers.command="node"', 'mcp_servers.agent-peers.default_tools_approval_mode="approve"',
+    'mcp_servers.agent-peers.enabled=true', `mcp_servers.agent-peers.command=${JSON.stringify(process.execPath)}`, 'mcp_servers.agent-peers.default_tools_approval_mode="approve"',
     `mcp_servers.agent-peers.args=[${JSON.stringify(join(root, "src/codex-peer.mjs"))}]`,
     `mcp_servers.agent-peers.env={AGENT_PEERS_CODEX_APP_SERVER=${JSON.stringify(appSocket)},AGENT_PEERS_HOME=${JSON.stringify(registry)},CLAUDE_CONFIG_DIR=${JSON.stringify(claudeRegistry)},AGENT_PEERS_LOG=${JSON.stringify(join(output, "codex-peer.log"))}}`,
   ];

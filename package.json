@@ -1,15 +1,61 @@
 {
   "name": "agent-peers",
   "version": "0.1.0",
-  "private": true,
-  "description": "Local messaging between Claude Code, Codex, and hidden Hermes conversations",
+  "description": "Local peer messaging for Claude Code, Codex, and Hermes agents",
+  "license": "MIT",
+  "author": "Thomas Marcelis",
+  "homepage": "https://github.com/ThomasMarcelis/agent-peers#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThomasMarcelis/agent-peers.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ThomasMarcelis/agent-peers/issues"
+  },
+  "keywords": [
+    "hermes",
+    "codex",
+    "claude-code",
+    "mcp",
+    "agents",
+    "ipc"
+  ],
   "type": "module",
+  "files": [
+    "bin/",
+    "src/",
+    "agent_peers/",
+    "__init__.py",
+    "plugin.yaml",
+    "hermes-plugin/",
+    "scripts/install-hermes-plugin.py",
+    "docs/",
+    "CLAUDE-snippet.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "after-install.md",
+    "!**/__pycache__/**",
+    "!**/*.pyc"
+  ],
+  "os": [
+    "linux",
+    "darwin"
+  ],
   "bin": {
     "agent-peers": "bin/agent-peers.mjs",
     "codex-peer": "src/codex-peer.mjs"
   },
   "engines": {
     "node": ">=22"
+  },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test": "node --test test/discovery.mjs test/hermes-bridge.mjs test/wire.mjs test/app-server.mjs test/codex-peer.mjs test/cli.mjs",
+    "test:python": "python3 -m pytest -q",
+    "test:package": "node scripts/test-package.mjs",
+    "test:live": "node test/live-matrix.mjs",
+    "test:live:hermes": "node test/hermes-live.mjs",
+    "prepublishOnly": "npm run check && npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1",

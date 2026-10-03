@@ -5,7 +5,9 @@
 // delivers each inbound line into its thread as a framed peer message, mid-turn or waking an
 // idle thread. Outbound messages use the same line format, so Claude replies with SendMessage.
 
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { VERSION } from "./version.mjs";
+import { createHash, randomUUID } from "node:crypto";
+import { appendFileSync, chmodSync, lstatSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -15,14 +17,16 @@ import { AppServer } from "./app-server.mjs";
 import { codexDiscovery, formatCodexPeer } from "./discovery.mjs";
 import { coordinationGuidance } from "./guidance.mjs";
 import {
-  address, alive, allPeers, codexPeers, messageLine, parseEnvelope, peerSocket, peersHome, post,
-  readLines, slug, socketDir, socketPath,
+  MAX_LINE, address, alive, allPeers, codexPeers, ensurePrivateDir, isSafePeerRecord, messageLine, parseEnvelope, peerSocket, peersHome, post,
+  readLines, readPeerRecord, slug, socketDir, validThreadId,
 } from "./wire.mjs";
 
 const log = (...a) => {
   const line = `${new Date().toISOString()} [codex-peer ${process.pid}] ${a.join(" ")}`;
-  if (process.env.AGENT_PEERS_LOG) appendFileSync(process.env.AGENT_PEERS_LOG, line + "\n");
-  else console.error(line);
+  try {
+    if (process.env.AGENT_PEERS_LOG) appendFileSync(process.env.AGENT_PEERS_LOG, line + "\n", { mode: 0o600 });
+    else console.error(line);
+  } catch { console.error(line); }
 };
 const app = new AppServer();
 
@@ -39,7 +43,7 @@ const bind = (meta) => (binding = binding.then(() => bindNow(meta), () => bindNo
 // Guessing earlier, say by cwd, can bind to another session's thread.
 async function bindNow(meta) {
   const threadId = meta?.threadId;
-  if (!threadId) throw new Error("Codex did not identify this session's thread");
+  if (!validThreadId(threadId)) throw new Error("Codex did not identify this session with a valid thread ID");
   if (self?.threadId === threadId) return self;
   unbind();
   // Delivery goes through the shared app-server daemon. A Codex started with -c overrides or
@@ -52,63 +56,94 @@ async function bindNow(meta) {
   const t = await app.readThread(threadId);
   let rootId = threadId;
   for (let p = t.parentThreadId, depth = 0; p && depth < 16; depth++) {
+    if (!validThreadId(p)) throw new Error("app-server returned an invalid parent thread ID");
     rootId = p;
     p = (await app.readThread(p)).parentThreadId;
   }
-  const name = `codex:${slug(t.name || t.agentNickname || "") || slug(t.cwd)}-${threadId.replace(/-/g, "").slice(-4)}`;
+  const name = `codex:${slug(t.name || t.agentNickname || "") || slug(t.cwd || "session")}-${threadId.replace(/-/g, "").slice(-4)}`;
   if (rootId !== threadId) {
     // Codex refuses input for sub-agent threads, so a sub-agent sends under its root session's
     // address and replies land there, as with Claude sub-agents.
     self = { threadId, rootId, name, subagent: true };
     return self;
   }
-  mkdirSync(peersHome(), { recursive: true, mode: 0o700 });
+  ensurePrivateDir(peersHome());
   dropDeadOwners();
-  const socket = join(socketDir(), `codex-${threadId.replace(/-/g, "").slice(-16)}.sock`);
-  // A newer codex-peer for the same thread (Codex restarted its MCP servers) takes over the
-  // inbox; the older one then leaves the files alone because it no longer owns them.
-  rmSync(socket, { force: true });
-  const server = createServer((conn) => readLines(conn, (line) => receive(line)));
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socket, resolve);
+  const directory = socketDir();
+  const socket = join(directory, `codex-${threadId.replace(/-/g, "").slice(-16)}.sock`);
+  if (!peerSocket(address(socket))) throw new Error("unsafe existing Codex inbox path");
+  // libuv unlinks the original bind path when server.close() runs. Bind a unique path and
+  // rename it into place, so an old listener can never unlink a replacement's public socket.
+  const token = randomUUID();
+  const temporary = join(directory, `.ap-${token.slice(0, 8)}.sock`);
+  const connections = new Set();
+  const server = createServer((conn) => {
+    if (connections.size >= CONNECTION_MAX) return conn.destroy();
+    connections.add(conn);
+    conn.once("close", () => connections.delete(conn));
+    readLines(conn, (line) => { if (self?.token === token && ownsSocket(self)) receive(line); });
   });
+  server.maxConnections = CONNECTION_MAX;
+  server.on("error", (error) => log("inbox error:", error.message));
   const registry = join(peersHome(), `codex-${threadId}.json`);
-  self = { threadId, rootId, name, subagent: false, address: address(socket), socket, server, registry };
-  writeFileSync(registry, JSON.stringify({
-    name, address: self.address, cwd: t.cwd, threadId, pid: process.pid, startedAt: Date.now(),
-  }));
+  const registryTemp = join(peersHome(), `.codex-${token}.json`);
+  let identity;
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(temporary, () => { server.off("error", reject); resolve(); });
+    });
+    chmodSync(temporary, 0o600);
+    identity = lstatSync(temporary);
+    renameSync(temporary, socket);
+    writeFileSync(registryTemp, JSON.stringify({
+      name, address: address(socket), cwd: t.cwd, threadId, pid: process.pid, startedAt: Date.now(), token,
+    }), { mode: 0o600, flag: "wx" });
+    renameSync(registryTemp, registry);
+    self = { threadId, rootId, name, subagent: false, address: address(socket), socket, server, registry,
+      token, identity, connections };
+  } catch (error) {
+    server.close();
+    rmSync(temporary, { force: true });
+    rmSync(registryTemp, { force: true });
+    if (identity && sameFile(socket, identity)) rmSync(socket, { force: true });
+    throw error;
+  }
   log(`bound ${name} (${threadId}) at ${socket}`);
   return self;
 }
 
-const ownedByUs = () => {
-  try {
-    return JSON.parse(readFileSync(self.registry, "utf8")).pid === process.pid;
-  } catch {
-    return false;
-  }
-};
+function sameFile(path, expected) {
+  try { const current = lstatSync(path); return current.dev === expected.dev && current.ino === expected.ino; }
+  catch { return false; }
+}
+const ownsSocket = (caller) => !!caller?.identity && sameFile(caller.socket, caller.identity);
 
 function unbind() {
   if (!self) return;
-  self.server?.close();
-  if (self.registry && ownedByUs()) {
-    rmSync(self.socket, { force: true });
-    rmSync(self.registry, { force: true });
-  }
+  const old = self;
   self = undefined;
+  for (const connection of old.connections ?? []) connection.destroy();
+  old.server?.close();
+  if (ownsSocket(old)) rmSync(old.socket, { force: true });
+  if (old.registry) {
+    try {
+      if (readPeerRecord(old.registry).token === old.token) rmSync(old.registry, { force: true });
+    } catch {}
+  }
+  buckets.clear(); recent.clear();
 }
 
-// A hard-killed codex-peer leaves its registry entry and inbox behind. Remove only those whose
-// recorded owner process is gone; never infer anything from a socket's absence elsewhere.
+// A hard-killed codex-peer leaves files behind. A record may only clean its own deterministic
+// inbox; a forged dead record must not remove some other peer's socket.
 function dropDeadOwners() {
-  for (const f of readdirSync(peersHome()).filter((f) => f.startsWith("codex-") && f.endsWith(".json"))) {
+  for (const f of readdirSync(peersHome()).filter((f) => /^codex-[A-Za-z0-9_-]+\.json$/.test(f))) {
     try {
-      const entry = JSON.parse(readFileSync(join(peersHome(), f), "utf8"));
-      if (alive(entry.pid)) continue;
+      const entry = readPeerRecord(join(peersHome(), f));
+      if (!isSafePeerRecord(entry) || f !== `codex-${entry.threadId}.json` || alive(entry.pid)) continue;
       const socket = peerSocket(entry.address);
-      if (socket) rmSync(socket, { force: true });
+      const expected = join(socketDir(), `codex-${entry.threadId.replace(/-/g, "").slice(-16)}.sock`);
+      if (socket === expected) rmSync(socket, { force: true });
       rmSync(join(peersHome(), f), { force: true });
     } catch {}
   }
@@ -117,28 +152,32 @@ function dropDeadOwners() {
 // --- inbound --------------------------------------------------------------------------------
 
 const BUCKET = 30, REFILL_PER_S = 0.5, DEDUP_MS = 30_000, QUEUE_MAX = 50, IDLE_MS = 600_000;
+const CONNECTION_MAX = 32, SENDERS_MAX = 1024, RECENT_MAX = 2048, QUEUE_BYTES_MAX = 8_000_000;
 const buckets = new Map(); // from -> { tokens, at }
 const recent = new Map(); // from + body -> time
 const pending = new Map(); // msg_id -> resolve(status) for receipts on our own sends
-let queued = 0;
+let queued = 0, queuedBytes = 0;
 let chain = Promise.resolve();
 
 function admit(from, body) {
   const now = Date.now();
   for (const [k, b] of buckets) if (now - b.at > IDLE_MS) buckets.delete(k);
   for (const [k, t] of recent) if (now - t > DEDUP_MS) recent.delete(k);
+  if (!buckets.has(from) && buckets.size >= SENDERS_MAX) return false;
   const b = buckets.get(from) ?? { tokens: BUCKET, at: now };
   b.tokens = Math.min(BUCKET, b.tokens + ((now - b.at) / 1000) * REFILL_PER_S);
   b.at = now;
   buckets.set(from, b);
-  const key = from + "\0" + body;
-  if (b.tokens < 1 || recent.has(key) || queued >= QUEUE_MAX) return false;
+  const key = createHash("sha256").update(from).update("\0").update(body).digest("hex");
+  if (b.tokens < 1 || recent.has(key) || queued >= QUEUE_MAX || queuedBytes + Buffer.byteLength(body) > QUEUE_BYTES_MAX) return false;
   b.tokens -= 1;
+  if (recent.size >= RECENT_MAX) recent.delete(recent.keys().next().value);
   recent.set(key, now);
   return true;
 }
 
 function receive(line) {
+  if (!line || typeof line !== "object") return;
   if (line.type === "control" && line.action === "peer_message_status") {
     pending.get(line.orig_msg_id)?.(line.status);
     return;
@@ -147,12 +186,16 @@ function receive(line) {
   // Only a well-formed envelope with a valid peer reply address is delivered; anything else
   // could not be answered and might not be framed safely.
   const env = parseEnvelope(line.message.content);
-  if (!env || !peerSocket(env.from) || env.from === self.address) return log("dropped malformed message");
+  if (!env || !peerSocket(env.from) || env.from === self.address || (line.from && line.from !== env.from)) return log("dropped malformed message");
   if (!admit(env.from, env.body)) return log("dropped message from", env.from);
   const sender = /^[A-Za-z0-9:_ .-]{1,80}$/.test(env.fromName ?? "") ? env.fromName : "an unnamed peer";
   queued++;
-  const { threadId } = self;
-  chain = chain.then(() => deliver(threadId, sender, env.from, env.body)).finally(() => queued--);
+  const caller = self;
+  const bytes = Buffer.byteLength(env.body);
+  queuedBytes += bytes;
+  chain = chain.then(() => {
+    if (self === caller && ownsSocket(caller)) return deliver(caller.threadId, sender, env.from, env.body);
+  }).catch((error) => log("delivery failed:", error.message)).finally(() => { queued--; queuedBytes -= bytes; });
 }
 
 // Mirrors the frame Claude Code puts around a peer message: who sent it first, then the body,
@@ -195,22 +238,33 @@ function resolveTarget(to) {
 }
 
 async function send(to, message, meta) {
-  await bind(meta);
-  const from = self.subagent ? codexPeers().find((p) => p.threadId === self.rootId)?.address : self.address;
+  const caller = await bind(meta);
+  if (!caller.subagent && !ownsSocket(caller)) throw new Error("this inbox was replaced; restart this MCP connection");
+  const from = caller.subagent ? codexPeers().find((p) => p.threadId === caller.rootId)?.address : caller.address;
   if (!from) throw new Error("your root Codex session has no inbox yet, so replies could not reach you; ask your root agent to call list_peers first");
   const target = resolveTarget(to);
   if (target.address === from) throw new Error("that address is this session's own inbox");
   // Claude Code frames every peer as "another Claude session", so tell Claude what this is.
   const body = target.kind === "codex" || /\/codex-[0-9a-f]{16}\.sock$/.test(target.socket ?? "") ? message :
-    `${message}\n\n(From ${self.name}, ${self.subagent ? "an agent inside " : ""}a Codex CLI ` +
+    `${message}\n\n(From ${caller.name}, ${caller.subagent ? "an agent inside " : ""}a Codex CLI ` +
     `session. Claude's notify_when_idle is unavailable for this peer.)`;
-  const line = messageLine({ from, fromName: self.name, body });
+  const line = messageLine({ from, fromName: caller.name, body });
+  if (pending.size >= 128) throw new Error("too many pending peer sends");
+  let finish, timer;
   const receipt = new Promise((resolve) => {
-    pending.set(line.msg_id, resolve);
-    setTimeout(() => resolve(undefined), 1500);
-  }).finally(() => pending.delete(line.msg_id));
-  await post(target.socket ?? socketPath(target.address), line);
-  const status = self.subagent ? undefined : await receipt;
+    finish = (status) => { clearTimeout(timer); pending.delete(line.msg_id); resolve(status); };
+    if (!caller.subagent) {
+      pending.set(line.msg_id, finish);
+      timer = setTimeout(() => finish(undefined), 1500);
+    } else finish(undefined);
+  });
+  let status;
+  try {
+    const socket = peerSocket(target.address);
+    if (!socket) throw new Error("invalid peer inbox address; call list_peers again");
+    await post(socket, line);
+    status = await receipt;
+  } finally { finish(undefined); }
   if (status === "held") return `Delivered to ${target.name}'s inbox; its session is holding it for its user's approval.`;
   if (status && status !== "delivered") return `Not delivered to ${target.name}: ${status}.`;
   return `Delivered to ${target.name}'s inbox. Any reply arrives as a message in this conversation.`;
@@ -243,7 +297,7 @@ async function listPeers(caller) {
 // --- MCP ------------------------------------------------------------------------------------
 
 const mcp = new McpServer(
-  { name: "agent-peers", version: "0.1.0" },
+  { name: "agent-peers", version: VERSION },
   {
     instructions:
       "Discover Claude Code and Codex CLI sessions on this machine with list_peers; call it once early " +
@@ -276,7 +330,7 @@ mcp.registerTool(
     description:
       "Send a message to another agent session (Claude Code or Codex). `to` is an inbox address or " +
       "session name listed with a bridge route, or a peer's reply address. The message arrives while the recipient works.",
-    inputSchema: { to: z.string(), message: z.string().min(1) },
+    inputSchema: { to: z.string().min(1).max(1000), message: z.string().min(1).max(MAX_LINE) },
   },
   async ({ to, message }, extra) => {
     try {
@@ -288,7 +342,7 @@ mcp.registerTool(
 );
 
 for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => process.exit(0));
-process.on("exit", unbind);
+process.on("exit", () => { unbind(); app.close(); });
 process.stdin.on("end", () => process.exit(0));
 
 await mcp.connect(new StdioServerTransport());

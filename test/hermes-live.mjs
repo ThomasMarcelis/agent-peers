@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Paid live contract: a real Hermes bridge exchanges messages with disposable Codex and
 // Claude sessions. Uses only isolated discovery registries and test-owned inbox addresses.
-// Run: node /home/thomasmarcelis/workspace/agent-peers/test/hermes-live.mjs
+// Pass --codex-only to check Codex without installing or launching Claude.
 
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
@@ -16,6 +16,7 @@ import { AppServer } from "../src/app-server.mjs";
 import { address, allPeers } from "../src/wire.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const codexOnly = process.argv.includes("--codex-only");
 const output = join(root, "artifacts", "hermes-live", new Date().toISOString().replace(/[:.]/g, "-"));
 const tmp = mkdtempSync(join(tmpdir(), "agent-peers-hermes-live-"));
 const registry = join(tmp, "peers"), claudeRegistry = join(tmp, "claude-discovery");
@@ -25,15 +26,15 @@ const sourceEnv = { ...process.env };
 const nonce = randomUUID().slice(0, 8);
 const processes = [], participants = [], hidden = new Map(), notifications = [], codexEvents = [];
 const completed = new Map(), active = new Map(), checks = [];
-const report = { startedAt: new Date().toISOString(), output, passed: false, checks };
+const report = { startedAt: new Date().toISOString(), mode: codexOnly ? "codex-only" : "codex-and-claude", output, passed: false, checks };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const log = (message) => console.log(`${new Date().toISOString()} ${message}`);
 const saveReport = () => writeFileSync(join(output, "report.json"), JSON.stringify(report, null, 2) + "\n");
 let cancelled, app, bridge, client;
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => { cancelled = signal; });
 mkdirSync(output, { recursive: true });
-mkdirSync(registry);
-mkdirSync(join(claudeRegistry, "sessions"), { recursive: true });
+mkdirSync(registry, { mode: 0o700 });
+mkdirSync(join(claudeRegistry, "sessions"), { recursive: true, mode: 0o700 });
 const isolatedEnv = { ...sourceEnv, AGENT_PEERS_HOME: registry, CLAUDE_CONFIG_DIR: claudeRegistry,
   AGENT_PEERS_CODEX_APP_SERVER: appSocket };
 Object.assign(process.env, { AGENT_PEERS_HOME: registry, CLAUDE_CONFIG_DIR: claudeRegistry,
@@ -65,6 +66,7 @@ function launch(label, command, args, options = {}) {
     env: isolatedEnv, ...options });
   child.testLabel = label;
   child.on("error", (error) => { report.processError = `${label}: ${error.message}`; });
+  child.stdin.on("error", (error) => { report.processError ??= `${label} input: ${error.message}`; });
   child.stderr.on("data", (data) => appendFileSync(join(output, `${label}.stderr.log`), data));
   processes.push(child);
   return child;
@@ -95,10 +97,13 @@ function startBridge() {
       if (line.error) request.reject(new Error(line.error.message)); else request.resolve(line.result);
     }
   });
-  child.on("exit", () => {
-    for (const request of pending.values()) { clearTimeout(request.timer); request.reject(new Error("Hermes bridge exited")); }
+  const fail = (error) => {
+    for (const request of pending.values()) { clearTimeout(request.timer); request.reject(error); }
     pending.clear();
-  });
+  };
+  child.on("exit", () => fail(new Error("Hermes bridge exited")));
+  child.on("error", fail);
+  child.stdin.on("error", fail);
   return { child, request: (method, params = {}) => new Promise((resolve, reject) => {
     const id = ++next;
     const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Hermes ${method} timed out`)); }, 15_000);
@@ -183,13 +188,14 @@ async function roundtrip(peer, session, phase, busyTurn) {
 
 async function run() {
   report.versions = { codex: execFileSync("codex", ["--version"], { encoding: "utf8" }).trim(),
-    claude: execFileSync("claude", ["--version"], { encoding: "utf8" }).trim() };
+    ...(!codexOnly ? { claude: execFileSync("claude", ["--version"], { encoding: "utf8" }).trim() } : {}) };
   log(`evidence: ${output}`);
-  const config = readFileSync(join(sourceEnv.CODEX_HOME || join(homedir(), ".codex"), "config.toml"), "utf8");
-  const disable = [...config.matchAll(/^\[mcp_servers\.("?)([^\]."]+)\1\]/gm)]
-    .filter((match) => match[2] !== "agent-peers").map((match) => `mcp_servers.${match[2]}.enabled=false`);
+  const configPath = join(sourceEnv.CODEX_HOME || join(homedir(), ".codex"), "config.toml");
+  const config = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+  const disable = [...new Set([...config.matchAll(/^\s*\[\s*mcp_servers\s*\.\s*("(?:[^"\\]|\\.)*"|'[^']*'|[A-Za-z0-9_-]+)(?:\s*\.[^\]\n]*)?\s*\]/gm)]
+    .map((match) => `mcp_servers.${match[1]}.enabled=false`))];
   const overrides = [...disable, "features.hooks=false", "features.memories=false",
-    'mcp_servers.agent-peers.command="node"', 'mcp_servers.agent-peers.default_tools_approval_mode="approve"',
+    'mcp_servers.agent-peers.enabled=true', `mcp_servers.agent-peers.command=${JSON.stringify(process.execPath)}`, 'mcp_servers.agent-peers.default_tools_approval_mode="approve"',
     `mcp_servers.agent-peers.args=[${JSON.stringify(join(root, "src", "codex-peer.mjs"))}]`,
     `mcp_servers.agent-peers.env={AGENT_PEERS_CODEX_APP_SERVER=${JSON.stringify(appSocket)},AGENT_PEERS_HOME=${JSON.stringify(registry)},CLAUDE_CONFIG_DIR=${JSON.stringify(claudeRegistry)},AGENT_PEERS_LOG=${JSON.stringify(join(output, "codex-peer.log"))}}`];
   const daemon = launch("codex-app-server", "codex", [...overrides.flatMap((value) => ["-c", value]), "app-server", "--listen", `unix://${appSocket}`]);
@@ -225,42 +231,45 @@ async function run() {
   await roundtrip(codex, "profile-b-conversation-b", "busy", busy);
   assert.notEqual(hidden.get("profile-a-conversation-a"), hidden.get("profile-b-conversation-b"), "different Hermes conversations have different private inboxes");
 
-  const claude = { kind: "claude", events: [] }; participants.push(claude);
-  claude.process = launch("claude", "claude", ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-    "--name", `hermes-live-${nonce}`, "--no-session-persistence", "--disable-slash-commands",
-    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-    "--settings", JSON.stringify({ crossSessionInbound: "accept", disableAllHooks: true }),
-    "--allowedTools", "Bash(sleep *),SendMessage,ListAgents",
-    "--append-system-prompt", readFileSync(join(root, "CLAUDE-snippet.md"), "utf8")],
-  { cwd: work, env: { ...sourceEnv, AGENT_PEERS_HOME: registry } });
-  lines(claude.process.stdout, "claude.jsonl", (event) => claude.events.push(event));
-  claudeTurn(claude, protocol + "For now, reply READY.");
-  const claudeMeta = await until("Claude real inbox", () => {
-    try { const value = JSON.parse(readFileSync(join(sourceClaudeHome, "sessions", `${claude.process.pid}.json`), "utf8")); return value.messagingSocketPath && value; } catch {}
-  }, 90_000);
-  // Mirror only this test-owned session's public registry entry. Never copy account or memory data.
-  writeFileSync(join(claudeRegistry, "sessions", `${claude.process.pid}.json`), JSON.stringify(claudeMeta));
-  claude.address = address(claudeMeta.messagingSocketPath); claude.name = `claude:${claudeMeta.name ?? claudeMeta.pid}`;
-  await until("Claude ready", () => claude.events.some((event) => event.type === "result" && !event.is_error));
-  claude.turnStart = claude.events.length;
-  await roundtrip(claude, "profile-a-conversation-a", "idle");
-  claude.turnStart = claude.events.length;
-  claudeTurn(claude, "Run `sleep 12` with Bash, then reply DONE. Keep following the Hermes test reply protocol for incoming messages.");
-  await until("Claude Bash sleep started", () => claude.events.slice(claude.turnStart).some((event) =>
-    event.type === "assistant" && event.message?.content?.some((block) => block.type === "tool_use" && block.name === "Bash" && /sleep 12/.test(block.input?.command))), 90_000);
-  assert.ok(!claude.events.slice(claude.turnStart).some((event) => event.type === "result"), "Claude is busy at send time");
-  await roundtrip(claude, "profile-b-conversation-b", "busy");
+  if (!codexOnly) {
+    const claude = { kind: "claude", events: [] }; participants.push(claude);
+    claude.process = launch("claude", "claude", ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+      "--name", `hermes-live-${nonce}`, "--no-session-persistence", "--disable-slash-commands",
+      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+      "--settings", JSON.stringify({ crossSessionInbound: "accept", disableAllHooks: true }),
+      "--allowedTools", "Bash(sleep *),SendMessage,ListAgents",
+      "--append-system-prompt", readFileSync(join(root, "CLAUDE-snippet.md"), "utf8")],
+    { cwd: work, env: { ...sourceEnv, AGENT_PEERS_HOME: registry } });
+    lines(claude.process.stdout, "claude.jsonl", (event) => claude.events.push(event));
+    claudeTurn(claude, protocol + "For now, reply READY.");
+    const claudeMeta = await until("Claude real inbox", () => {
+      try { const value = JSON.parse(readFileSync(join(sourceClaudeHome, "sessions", `${claude.process.pid}.json`), "utf8")); return value.messagingSocketPath && value; } catch {}
+    }, 90_000);
+    // Mirror only this test-owned session's public registry entry. Never copy account or memory data.
+    writeFileSync(join(claudeRegistry, "sessions", `${claude.process.pid}.json`), JSON.stringify(claudeMeta), { mode: 0o600 });
+    claude.address = address(claudeMeta.messagingSocketPath); claude.name = `claude:${claudeMeta.name ?? claudeMeta.pid}`;
+    await until("Claude ready", () => claude.events.some((event) => event.type === "result" && !event.is_error));
+    claude.turnStart = claude.events.length;
+    await roundtrip(claude, "profile-a-conversation-a", "idle");
+    claude.turnStart = claude.events.length;
+    claudeTurn(claude, "Run `sleep 12` with Bash, then reply DONE. Keep following the Hermes test reply protocol for incoming messages.");
+    await until("Claude Bash sleep started", () => claude.events.slice(claude.turnStart).some((event) =>
+      event.type === "assistant" && event.message?.content?.some((block) => block.type === "tool_use" && block.name === "Bash" && /sleep 12/.test(block.input?.command))), 90_000);
+    assert.ok(!claude.events.slice(claude.turnStart).some((event) => event.type === "result"), "Claude is busy at send time");
+    await roundtrip(claude, "profile-b-conversation-b", "busy");
+  }
   for (const session of hidden.keys()) {
     assert.equal((await bridge.request("close_session", { session })).closed, true);
     assert.ok(!existsSync(decodeURIComponent(hidden.get(session).slice(4))), "closed private inbox is retired");
   }
   await assertInvisible("after-private-inboxes-retired");
-  assert.equal(notifications.length, 4, "each test message received one reply, without cross-conversation duplicates");
+  assert.equal(notifications.length, codexOnly ? 2 : 4, "each test message received one reply, without cross-conversation duplicates");
   report.passed = true;
 }
 
 async function cleanup() {
   await client?.close().catch(() => {});
+  await app?.close?.();
   if (bridge?.child.exitCode === null) await bridge.request("shutdown").catch(() => {});
   for (const child of [...processes].reverse()) { try { process.kill(-child.pid, "SIGTERM"); } catch {} }
   await sleep(1000);

@@ -24,7 +24,7 @@ async function until(check, description = "condition") {
 async function fixture(t, options = {}) {
   const dir = mkdtempSync(join(tmpdir(), "hermes-peer-"));
   const claude = join(dir, "claude"), peers = join(dir, "peers"), sockets = join(dir, "socks");
-  for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true });
+  for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true, mode: 0o700 });
   const before = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME };
   process.env.CLAUDE_CONFIG_DIR = claude;
   process.env.AGENT_PEERS_HOME = peers;
@@ -90,6 +90,18 @@ test("a missing daemon keeps discoverable inboxes; historical threads are never 
   assert.equal(result.peers.length, 2);
   assert.match(result.note, /offline/);
   await offline.close();
+});
+
+test("closing releases the app-server once and rejects further bridge requests", async (t) => {
+  let closed = 0;
+  const f = await fixture(t, { app: { close: () => { closed++; } } });
+  await f.send("closing");
+  const first = f.bridge.close();
+  assert.equal(f.bridge.close(), first);
+  await first;
+  assert.equal(closed, 1);
+  await assert.rejects(f.bridge.request("list_peers"), /closed/);
+  await assert.rejects(f.send("closed"), /closed/);
 });
 
 test("private sessions send, receive replies, and remain absent from every registry", async (t) => {
@@ -262,4 +274,74 @@ for (const ending of ["EOF", "SIGTERM", "shutdown"]) test(`stdout IPC and owned 
   if (ending === "shutdown") assert.equal(replies.find((r) => r.id === 3).result.closed, true);
   assert.equal(existsSync(socket), false);
   assert.equal(stderr, "");
+});
+
+test("IPC rejects malformed request ids without echoing untrusted objects", async (t) => {
+  const f = await fixture(t);
+  const child = spawn(process.execPath, [join(root, "bin", "agent-peers.mjs"), "hermes-bridge"], {
+    env: { ...process.env, AGENT_PEERS_CODEX_APP_SERVER: join(f.dir, "missing.sock") },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (data) => { output += data; });
+  const closed = once(child, "exit");
+  for (const id of [{ nested: true }, [], "x".repeat(257), 1e30, "", null]) {
+    child.stdin.write(JSON.stringify({ id, method: "list_peers" }) + "\n");
+  }
+  child.stdin.end(JSON.stringify({ id: "done", method: "shutdown" }) + "\n");
+  assert.deepEqual(await closed, [0, null]);
+  const lines = output.trim().split("\n").map(JSON.parse);
+  assert.equal(lines.length, 7);
+  for (const line of lines.slice(0, -1)) {
+    assert.equal(line.id, null);
+    assert.match(line.error.message, /expected/);
+  }
+  assert.deepEqual(lines.at(-1), { id: "done", result: { closed: true } });
+});
+
+for (const [label, data, expected] of [
+  ["oversized frame", "x".repeat(MAX_LINE), /input line too large/],
+  ["request flood", "{}\n".repeat(129), /input limit exceeded/],
+  ["truncated frame", '{"id":1', /incomplete bridge input/],
+]) test(`IPC terminates promptly on ${label}`, { timeout: 10_000 }, async (t) => {
+  const f = await fixture(t);
+  const child = spawn(process.execPath, [join(root, "bin", "agent-peers.mjs"), "hermes-bridge"], {
+    env: { ...process.env, AGENT_PEERS_CODEX_APP_SERVER: join(f.dir, "missing.sock") },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill("SIGKILL"); });
+  child.stdin.on("error", () => {});
+  child.stdout.resume();
+  let errors = "";
+  child.stderr.on("data", (chunk) => { errors += chunk; });
+  const closed = once(child, "exit");
+  child.stdin.end(data);
+  assert.deepEqual(await closed, [1, null]);
+  assert.match(errors, expected);
+});
+
+test("a parent that stops reading notifications cannot keep the bridge alive", { timeout: 12_000 }, async (t) => {
+  const f = await fixture(t);
+  const child = spawn(process.execPath, [join(root, "bin", "agent-peers.mjs"), "hermes-bridge"], {
+    env: { ...process.env, AGENT_PEERS_CODEX_APP_SERVER: join(f.dir, "missing.sock") },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill("SIGKILL"); });
+  child.stderr.resume();
+  const output = once(child.stdout, "data");
+  child.stdin.write(JSON.stringify({ id: 1, method: "send_peer", params: {
+    session: "blocked-parent", name: "hermes:test", to: "claude:test", message: "hello",
+  } }) + "\n");
+  const [chunk] = await output;
+  const sent = JSON.parse(chunk.toString()).result;
+  assert.ok(sent.address);
+  child.stdout.pause();
+  const socket = peerSocket(sent.address);
+  const closed = once(child, "exit");
+  await post(socket, messageLine({ from: address(join(f.sockets, "claude-test.sock")),
+    body: "x".repeat(MAX_LINE - 1000) }));
+  assert.deepEqual(await closed, [1, null]);
+  assert.equal(existsSync(socket), false);
 });

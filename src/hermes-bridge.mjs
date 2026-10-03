@@ -12,6 +12,7 @@ import {
 
 const BUCKET = 30, REFILL_PER_S = 0.5, DEDUP_MS = 30_000, IDLE_MS = 600_000;
 const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256;
+const IPC_QUEUE_MAX = 128, IPC_WRITE_TIMEOUT_MS = 5000;
 const logger = (message) => console.error(`[hermes-bridge ${process.pid}] ${message}`);
 
 function requiredString(value, field, max = MAX_LINE) {
@@ -43,6 +44,7 @@ export class HermesBridge {
   #routes = new Map();
   #locks = new Map();
   #closed = false;
+  #closing;
   #queued = 0;
 
   constructor({ app = new AppServer(), emit = async () => {}, log = logger } = {}) {
@@ -254,10 +256,18 @@ export class HermesBridge {
     route.recent.clear();
   }
 
-  async close() {
+  close() {
+    if (this.#closing) return this.#closing;
     this.#closed = true;
-    await Promise.allSettled([...this.#locks.values()]);
-    await Promise.all([...this.#routes.values()].map((route) => this.#retire(route)));
+    this.#closing = (async () => {
+      try {
+        await Promise.allSettled([...this.#locks.values()]);
+        await Promise.all([...this.#routes.values()].map((route) => this.#retire(route)));
+      } finally {
+        await this.#app.close?.();
+      }
+    })();
+    return this.#closing;
   }
 }
 
@@ -265,7 +275,14 @@ export class HermesBridge {
 // messages and respects stream backpressure; diagnostic text goes to stderr.
 export function runHermesBridge() {
   const write = (message) => new Promise((resolve, reject) => {
-    process.stdout.write(JSON.stringify(message) + "\n", (error) => error ? reject(error) : resolve());
+    const timer = setTimeout(() => {
+      reject(new Error("bridge output timed out"));
+      void stop(1);
+    }, IPC_WRITE_TIMEOUT_MS);
+    process.stdout.write(JSON.stringify(message) + "\n", (error) => {
+      clearTimeout(timer);
+      if (error) reject(error); else resolve();
+    });
   });
   const bridge = new HermesBridge({ emit: write });
   let buffer = "", queued = 0, chain = Promise.resolve(), stopping = false;
@@ -273,17 +290,26 @@ export function runHermesBridge() {
     if (stopping) return;
     stopping = true;
     process.stdin.pause();
-    await bridge.close();
+    // A blocked parent or daemon must not keep an unloaded plugin alive indefinitely.
+    const deadline = setTimeout(() => process.exit(code || 1), IPC_WRITE_TIMEOUT_MS);
+    deadline.unref();
+    try {
+      await bridge.close();
+    } catch (error) {
+      logger(`bridge shutdown failed: ${error.message}`);
+      code = 1;
+    }
     process.exit(code);
   };
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (data) => {
+    if (stopping) return;
     buffer += data;
     let newline;
     while ((newline = buffer.indexOf("\n")) >= 0) {
       const raw = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
-      if (Buffer.byteLength(raw) > MAX_LINE || queued >= 128) {
+      if (Buffer.byteLength(raw) + 1 > MAX_LINE || queued >= IPC_QUEUE_MAX) {
         logger("bridge input limit exceeded");
         void stop(1);
         return;
@@ -292,31 +318,39 @@ export function runHermesBridge() {
       queued++;
       chain = chain.then(async () => {
         if (stopping) return;
-        let request;
+        let request, id = null;
         try {
           request = JSON.parse(raw);
           if (!request || typeof request !== "object" || Array.isArray(request) ||
-              !["string", "number"].includes(typeof request.id) || typeof request.method !== "string") {
+              !(typeof request.id === "string" && request.id.length > 0 && request.id.length <= 256 ||
+                Number.isSafeInteger(request.id)) || typeof request.method !== "string" ||
+              request.method.length > 80) {
             throw new Error("expected {id, method, params}");
           }
+          id = request.id;
           if (request.method === "shutdown") {
-            await write({ id: request.id, result: { closed: true } });
+            await write({ id, result: { closed: true } });
             await stop();
             return;
           }
           const result = await bridge.request(request.method, request.params);
-          await write({ id: request.id, result });
+          await write({ id, result });
         } catch (error) {
-          await write({ id: request?.id ?? null, error: { message: error.message } });
+          await write({ id, error: { message: error.message } });
         }
       }).catch((error) => { logger(error.message); void stop(1); }).finally(() => queued--);
     }
-    if (Buffer.byteLength(buffer) > MAX_LINE) {
+    if (Buffer.byteLength(buffer) >= MAX_LINE) {
       logger("bridge input line too large");
       void stop(1);
     }
   });
-  process.stdin.on("end", () => { void chain.finally(() => stop()); });
+  process.stdin.on("end", () => {
+    if (buffer.trim()) {
+      logger("incomplete bridge input at EOF");
+      void stop(1);
+    } else void chain.finally(() => stop());
+  });
   process.stdin.on("error", () => { void stop(1); });
   process.stdout.on("error", () => { void stop(1); });
   process.once("SIGINT", () => { void stop(); });

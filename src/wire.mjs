@@ -6,10 +6,10 @@
 // Claude Code does not document this line format; test/contract.mjs pins it.
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir, userInfo } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 
 export const TAG = "cross-session-message";
 export const MAX_LINE = 1_000_000;
@@ -18,7 +18,9 @@ const uid = userInfo().uid;
 export const claudeHome = () => process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 export const peersHome = () => process.env.AGENT_PEERS_HOME || join(homedir(), ".agent-peers");
 
+// Process group identifiers (0 and negative numbers) are never peer identities.
 export function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || pid > 0x7fffffff) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -27,12 +29,74 @@ export function alive(pid) {
   }
 }
 
+function safeDirectory(path, privateOnly = false) {
+  const st = lstatSync(path);
+  if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== uid || (st.mode & (privateOnly ? 0o077 : 0o022))) {
+    throw new Error(`unsafe peer directory ${path}: expected an owned ${privateOnly ? "0700 " : ""}directory without symlinks or shared write access`);
+  }
+  return path;
+}
+
+export function ensurePrivateDir(path) {
+  if (typeof path !== "string" || !isAbsolute(path) || normalize(path) !== path) {
+    throw new Error("peer directory must be an absolute normalized path");
+  }
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  return safeDirectory(path, true);
+}
+
+// Read registry files without following a substituted symlink or allocating an unbounded file.
+export function readPeerRecord(path) {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.uid !== uid || (st.mode & 0o022) || st.size > 65_536) throw new Error("unsafe peer registry file");
+    const buffer = Buffer.allocUnsafe(65_537);
+    let bytes = 0, count;
+    while (bytes < buffer.length && (count = readSync(fd, buffer, bytes, buffer.length - bytes, null))) bytes += count;
+    if (bytes > 65_536) throw new Error("peer registry file is too large");
+    const value = JSON.parse(buffer.toString("utf8", 0, bytes));
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid peer registry record");
+    return value;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+const safeText = (s, limit = 512) => typeof s === "string" && s.length > 0 && s.length <= limit && !/[\x00-\x1f\x7f]/.test(s);
+const validSocketPath = (path) => typeof path === "string" && isAbsolute(path) && normalize(path) === path &&
+  path.endsWith(".sock") && !/[\x00-\x1f\x7f]/.test(path);
+const validPid = (pid) => Number.isInteger(pid) && pid > 0 && pid <= 0x7fffffff;
+export const validThreadId = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id);
+
+function claudeRecords() {
+  const dir = join(claudeHome(), "sessions");
+  let files;
+  try { safeDirectory(dir); files = readdirSync(dir); } catch { return []; }
+  const out = [];
+  for (const f of files.filter((f) => /^[1-9]\d*\.json$/.test(f))) {
+    try {
+      const s = readPeerRecord(join(dir, f));
+      if (!validPid(s.pid) || String(s.pid) !== f.slice(0, -5) || !alive(s.pid) || !validSocketPath(s.messagingSocketPath)) continue;
+      if (s.name !== undefined && !safeText(s.name, 128)) continue;
+      if (s.cwd !== undefined && !safeText(s.cwd, 4096)) continue;
+      safeDirectory(dirname(s.messagingSocketPath), true);
+      out.push(s);
+    } catch {}
+  }
+  return out;
+}
+
 // Claude vets reply targets to its own socket directory, so Codex inboxes live there too.
-export function socketDir() {
-  for (const s of claudeSessions()) return dirname(s.socket);
+export function socketDir({ create = true } = {}) {
+  const sessions = claudeRecords();
+  if (sessions.length) return dirname(sessions[0].messagingSocketPath);
   const run = `/run/user/${uid}`;
-  const dir = existsSync(run) ? join(run, "cc-socks") : `/tmp/cc-socks-${uid}`;
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let dir;
+  try { safeDirectory(run, true); dir = join(run, "cc-socks"); }
+  catch { dir = `/tmp/cc-socks-${uid}`; }
+  if (create) return ensurePrivateDir(dir);
+  try { safeDirectory(dir, true); } catch (error) { if (error.code !== "ENOENT") throw error; }
   return dir;
 }
 
@@ -41,58 +105,50 @@ export const address = (path) =>
   "uds:" + path.replace(/[^A-Za-z0-9:_/.\\-]/gu, (c) =>
     [...Buffer.from(c)].map((b) => "%" + b.toString(16).toUpperCase().padStart(2, "0")).join(""));
 
-// A reply address must name a socket in Claude's socket directory, as Claude itself requires.
+// Missing paths remain valid reply addresses; a discovered or connected existing path must be a socket.
 export function peerSocket(addr) {
-  if (typeof addr !== "string" || !/^uds:[A-Za-z0-9%:_/.\\-]{1,300}$/.test(addr)) return undefined;
+  if (typeof addr !== "string" || !/^uds:[A-Za-z0-9%:_/.\\-]{1,1000}$/.test(addr)) return undefined;
   const path = socketPath(addr);
-  return path.endsWith(".sock") && dirname(path) === socketDir() ? path : undefined;
+  if (!validSocketPath(path) || address(path) !== addr || dirname(path) !== socketDir({ create: false })) return undefined;
+  try {
+    const st = lstatSync(path);
+    if (!st.isSocket() || st.isSymbolicLink() || st.uid !== uid) return undefined;
+  } catch (e) {
+    if (e.code !== "ENOENT") return undefined;
+  }
+  return path;
 }
 
 export function socketPath(addr) {
-  if (!addr.startsWith("uds:")) return undefined;
-  try {
-    return decodeURIComponent(addr.slice(4));
-  } catch {
-    return addr.slice(4);
-  }
+  if (typeof addr !== "string" || !addr.startsWith("uds:")) return undefined;
+  try { return decodeURIComponent(addr.slice(4)); } catch { return undefined; }
 }
 
 // Live Claude sessions from Claude's public session registry (never its key files).
 export function claudeSessions() {
-  const dir = join(claudeHome(), "sessions");
-  let files = [];
-  try {
-    files = readdirSync(dir).filter((f) => /^\d+\.json$/.test(f));
-  } catch {}
-  const out = [];
-  for (const f of files) {
-    try {
-      const s = JSON.parse(readFileSync(join(dir, f), "utf8"));
-      if (!s.messagingSocketPath || !alive(s.pid)) continue;
-      out.push({
-        kind: "claude",
-        name: `claude:${s.name ?? s.pid}`,
-        address: address(s.messagingSocketPath),
-        socket: s.messagingSocketPath,
-        cwd: s.cwd,
-        status: s.status,
-        pid: s.pid,
-      });
-    } catch {}
-  }
-  return out;
+  return claudeRecords().flatMap((s) => {
+    if (!peerSocket(address(s.messagingSocketPath))) return [];
+    return [{ kind: "claude", name: `claude:${s.name ?? s.pid}`, address: address(s.messagingSocketPath),
+      socket: s.messagingSocketPath, cwd: s.cwd, status: safeText(s.status, 64) ? s.status : undefined, pid: s.pid }];
+  });
+}
+
+export function isSafePeerRecord(p) {
+  return !!p && validPid(p.pid) && safeText(p.name, 160) && p.name.startsWith("codex:") &&
+    validThreadId(p.threadId) && (p.cwd === undefined || safeText(p.cwd, 4096)) && !!peerSocket(p.address);
 }
 
 export function codexPeers() {
-  let files = [];
-  try {
-    files = readdirSync(peersHome()).filter((f) => f.startsWith("codex-") && f.endsWith(".json"));
-  } catch {}
+  const dir = resolve(peersHome());
+  let files;
+  try { safeDirectory(dir, true); files = readdirSync(dir); } catch { return []; }
   const out = [];
-  for (const f of files) {
+  for (const f of files.filter((f) => /^codex-[A-Za-z0-9_-]+\.json$/.test(f))) {
     try {
-      const p = JSON.parse(readFileSync(join(peersHome(), f), "utf8"));
-      if (alive(p.pid)) out.push({ kind: "codex", ...p });
+      const p = readPeerRecord(join(dir, f));
+      if (!isSafePeerRecord(p) || !alive(p.pid)) continue;
+      out.push({ kind: "codex", name: p.name, address: p.address, socket: peerSocket(p.address), cwd: p.cwd,
+        threadId: p.threadId, pid: p.pid, startedAt: p.startedAt });
     } catch {}
   }
   return out;
@@ -143,33 +199,57 @@ export function messageLine({ from, fromName, fromMode, body }) {
 // Write one line to a peer inbox. Open the connection only once the line is ready:
 // Claude closes connections that send no complete line within 30 seconds.
 export function post(socket, line) {
+  if (typeof socket !== "string" || peerSocket(address(socket)) !== socket) {
+    return Promise.reject(new Error("invalid peer inbox socket"));
+  }
   const data = JSON.stringify(line) + "\n";
   const bytes = Buffer.byteLength(data);
   if (bytes > MAX_LINE) return Promise.reject(new Error(`message too large (${bytes} bytes)`));
   return new Promise((resolve, reject) => {
     const c = connect(socket);
-    c.setTimeout(5000, () => c.destroy(new Error("peer inbox did not accept the message within 5 s")));
-    c.on("error", reject);
-    c.on("connect", () => c.end(data, resolve));
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      c.destroy();
+      error ? reject(error) : resolve();
+    };
+    const timer = setTimeout(() => finish(new Error("peer inbox did not accept the message within 5 s")), 5000);
+    c.on("error", finish);
+    c.on("connect", () => c.end(data, () => finish()));
+    c.on("close", () => finish(new Error("peer inbox closed before accepting the message")));
   });
 }
 
-// Read newline-delimited JSON lines from an accepted inbox connection.
+// Count bytes per frame, including its newline, rather than per incoming chunk. Buffering bytes
+// until the complete line also preserves UTF-8 codepoints split across arbitrary socket writes.
 export function readLines(conn, onLine) {
-  let buf = "";
-  conn.setEncoding("utf8");
+  let buffer = Buffer.allocUnsafe(4096), bytes = 0;
   conn.setTimeout(30_000, () => conn.destroy());
-  conn.on("data", (d) => {
-    buf += d;
-    if (Buffer.byteLength(buf) > MAX_LINE) return conn.destroy();
-    let i;
-    while ((i = buf.indexOf("\n")) >= 0) {
-      const raw = buf.slice(0, i);
-      buf = buf.slice(i + 1);
+  conn.on("data", (data) => {
+    const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    let offset = 0;
+    while (offset < chunk.length) {
+      const end = chunk.indexOf(10, offset);
+      const stop = end < 0 ? chunk.length : end + 1;
+      const part = chunk.subarray(offset, stop);
+      const nextBytes = bytes + part.length;
+      if (nextBytes > MAX_LINE || (end < 0 && nextBytes >= MAX_LINE)) return conn.destroy();
+      if (nextBytes > buffer.length) {
+        const grown = Buffer.allocUnsafe(Math.min(MAX_LINE, Math.max(nextBytes, buffer.length * 2)));
+        buffer.copy(grown, 0, 0, bytes);
+        buffer = grown;
+      }
+      part.copy(buffer, bytes);
+      bytes = nextBytes;
+      offset = stop;
+      if (end < 0) break;
+      const raw = buffer.toString("utf8", 0, bytes);
+      bytes = 0;
       if (!raw.trim()) continue;
-      try {
-        onLine(JSON.parse(raw));
-      } catch {}
+      try { onLine(JSON.parse(raw)); } catch {}
+      if (conn.destroyed) return;
     }
   });
   conn.on("error", () => {});
