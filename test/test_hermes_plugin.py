@@ -120,7 +120,7 @@ def test_missing_route_does_not_start_bridge_or_send(network):
     peers.close()
 
 
-def test_real_plugin_discovery_preserves_profile_scopes(tmp_path, monkeypatch):
+def test_real_plugin_discovery_preserves_profile_scopes(tmp_path, monkeypatch, network):
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from hermes_cli.plugins import discover_plugins, get_plugin_manager
     from tools.registry import registry
@@ -152,7 +152,10 @@ def test_real_plugin_discovery_preserves_profile_scopes(tmp_path, monkeypatch):
                 handlers.append(handler)
                 result = registry.dispatch("send_peer", {"to": "claude:test", "message": "hello"},
                                            scope=manager.scope_key, session_id="missing")
-                assert "error" in result
+                assert json.loads(result) == {"error": "This conversation is no longer reachable for automatic peer replies."}
+                listing = json.loads(registry.dispatch("list_peers", {}, scope=manager.scope_key))
+                assert "error" not in listing
+                assert "claude:test" in json.dumps(listing)
         assert handlers[0] is handlers[2]
         assert handlers[0] is not handlers[1]
     finally:
