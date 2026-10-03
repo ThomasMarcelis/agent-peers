@@ -86,6 +86,12 @@ user switches tabs. Context compression preserves the inbox; a new/replaced conv
 closed session, unloaded plugin, or stopped runtime makes the old inbox unreachable. There is
 no offline mailbox and no transcript-reading or automatic polling tool.
 
+Discord replies return to the exact conversation and thread that sent the request. For example,
+if Hermes sends a message to Fable from thread A, Fable's reply re-enters Hermes in thread A,
+and Hermes's response is delivered there—even if thread B was used more recently or replies
+arrive out of order. The return address is per conversation, not per profile. A missing thread
+or retired conversation does not redirect the reply into the parent channel or another chat.
+
 Automatic replies require the Hermes fork's generic `PluginContext.session_message_route` and
 `PluginContext.inject_session_message` APIs. The plugin reports an error instead of sending an
 unanswerable message when the host lacks a route. Existing `inject_message` users retain their
