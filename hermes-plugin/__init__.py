@@ -267,15 +267,23 @@ class PeerTools:
 
 def register(ctx):
     peers = PeerTools(ctx)
+
+    # Hermes tool results are text (or a multimodal envelope), not arbitrary dicts.
+    def list_peers(args, **kwargs):
+        return json.dumps(peers.list_peers(args, **kwargs), ensure_ascii=False)
+
+    def send_peer(args, **kwargs):
+        return json.dumps(peers.send_peer(args, **kwargs), ensure_ascii=False)
+
     ctx.register_tool(
-        name="list_peers", toolset="agent-peers", handler=peers.list_peers,
+        name="list_peers", toolset="agent-peers", handler=list_peers,
         schema={"name": "list_peers", "description": (
             "List local Claude Code and Codex sessions, their status and messaging targets. "
             "Your Hermes profile remains unlisted. Call on demand when coordination is useful."
         ), "parameters": {"type": "object", "properties": {}, "additionalProperties": False}},
     )
     ctx.register_tool(
-        name="send_peer", toolset="agent-peers", handler=peers.send_peer,
+        name="send_peer", toolset="agent-peers", handler=send_peer,
         schema={"name": "send_peer", "description": (
             "Send a concise message to a local Claude Code or Codex session using a listed name, "
             "inbox address, or incoming reply_to. Replies arrive automatically in this conversation. "
