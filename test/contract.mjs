@@ -73,7 +73,8 @@ step("envelope escapes a closing tag in the body and parses back");
 // --- 2. Codex inbox: busy and idle delivery, reply via send_peer ------------------------------
 step("start a private Codex app-server with codex-peer");
 const disable = [...readFileSync(join(process.env.CODEX_HOME || join(homedir(), ".codex"), "config.toml"), "utf8")
-  .matchAll(/^\[mcp_servers\.("?)([^\]."]+)\1\]/gm)].map((m) => `mcp_servers.${m[2]}.enabled=false`);
+  .matchAll(/^\[mcp_servers\.("?)([^\]."]+)\1\]/gm)].filter((m) => m[2] !== "agent-peers")
+  .map((m) => `mcp_servers.${m[2]}.enabled=false`);
 const overrides = [
   ...disable,
   "features.hooks=false",
@@ -169,8 +170,9 @@ await post(claudeSocket, messageLine({
 const r2 = await until("PEAR-5 reply", () => codexStub.bodies().find((b) => b.body.includes("PEAR-5")));
 assert.equal(r2.from, address(claudeSocket));
 await until("claude exit", () => claude.exitCode !== null, 180_000);
-const result = transcript.split("\n").map((l) => { try { return JSON.parse(l); } catch {} }).find((m) => m?.type === "result");
-assert.match(result?.result ?? "", /PLUM-2/, "Codex's reply reached Claude");
+// The reply can arrive after Claude's first result and start another turn, so check every result.
+const results = transcript.split("\n").map((l) => { try { return JSON.parse(l); } catch {} }).filter((m) => m?.type === "result");
+assert.ok(results.some((r) => r.result?.includes("PLUM-2")), "Codex's reply reached Claude");
 const toClaude = events.find((m) => m.method === "item/completed" && m.params.item.tool === "send_peer" &&
   m.params.item.arguments.to === address(claudeSocket));
 assert.match(toClaude?.params.item.result?.content?.[0]?.text ?? "", /^Sent to/, "Codex answered Claude with send_peer");

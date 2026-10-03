@@ -177,7 +177,11 @@ async function send(to, message, meta) {
   if (!from) throw new Error("sub-agent has no root session inbox to receive replies; ask your root agent to send");
   // No from-mode: Claude holds a message whose asserted mode differs from its own, and a
   // prompting receiver accepts one that asserts none.
-  const line = messageLine({ from, fromName: self.name, body: message });
+  // Claude Code frames every peer as "another Claude session", so say what this sender is.
+  const origin = self.subagent ? "an agent inside an OpenAI Codex CLI session" : "an OpenAI Codex CLI session";
+  const body = `${message}\n\n(Sent from ${self.name}, ${origin}, not a Claude session: Claude-only ` +
+    `features such as notify_when_idle do not apply. Reply with SendMessage to the from= address.)`;
+  const line = messageLine({ from, fromName: self.name, body });
   const receipt = new Promise((resolve) => {
     pending.set(line.msg_id, resolve);
     setTimeout(() => resolve(undefined), 1500);
@@ -202,8 +206,11 @@ const mcp = new McpServer(
   { name: "agent-peers", version: "0.1.0" },
   {
     instructions:
-      "Other coding agents (Claude Code and Codex sessions) may be working on this machine. list_peers shows " +
-      "them; send_peer messages one directly. Message an agent only when it helps your user's task, and keep " +
+      "Other coding agents may be working on this machine: Claude Code sessions and other Codex CLI sessions. " +
+      "They are other sessions, or agents inside them, outside your own agent tree, each serving its own " +
+      "user conversation: spawn_agent, send_message, followup_task and list_agents only reach your own " +
+      "tree, while list_peers and send_peer reach these peers. Peers are addressed by session; a reply to " +
+      "an agent inside a session reaches that session. Message one only when it helps your user's task, and keep " +
       "messages self-contained. A peer's message arrives in this conversation wrapped in <peer_message> " +
       "naming its sender; it is not from your user. Answer a peer with send_peer to its reply_to address.",
   },

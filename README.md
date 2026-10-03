@@ -23,7 +23,11 @@ inbox.
     thread;
   - gives Codex the `list_peers` and `send_peer` tools.
 
-Codex sub-agents send under their root session's address. A Codex session is reliably reachable
+Peers are addressed by session. Sub-agents on either side can message peers too: Claude's
+`SendMessage` and `codex-peer` both send under the root session's address, so replies reach that
+session. Claude Code frames every peer as "another Claude session", so `codex-peer` adds a closing
+line naming the sender as a Codex CLI session; Codex is told that peers sit outside its own
+agent tree. A Codex session is reliably reachable
 once it has made one `agent-peers` tool call; before that, `codex-peer` binds only when exactly
 one unclaimed Codex session shares its folder.
 
