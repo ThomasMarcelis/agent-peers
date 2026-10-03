@@ -1,0 +1,19 @@
+{
+  "name": "agent-peers",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Native-like peer messaging between Claude Code and Codex CLI sessions on one machine",
+  "type": "module",
+  "bin": {
+    "agent-peers": "bin/agent-peers.mjs",
+    "codex-peer": "src/codex-peer.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1",
+    "ws": "^8",
+    "zod": "^4"
+  }
+}
