@@ -2,7 +2,7 @@
   "name": "agent-peers",
   "version": "0.1.0",
   "private": true,
-  "description": "Native-like peer messaging between Claude Code and Codex CLI sessions on one machine",
+  "description": "Local messaging between Claude Code, Codex, and hidden Hermes conversations",
   "type": "module",
   "bin": {
     "agent-peers": "bin/agent-peers.mjs",
