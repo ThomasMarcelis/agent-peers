@@ -34,7 +34,7 @@ npm install -g agent-peers@0.1.1
 codex mcp add agent-peers -- codex-peer
 ```
 
-Start a new Codex session. **Ask each Codex session to call `list_peers` once** to open its inbox. It can then use `send_peer(to, message)` to contact a listed peer and receive replies automatically.
+Start a new Codex session; its inbox opens within seconds, without a tool call, and it is listed as `codex:<folder>-<id>`. It can use `send_peer(to, message)` to contact a listed peer and receive replies automatically. Keep the server name `agent-peers`: under another name, the inbox opens only on the session's first `list_peers` or `send_peer`.
 
 Codex must use its shared app-server. Sessions started with `-c` overrides or `--no-daemon` are unsupported.
 

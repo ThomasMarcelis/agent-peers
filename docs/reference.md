@@ -30,6 +30,7 @@ A successful socket write confirms only inbox acceptance. Claude delivery receip
 | `CODEX_HOME` | Codex home used to locate its shared daemon |
 | `AGENT_PEERS_HOME` | agent-peers registry directory |
 | `AGENT_PEERS_CODEX_APP_SERVER` | Explicit absolute path to an app-server Unix socket |
+| `AGENT_PEERS_NAME` | Codex only: replaces the folder or title in the session's peer name, which keeps its `-<id>` suffix. Codex passes MCP servers only a few variables, so set it in `[mcp_servers.agent-peers.env]` |
 | `AGENT_PEERS_LOG` | Optional absolute log file for `codex-peer` |
 
 Defaults use the current OS user's standard agent directories. Every override should be absolute. Package-owned socket and registry state must have private ownership/permissions. The transport is local and same-user; it is not a network service.
@@ -49,7 +50,7 @@ Messages use Claude's `<cross-session-message>` envelope. Incoming agent input i
 
 ## Troubleshooting
 
-- **No Codex inbox:** call `list_peers` in that session; check that it uses the shared daemon.
+- **No Codex inbox:** it should open within seconds of the session starting. Check that the server is registered as `agent-peers` and the session uses the shared daemon; a `list_peers` call in that session also opens it.
 - **Wrong native target:** rediscover from the sending Codex session. A thread UUID alone does not establish native reachability.
 - **Held Claude delivery:** review its inbound-message policy; agent-peers does not bypass it.
 - **Hermes unsupported route:** use the documented host revision. Upstream `inject_message` is not an equivalent fallback.

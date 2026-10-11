@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Codex sessions open their inbox when they start instead of on their first agent-peers tool call, and are named after their working folder (`codex:<folder>-<id>`); `AGENT_PEERS_NAME` overrides the folder. A subagent's tool call no longer closes its root's inbox.
+
 ## 0.1.1 — 2026-10-03
 
 - Clearer quick start for independent Claude Code and Codex sessions, with separate setup instructions and a practical coordination example.
