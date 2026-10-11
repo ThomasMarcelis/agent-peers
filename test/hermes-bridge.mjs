@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { connect, createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,13 +22,17 @@ async function until(check, description = "condition") {
 
 async function fixture(t, options = {}) {
   // macOS TMPDIR can already consume half of sun_path; keep transport fixtures short.
-  const dir = mkdtempSync("/tmp/ap-hermes-");
+  const dir = realpathSync(mkdtempSync("/tmp/ap-hermes-"));
   const claude = join(dir, "claude"), peers = join(dir, "peers");
   const sockets = join(dir, options.longSockets ? "s".repeat(69 - Buffer.byteLength(dir)) : "socks");
   for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true, mode: 0o700 });
-  const before = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME };
+  const before = Object.fromEntries(["CLAUDE_CONFIG_DIR", "AGENT_PEERS_HOME", "AGENT_PEERS_DEBUG", "AGENT_PEERS_LOG"]
+    .map((key) => [key, process.env[key]]));
   process.env.CLAUDE_CONFIG_DIR = claude;
   process.env.AGENT_PEERS_HOME = peers;
+  process.env.AGENT_PEERS_DEBUG = options.logging ? "1" : "0";
+  const logPath = join(dir, "diagnostics.jsonl");
+  process.env.AGENT_PEERS_LOG = logPath;
   const messages = [], servers = [];
   for (const kind of ["claude", "codex"]) {
     const socket = join(sockets, `${kind}-test.sock`);
@@ -50,12 +54,12 @@ async function fixture(t, options = {}) {
       pid: process.pid, name: "codex:test", address: address(socket), cwd: dir, threadId: "live-thread",
     }));
   }
-  const events = [], reads = [];
+  const events = [], reads = [], diagnostics = [];
   const app = options.app ?? {
     loadedThreads: async () => ["live-thread"],
     readThread: async (id) => { reads.push(id); return { id, status: { type: "idle" } }; },
   };
-  const bridge = new HermesBridge({ app, emit: options.emit ?? (async (event) => { events.push(event); }), log: () => {} });
+  const bridge = new HermesBridge({ app, emit: options.emit ?? (async (event) => { events.push(event); }), log: (message) => diagnostics.push(message) });
   t.after(async () => {
     await bridge.close();
     await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
@@ -67,7 +71,7 @@ async function fixture(t, options = {}) {
   });
   const send = (session, to = "codex:test", message = "hello", name = "hermes:JD") =>
     bridge.request("send_peer", { session, name, to, message });
-  return { bridge, dir, peers, sockets, claude, events, reads, messages, send };
+  return { bridge, dir, peers, sockets, claude, events, reads, messages, send, logPath, diagnostics };
 }
 
 test("long inbox paths fail before listening and leave no sockets or live handles", async (t) => {
@@ -275,6 +279,92 @@ test("backpressure bounds the inbox queue across senders and recovers after a de
   assert.equal(delivered.at(-1).params.message, "recovered");
 });
 
+for (const [status, outcome] of [
+  ["delivered", "receipt_delivered"], ["held", "held"], ["rejected", "rejected"], [undefined, "inbox_written"],
+]) test(`diagnostics report ${outcome} without claiming model consumption`, async (t) => {
+  const f = await fixture(t, { logging: true, status, receipts: status !== undefined });
+  await f.bridge.request("list_peers");
+  const sent = await f.send("private-session-sentinel", "codex:test", "private-body-sentinel");
+  await f.bridge.request("close_session", { session: "private-session-sentinel" });
+  const raw = readFileSync(f.logPath, "utf8");
+  const records = raw.trim().split("\n").map(JSON.parse).filter((record) => record.component === "hermes-bridge");
+  const request = records.find((record) => record.event === "tool.request" && record.method === "send_peer");
+  const started = records.find((record) => record.event === "send.started");
+  const result = records.find((record) => record.event === "send.result");
+  const completed = records.find((record) => record.event === "tool.result" && record.method === "send_peer");
+  assert.equal(result.outcome, outcome);
+  assert.equal(result.receipt, status !== undefined);
+  assert.match(result.messageId, /^sha256:[a-f0-9]{24}$/);
+  assert.notEqual(result.messageId, sent.message_id);
+  assert.equal(started.operationId, request.operationId);
+  assert.equal(started.messageId, result.messageId);
+  assert.equal(result.operationId, request.operationId);
+  assert.equal(completed.operationId, request.operationId);
+  assert.ok(records.some((record) => record.event === "message.send" && record.outcome === "inbox_written" && record.messageId === result.messageId));
+  assert.equal(completed.outcome, status && status !== "delivered" ? "warning" : "success");
+  assert.equal(result.bytes, Buffer.byteLength("private-body-sentinel"));
+  assert.ok(result.durationMs >= 0);
+  assert.ok(records.some((record) => record.event === "inbox.bound"));
+  assert.ok(records.some((record) => record.event === "inbox.closed"));
+  for (const secret of ["private-session-sentinel", "private-body-sentinel", "codex:test", f.dir, sent.address]) {
+    assert.equal(raw.includes(secret), false);
+  }
+});
+
+test("diagnostics classify dropped and failed incoming delivery without retaining message or error text", async (t) => {
+  let fail = true;
+  const f = await fixture(t, { logging: true, emit: async () => {
+    if (fail) { fail = false; throw new Error("secret-consumer-error-sentinel"); }
+  } });
+  const sent = await f.send("private-session-sentinel");
+  const sender = address(join(f.sockets, "codex-test.sock"));
+  const socket = peerSocket(sent.address);
+  await post(socket, { type: "user", message: { content: "secret-malformed-sentinel" } });
+  const line = { ...messageLine({ from: sender, body: "secret-first-body-sentinel" }), msg_id: "secret-id-sentinel" };
+  await post(socket, line);
+  await post(socket, line);
+  await post(socket, messageLine({ from: sender, body: "secret-second-body-sentinel" }));
+  const records = () => readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse)
+    .filter((record) => record.component === "hermes-bridge");
+  await until(() => records().some((record) => record.event === "delivery.result" && record.outcome === "emitted_to_host"));
+  await assert.rejects(f.send("private-session-sentinel", "secret-missing-target-sentinel"), /no live peer/);
+  const result = records();
+  assert.ok(result.some((record) => record.event === "receive.dropped" && record.reason === "malformed"));
+  assert.ok(result.some((record) => record.event === "receive.dropped" && record.reason === "duplicate"));
+  assert.ok(result.some((record) => record.event === "receive.queued" && record.queueDepth >= 1));
+  assert.ok(result.some((record) => record.event === "delivery.result" && record.outcome === "error"));
+  assert.ok(result.some((record) => record.event === "tool.result" && record.reason === "not_found"));
+  const queued = result.find((record) => record.event === "receive.queued");
+  assert.equal(result.find((record) => record.event === "delivery.result").messageId, queued.messageId);
+  assert.equal(readFileSync(f.logPath, "utf8").includes("sentinel"), false);
+  assert.ok(f.diagnostics.some((text) => text.startsWith("incoming message delivery failed:")));
+  assert.equal(f.diagnostics.join("\n").includes("sentinel"), false);
+});
+
+test("diagnostics distinguish rate and queue limits", async (t) => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const f = await fixture(t, { logging: true, emit: () => gate });
+  t.after(() => release());
+  const sent = await f.send("bounded");
+  const socket = peerSocket(sent.address);
+  const sender = address(join(f.sockets, "codex-test.sock"));
+  for (let i = 0; i < 31; i++) await post(socket, messageLine({ from: sender, body: `rate-${i}` }));
+  for (let i = 0; i < 21; i++) await post(socket, messageLine({ from: address(join(f.sockets, `source-${i}.sock`)), body: `queue-${i}` }));
+  await until(() => readFileSync(f.logPath, "utf8").includes('"queue_full"'));
+  const records = readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse);
+  assert.ok(records.some((record) => record.event === "receive.dropped" && record.reason === "rate_limit"));
+  assert.ok(records.some((record) => record.event === "receive.dropped" && record.reason === "queue_full"));
+  release();
+});
+
+test("Hermes diagnostics stay disabled with DEBUG=0 even with a configured path", async (t) => {
+  const f = await fixture(t);
+  await f.send("disabled");
+  await f.bridge.close();
+  assert.equal(existsSync(f.logPath), false);
+});
+
 for (const ending of ["EOF", "SIGTERM", "shutdown"]) test(`stdout IPC and owned socket cleanup on ${ending}`, async (t) => {
   const f = await fixture(t);
   const child = spawn(process.execPath, [join(root, "bin", "agent-peers.mjs"), "hermes-bridge"], {
@@ -341,12 +431,12 @@ test("IPC rejects malformed request ids without echoing untrusted objects", asyn
   assert.deepEqual(lines.at(-1), { id: "done", result: { closed: true } });
 });
 
-for (const [label, data, expected] of [
-  ["oversized frame", "x".repeat(MAX_LINE), /input line too large/],
-  ["request flood", "{}\n".repeat(129), /input limit exceeded/],
-  ["truncated frame", '{"id":1', /incomplete bridge input/],
+for (const [label, data, expected, reason] of [
+  ["oversized frame", "x".repeat(MAX_LINE), /input line too large/, "message_too_large"],
+  ["request flood", "{}\n".repeat(129), /input limit exceeded/, "queue_full"],
+  ["truncated frame", '{"id":1', /incomplete bridge input/, "malformed"],
 ]) test(`IPC terminates promptly on ${label}`, { timeout: 10_000 }, async (t) => {
-  const f = await fixture(t);
+  const f = await fixture(t, { logging: true });
   const child = spawn(process.execPath, [join(root, "bin", "agent-peers.mjs"), "hermes-bridge"], {
     env: { ...process.env, AGENT_PEERS_CODEX_APP_SERVER: join(f.dir, "missing.sock") },
     stdio: ["pipe", "pipe", "pipe"],
@@ -360,10 +450,12 @@ for (const [label, data, expected] of [
   child.stdin.end(data);
   assert.deepEqual(await closed, [1, null]);
   assert.match(errors, expected);
+  const records = readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse);
+  assert.ok(records.some((record) => record.event === "bridge.error" && record.reason === reason));
 });
 
 test("a parent that stops reading notifications cannot keep the bridge alive", { timeout: 12_000 }, async (t) => {
-  const f = await fixture(t);
+  const f = await fixture(t, { logging: true });
   const child = spawn(process.execPath, [join(root, "bin", "agent-peers.mjs"), "hermes-bridge"], {
     env: { ...process.env, AGENT_PEERS_CODEX_APP_SERVER: join(f.dir, "missing.sock") },
     stdio: ["pipe", "pipe", "pipe"],
@@ -384,4 +476,6 @@ test("a parent that stops reading notifications cannot keep the bridge alive", {
     body: "x".repeat(MAX_LINE - 1000) }));
   assert.deepEqual(await closed, [1, null]);
   assert.equal(existsSync(socket), false);
+  const records = readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse);
+  assert.ok(records.some((record) => record.event === "bridge.error" && record.reason === "timeout"));
 });

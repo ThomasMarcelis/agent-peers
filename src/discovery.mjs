@@ -40,12 +40,40 @@ export function codexDiscovery(peers, threads, self) {
   return [...rows.values()];
 }
 
+// Explain a route mismatch without sending anything or treating a nickname as a bridge
+// address. Match against all discovered peers so an abbreviation cannot silently select
+// one native agent when another peer has a matching name.
+export function nativeRouteError(to, peers) {
+  if (typeof to !== "string" || !to || to.startsWith("uds:")) return null;
+  const exact = peers.filter((p) => p.name === to || p.name === `codex:${to}` || p.name === `claude:${to}` ||
+    p.native?.target === to || p.threadId === to);
+  const matches = exact.length ? exact : peers.filter((p) => p.name.includes(to));
+  if (matches.length !== 1) return null;
+  const p = matches[0];
+  if (p.native?.reachable !== true || !p.native.target || p.bridge) return null;
+  const subagent = p.native.target !== "/root";
+  let message = `${JSON.stringify(p.name)} is a native Codex ${subagent ? "subagent" : "agent"} without a bridge route; ` +
+    `send_peer cannot address it. Use native ${p.native.tool} ${JSON.stringify({ target: p.native.target })}.`;
+  if (p.status === "idle") {
+    message += subagent
+      ? ` It is idle; use native followup_task ${JSON.stringify({ target: p.native.target })} to start a turn; send_message only queues a message.`
+      : " Native send_message does not start an idle turn for the root agent.";
+  }
+  if (subagent) message += " Direct app-server input, including codex_tui.send_message_to_thread, is unsupported for subagents.";
+  return message;
+}
+
 export function formatCodexPeer(p) {
   const native = p.native.reachable === true
     ? `yes — ${p.native.tool} ${JSON.stringify({ target: p.native.target })}`
     : `${p.native.reachable === false ? "no" : "unknown"} (${p.native.reason})`;
-  const bridge = p.bridge ? `${p.bridge.tool} ${JSON.stringify({ to: p.bridge.to })}` : "none (use native messaging)";
-  return `${p.name}  ${p.status ?? ""}  cwd=${p.cwd}\n  native: ${native}\n  bridge: ${bridge}`;
+  const subagent = p.native.reachable === true && p.native.target !== "/root";
+  const bridge = p.bridge ? `${p.bridge.tool} ${JSON.stringify({ to: p.bridge.to })}`
+    : subagent ? "none (use native messaging; send_peer and direct app-server input cannot target this subagent)"
+    : p.native.reachable === true ? "none (use native messaging)" : "none (check list_agents for a native target)";
+  const wake = subagent && p.status === "idle"
+    ? `\n  start idle turn: followup_task ${JSON.stringify({ target: p.native.target })} (send_message only queues a message)` : "";
+  return `${p.name}  ${p.status ?? ""}  cwd=${p.cwd}\n  native: ${native}\n  bridge: ${bridge}${wake}`;
 }
 
 // The CLI is also used outside Codex, where there is no caller thread to compare.

@@ -7,6 +7,7 @@
 | `agent-peers list` | Sessions with exact Claude `SendMessage` and Codex `send_peer` targets |
 | `agent-peers list --json` | `{ "peers": [...] }`; no status text mixed into stdout |
 | `agent-peers doctor [--json]` | Runtime, dependency, and local path checks; does not modify configuration or send messages |
+| `agent-peers logs [--json]` | Read-only summary of retained local diagnostic events |
 | `agent-peers --version` | Package version |
 | `agent-peers --help` | Usage |
 | `codex-peer` | Codex MCP server over stdio |
@@ -30,9 +31,25 @@ A successful socket write confirms only inbox acceptance. Claude delivery receip
 | `CODEX_HOME` | Codex home used to locate its shared daemon |
 | `AGENT_PEERS_HOME` | agent-peers registry directory |
 | `AGENT_PEERS_CODEX_APP_SERVER` | Explicit absolute path to an app-server Unix socket |
-| `AGENT_PEERS_LOG` | Optional absolute log file for `codex-peer` |
+| `AGENT_PEERS_NAME` | Codex only: replaces the folder or title in the session's peer name, which keeps its `-<id>` suffix. Codex passes MCP servers only a few variables, so set it in `[mcp_servers.agent-peers.env]` |
+| `AGENT_PEERS_DEBUG` | Set to `1` to record structured local diagnostics; `0` disables recording, including an explicit log file |
+| `AGENT_PEERS_LOG` | Optional absolute private JSONL log file; enables diagnostics unless `AGENT_PEERS_DEBUG=0` |
 
 Defaults use the current OS user's standard agent directories. Every override should be absolute. Package-owned socket and registry state must have private ownership/permissions. The transport is local and same-user; it is not a network service.
+
+## Local diagnostic logging
+
+Logging is opt-in. Set `AGENT_PEERS_DEBUG=1` in the environment inherited by the Codex MCP server or Hermes bridge, then restart that integration through its normal lifecycle. It creates a `logs` directory under the agent-peers registry directory on the first event. `agent-peers doctor --json` reports the current shell's logging configuration without creating files or checking delivery. A running integration may have inherited a different environment.
+
+Events are newline-delimited JSON with timestamps, process IDs, component/event names, operation IDs, delivery stages, byte counts, durations and bounded error categories. Thread, target and session identities are hashed for local correlation. These pseudonyms are not anonymization: known candidate identities can be hashed and matched. Message bodies, thread titles, peer names, filesystem paths, credentials, raw error text, request parameters and model responses are excluded. Standard output remains reserved for CLI or protocol results.
+
+The default directory has mode `0700` and process-specific files have mode `0600`. Files rotate at 1 MiB; retention runs when writing and keeps at most 32 files / 16 MiB and seven days of recently modified files. Concurrent processes use separate files. Unrelated files are never retention candidates. Symlinked path components, shared writable ancestors, non-private destinations, hard links and non-regular log files are rejected. A logging failure emits at most one generic warning per process to standard error and never stops messaging.
+
+`AGENT_PEERS_LOG` preserves an explicit append-only file destination, with the same private-directory and file checks. It stops accepting events at a 1 MiB size check instead of renaming or truncating a destination another process might use; simultaneous writers at the boundary can append one additional bounded record each. It has no age-based expiration. Prefer the default directory for sustained use. Old plain-text logs may contain identifying information from older releases and are not converted or deleted automatically.
+
+Run `agent-peers logs --json` with the same environment to inspect retained events, outcomes, failure reasons, terminal tool calls by method, delivery stages and incomplete operations. The command reads existing files even when recording is disabled, tolerates malformed/legacy lines, applies read limits, and never creates or prunes state. It can show sends and discovery activity observed by agent-peers after logging was enabled. It cannot reconstruct unlogged history, native collaboration calls, arbitrary shell failures or calls made through another integration such as `codex_tui`. It does not collect token usage, billing, model reads or replies. An incomplete operation may still be running, may have been interrupted, or may have lost its earlier/later events to retention.
+
+An **inbox write** means the local socket write completed. A **receipt** records the recipient's reported handling. **Emitted to host** means the Hermes bridge sent an event to its host. **App-server input accepted** means the daemon acknowledged the input request. None proves that a model read the message or produced a reply; counts at these different stages must not be added together as total messages.
 
 ## Hermes subprocess protocol
 
@@ -49,7 +66,7 @@ Messages use Claude's `<cross-session-message>` envelope. Incoming agent input i
 
 ## Troubleshooting
 
-- **No Codex inbox:** call `list_peers` in that session; check that it uses the shared daemon.
+- **No Codex inbox:** it should open within seconds of the session starting. Check that the server is registered as `agent-peers` and the session uses the shared daemon; a `list_peers` call in that session also opens it.
 - **Wrong native target:** rediscover from the sending Codex session. A thread UUID alone does not establish native reachability.
 - **Held Claude delivery:** review its inbound-message policy; agent-peers does not bypass it.
 - **Hermes unsupported route:** use the documented host revision. Upstream `inject_message` is not an equivalent fallback.

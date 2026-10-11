@@ -9,6 +9,7 @@ Usage: agent-peers <command> [options]
 
   list [--json]     Discover running Claude Code and Codex inboxes
   doctor [--json]   Check local prerequisites without changing configuration
+  logs [--json]     Summarize retained local diagnostic events
   hermes-bridge    Start the plugin-managed JSON-lines subprocess
   --version       Print the installed version
   --help          Show this help
@@ -33,7 +34,7 @@ async function main() {
     console.log(VERSION);
     return;
   }
-  if (!["list", "doctor", "hermes-bridge"].includes(cmd) || args.length > 1 ||
+  if (!["list", "doctor", "logs", "hermes-bridge"].includes(cmd) || args.length > 1 ||
       (args.length && (args[0] !== "--json" || cmd === "hermes-bridge"))) {
     throw new SyntaxError("unknown command or option; run agent-peers --help");
   }
@@ -51,6 +52,23 @@ async function main() {
       for (const check of result.checks) console.log(`${check.status.toUpperCase()} ${check.name}: ${check.message}`);
     }
     if (!result.ok) process.exitCode = 1;
+    return;
+  }
+  if (cmd === "logs") {
+    const { summarizeLogs } = await import("../src/logging.mjs");
+    const result = summarizeLogs();
+    if (args.includes("--json")) console.log(JSON.stringify(result, null, 2));
+    else {
+      console.log(`Logging ${result.config.enabled ? "enabled" : "disabled"}: ${result.config.location}`);
+      console.log(`${result.events} events in ${result.files} files (${result.bytes} bytes); ${result.corruptLines} malformed lines; ${result.skippedFiles} skipped files; ${result.truncatedFiles} files read partially.`);
+      if (result.firstEventAt) console.log(`Observed: ${result.firstEventAt} to ${result.lastEventAt}`);
+      for (const [method, tool] of Object.entries(result.tools)) console.log(`${method}: ${tool.calls} completed calls; ${JSON.stringify(tool.outcomes)}`);
+      console.log(`Delivery: ${result.delivery.inboxWrites} inbox writes; ${result.delivery.receipts} receipts; ${result.delivery.appServerInputAccepted} app-server inputs accepted; ${result.delivery.emittedToHost} emitted to host.`);
+      console.log(`Operations: ${result.operations.started} started; ${result.operations.completed} completed; ${result.operations.incomplete} incomplete.`);
+      if (Object.keys(result.reasons).length) console.log(`Reasons: ${JSON.stringify(result.reasons)}`);
+      console.log(result.scope);
+      for (const warning of result.warnings) console.log(`WARNING ${warning}`);
+    }
     return;
   }
   const peers = allPeers();

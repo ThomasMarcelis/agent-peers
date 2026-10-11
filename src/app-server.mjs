@@ -2,6 +2,8 @@
 // Connections may reconnect after failure, but requests are never replayed: turn/start may
 // already have taken effect even when the acknowledgement is lost.
 import { VERSION } from "./version.mjs";
+import { randomUUID } from "node:crypto";
+import { errorFields, logEvent, logIdentity } from "./logging.mjs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
@@ -22,13 +24,24 @@ export class AppServer {
     this.#options = { handshakeTimeoutMs: 10_000, connectTimeoutMs: 5000, ...options };
   }
 
-  async request(method, params, timeoutMs = 15_000) {
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("invalid app-server request timeout");
-    const connection = this.#connect();
-    await connection.ready;
-    if (connection.failed || this.#closed) throw new Error("app-server connection closed");
-    if (connection.pending.size >= 256) throw new Error("too many pending app-server requests");
-    return this.#request(connection, method, params, timeoutMs);
+  async request(method, params, timeoutMs = 15_000, context = {}) {
+    const started = performance.now();
+    const trace = { operationId: context.operationId ?? randomUUID(), method,
+      threadId: logIdentity(params?.threadId) };
+    logEvent("app-server", "rpc.request", { ...trace, outcome: "started" });
+    try {
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("invalid app-server request timeout");
+      const connection = this.#connect();
+      await connection.ready;
+      if (connection.failed || this.#closed) throw new Error("app-server connection closed");
+      if (connection.pending.size >= 256) throw new Error("too many pending app-server requests");
+      const result = await this.#request(connection, method, params, timeoutMs);
+      logEvent("app-server", "rpc.request", { ...trace, outcome: "succeeded", durationMs: performance.now() - started });
+      return result;
+    } catch (error) {
+      logEvent("app-server", "rpc.request", { ...trace, outcome: "failed", durationMs: performance.now() - started, ...errorFields(error) });
+      throw error;
+    }
   }
 
   #request(connection, method, params, timeoutMs) {
@@ -59,6 +72,7 @@ export class AppServer {
     connection.fail = (error) => {
       if (connection.failed) return;
       connection.failed = true;
+      logEvent("app-server", "connection.closed", { outcome: this.#closed ? "closed" : "failed", ...errorFields(error) });
       if (this.#connection === connection) this.#connection = undefined;
       for (const pending of connection.pending.values()) pending.reject(error);
       connection.pending.clear();
@@ -77,7 +91,10 @@ export class AppServer {
           if (connection.failed || this.#closed) return;
           ws.send(JSON.stringify({ method: "initialized" }), (error) => {
             if (error) connection.fail(error);
-            else resolveReady();
+            else {
+              logEvent("app-server", "connection.ready", { outcome: "succeeded" });
+              resolveReady();
+            }
           });
         } catch (error) { connection.fail(error); }
       });
@@ -125,6 +142,13 @@ export class AppServer {
       if (cursor) cursors.add(cursor);
     } while (cursor);
     return [...new Set(ids)];
+  }
+
+  // A loaded thread's live MCP connections, each with the serverInfo its server advertised.
+  async mcpServers(threadId, serverName) {
+    const result = await this.request("mcpServerStatus/list", { threadId, serverName, detail: "toolsAndAuthOnly" }, 5000);
+    if (!result || !Array.isArray(result.data)) throw new Error("invalid app-server MCP status response");
+    return result.data;
   }
 
   async readThread(threadId) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { codexDiscovery, formatCodexPeer, formatSessionPeer } from "../src/discovery.mjs";
+import { codexDiscovery, formatCodexPeer, formatSessionPeer, nativeRouteError } from "../src/discovery.mjs";
 
 const self = { threadId: "root-a", rootId: "root-a", address: "uds:/tmp/root-a.sock" };
 const peer = (id) => ({ kind: "codex", name: `codex:${id}`, threadId: id, address: `uds:/tmp/${id}.sock`, cwd: "/work" });
@@ -71,4 +71,48 @@ test("display provides usable arguments and labels Claude's native tool by platf
   assert.match(formatCodexPeer(rows[1]), /native: yes — send_message \{"target":"\/root\/worker"\}/);
   assert.match(formatSessionPeer(claude), /Claude native: SendMessage \{"to":"uds:\/tmp\/claude.sock"\}/);
   assert.match(formatSessionPeer(claude), /Codex bridge: send_peer/);
+});
+
+test("native-only route errors explain the exact native target and idle wake route", () => {
+  const threads = [{ ...child("zeno-thread", "root-a", "/root/accepted_content"), agentNickname: "Zeno" }];
+  const rows = codexDiscovery([], threads, self);
+  for (const to of ["codex:Zeno", "Zeno", "Zen", "/root/accepted_content", "zeno-thread"]) {
+    const error = nativeRouteError(to, rows);
+    assert.match(error, /native Codex subagent without a bridge route; send_peer cannot address it/);
+    assert.match(error, /send_message \{"target":"\/root\/accepted_content"\}/);
+    assert.match(error, /followup_task \{"target":"\/root\/accepted_content"\}/);
+    assert.match(error, /codex_tui\.send_message_to_thread, is unsupported for subagents/);
+  }
+  const display = formatCodexPeer(rows[0]);
+  assert.match(display, /send_peer and direct app-server input cannot target this subagent/);
+  assert.match(display, /start idle turn: followup_task \{"target":"\/root\/accepted_content"\}/);
+});
+
+test("native route errors do not guess unknown, ambiguous, or bridge-capable targets", () => {
+  const rows = codexDiscovery([peer("Zeno-other")], [
+    { ...child("zeno-thread", "root-a", "/root/accepted_content"), agentNickname: "Zeno" },
+    { ...child("zenobia-thread", "root-a", "/root/other"), agentNickname: "Zenobia" },
+  ], self);
+  for (const to of ["missing", "", "Zen", "codex:Zeno-other", "uds:/tmp/Zeno-other.sock"]) {
+    assert.equal(nativeRouteError(to, rows), null);
+  }
+  assert.match(nativeRouteError("Zeno", rows), /"codex:Zeno" is a native/);
+  assert.equal(nativeRouteError("root-a", codexDiscovery([peer("root-a")], [], {
+    ...self, threadId: "caller", address: undefined,
+  })), null);
+  const duplicates = [rows[1], { ...rows[2], name: rows[1].name }];
+  assert.equal(nativeRouteError("Zeno", duplicates), null);
+});
+
+test("only idle non-root agents advertise followup_task", () => {
+  const rows = codexDiscovery([peer("root-a")], [
+    { ...root("root-a"), status: { type: "idle" } },
+    { ...child("busy", "root-a", "/root/busy"), status: { type: "active" } },
+  ], { ...self, threadId: "caller", address: undefined });
+  for (const row of rows) {
+    assert.doesNotMatch(formatCodexPeer(row), /followup_task/);
+    assert.doesNotMatch(nativeRouteError(row.name, rows), /followup_task/);
+  }
+  assert.match(nativeRouteError("/root", rows), /does not start an idle turn for the root agent/);
+  assert.doesNotMatch(nativeRouteError("/root", rows), /unsupported for subagents/);
 });

@@ -17,7 +17,7 @@ npm install -g agent-peers@0.1.0
 codex mcp add agent-peers -- codex-peer
 ```
 
-Start a new Codex session. Ask it to call `list_peers` once to open its inbox. Codex must use its shared app-server; sessions started with `-c` overrides or `--no-daemon` are unsupported.
+Start a new Codex session; its inbox opens within seconds, without a tool call. Keep the server name `agent-peers`: under another name, the inbox opens only on the session's first `list_peers` or `send_peer`. Codex must use its shared app-server; sessions started with `-c` overrides or `--no-daemon` are unsupported.
 
 Claude Code already provides messaging. Add this to its instructions:
 
@@ -43,6 +43,8 @@ agent-peers doctor
 | `send_peer(to, message)` | Send to a listed name, inbox address, or an incoming message's reply address. |
 
 Messages are framed as coming from another agent, with a reply address. They carry no user approval. A successful send means the recipient's inbox accepted the message, not that its model read or answered it.
+
+For local development diagnostics, start the integration with `AGENT_PEERS_DEBUG=1` and inspect retained activity with `agent-peers logs --json`. Logs contain bounded metadata, timings, correlation IDs and failure categories; message bodies and raw errors are excluded. See [logging configuration and limits](docs/reference.md#local-diagnostic-logging). Existing processes need a normal restart to inherit the setting.
 
 ## Hermes (experimental)
 
