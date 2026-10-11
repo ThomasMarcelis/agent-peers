@@ -29,7 +29,7 @@ async function fixture(t, options = {}) {
   for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true, mode: 0o700 });
   const before = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME };
   Object.assign(process.env, { CLAUDE_CONFIG_DIR: claude, AGENT_PEERS_HOME: peers });
-  const inbox = join(sockets, "claude.sock"), messages = [], turns = [], reads = [], clients = [], held = [];
+  const inbox = join(sockets, "claude.sock"), messages = [], turns = [], reads = [], clients = [], held = [], mcpServers = {}, statusCalls = [];
   const receiver = createServer((conn) => readLines(conn, (line) => {
     messages.push(line);
     void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "delivered" }).catch(() => {});
@@ -47,6 +47,12 @@ async function fixture(t, options = {}) {
       reads.push(message.params.threadId);
       reply(ws, message, { thread: { id: message.params.threadId, parentThreadId: options.parents?.[message.params.threadId],
         name: "fixture", cwd: dir, status: { type: "idle" } } });
+    }
+    if (message.method === "mcpServerStatus/list") {
+      statusCalls.push(message.params.threadId);
+      const servers = mcpServers[message.params.threadId];
+      if (servers === "error") ws.send(JSON.stringify({ id: message.id, error: { code: -32603, message: "transient" } }));
+      else reply(ws, message, { data: servers ?? [] });
     }
     if (message.method === "turn/start") {
       turns.push(message.params);
@@ -74,7 +80,7 @@ async function fixture(t, options = {}) {
     for (const [key, value] of Object.entries(before)) value === undefined ? delete process.env[key] : process.env[key] = value;
     rmSync(dir, { recursive: true, force: true });
   });
-  return { dir, peers, sockets, inbox, messages, turns, reads, start,
+  return { dir, peers, sockets, inbox, messages, turns, reads, start, mcpServers, statusCalls,
     registry: join(peers, `codex-${thread}.json`),
     release: () => { hold = false; held.splice(0).forEach((release) => release()); } };
 }
@@ -100,6 +106,71 @@ test("MCP binds privately, discovers peers, sends and receives framed messages, 
   assert.equal(existsSync(socket), false);
   assert.equal(existsSync(f.registry), false);
   assert.deepEqual(readdirSync(f.sockets), ["claude.sock"]);
+});
+
+test("a session is reachable under its folder name before its first tool call, and cleans up on exit", async (t) => {
+  const f = await fixture(t), peer = await f.start();
+  // The daemon reports this process's own serverInfo on the session's agent-peers connection.
+  f.mcpServers[thread] = [{ name: "agent-peers", serverInfo: peer.client.getServerVersion() }];
+  await until(() => existsSync(f.registry));
+  const record = JSON.parse(readFileSync(f.registry, "utf8")), socket = peerSocket(record.address);
+  assert.equal(record.name, `codex:${f.dir.split("/").pop().toLowerCase()}-9abc`);
+  assert.equal(lstatSync(socket).mode & 0o777, 0o600);
+  await post(socket, messageLine({ from: address(f.inbox), fromName: "claude:test", body: "before any tool call" }));
+  await until(() => f.turns.length === 1);
+  assert.equal(f.turns[0].threadId, thread);
+  await peer.close();
+  await until(() => !existsSync(socket) && !existsSync(f.registry));
+});
+
+test("startup binding ignores other processes' connections and honours AGENT_PEERS_NAME", async (t) => {
+  const f = await fixture(t), peer = await f.start({ AGENT_PEERS_NAME: "Review Lane" });
+  f.mcpServers[thread] = [{ name: "agent-peers", serverInfo: { name: "agent-peers", version: "0.1.0", description: "agent-peers inbox other" } }];
+  const seen = f.statusCalls.length;
+  await until(() => f.statusCalls.length > seen + 1);
+  assert.deepEqual(readdirSync(f.peers), []);
+  f.mcpServers[thread] = [{ name: "agent-peers", serverInfo: peer.client.getServerVersion() }];
+  await until(() => existsSync(f.registry));
+  assert.equal(JSON.parse(readFileSync(f.registry, "utf8")).name, "codex:review-lane-9abc");
+});
+
+test("a failed ownership lookup is retried, never read as another thread being the only match", async (t) => {
+  const other = "01900000-0000-0000-0000-00000000beef";
+  const f = await fixture(t, { loaded: [thread, other] }), peer = await f.start();
+  const mine = [{ name: "agent-peers", serverInfo: peer.client.getServerVersion() }];
+  // This process serves both roots, but one lookup fails: binding the other would be a guess.
+  f.mcpServers[thread] = "error"; f.mcpServers[other] = mine;
+  await until(() => f.statusCalls.filter((id) => id === thread).length >= 2);
+  assert.deepEqual(readdirSync(f.peers), []);
+  f.mcpServers[thread] = mine; f.mcpServers[other] = [];
+  await until(() => existsSync(f.registry));
+});
+
+test("a subagent served by its root's process keeps the root inbox open", async (t) => {
+  const child = "01900000-0000-0000-0000-00000000c41d";
+  const f = await fixture(t, { loaded: [thread, child], parents: { [child]: thread } }), peer = await f.start();
+  await peer.call("list_peers");
+  const socket = peerSocket(JSON.parse(readFileSync(f.registry, "utf8")).address);
+  const sent = await peer.call("send_peer", { to: "claude:test", message: "from the child" }, child);
+  assert.match(sent.content[0].text, /Delivered/);
+  assert.equal(parseEnvelope(f.messages[0].message.content).from, address(socket));
+  assert.equal(existsSync(socket), true);
+  assert.equal(existsSync(f.registry), true);
+  await post(socket, messageLine({ from: address(f.inbox), body: "root still reachable" }));
+  await until(() => f.turns.length === 1);
+  assert.equal(f.turns[0].threadId, thread);
+});
+
+test("a delayed startup scan does not take over an inbox a replacement process owns", async (t) => {
+  const f = await fixture(t), first = await f.start(), second = await f.start();
+  await second.call("list_peers");
+  const owned = JSON.parse(readFileSync(f.registry, "utf8"));
+  // The daemon now reports the first, stale process on the thread's connection.
+  f.mcpServers[thread] = [{ name: "agent-peers", serverInfo: first.client.getServerVersion() }];
+  const seen = f.statusCalls.length;
+  await until(() => f.statusCalls.length > seen + 2);
+  assert.deepEqual(JSON.parse(readFileSync(f.registry, "utf8")), owned);
+  assert.equal(existsSync(peerSocket(owned.address)), true);
 });
 
 test("closing a superseded MCP process preserves its replacement inbox and registry", async (t) => {

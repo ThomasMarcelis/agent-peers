@@ -127,6 +127,13 @@ export class AppServer {
     return [...new Set(ids)];
   }
 
+  // A loaded thread's live MCP connections, each with the serverInfo its server advertised.
+  async mcpServers(threadId, serverName) {
+    const result = await this.request("mcpServerStatus/list", { threadId, serverName, detail: "toolsAndAuthOnly" }, 5000);
+    if (!result || !Array.isArray(result.data)) throw new Error("invalid app-server MCP status response");
+    return result.data;
+  }
+
   async readThread(threadId) {
     const result = await this.request("thread/read", { threadId });
     if (!result?.thread || typeof result.thread !== "object" || Array.isArray(result.thread)) {

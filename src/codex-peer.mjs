@@ -38,9 +38,9 @@ let self;
 let binding = Promise.resolve();
 const bind = (meta) => (binding = binding.then(() => bindNow(meta), () => bindNow(meta)));
 
-// Codex names the thread only in each tool call's _meta.threadId, so a session becomes reachable
-// at its first agent-peers tool call.
-// Guessing earlier, say by cwd, can bind to another session's thread.
+// Codex names the thread in each tool call's _meta.threadId; bindAtStart finds it earlier from
+// the daemon's report of which thread runs this process. Guessing, say by cwd, can bind to
+// another session's thread.
 async function bindNow(meta) {
   const threadId = meta?.threadId;
   if (!validThreadId(threadId)) throw new Error("Codex did not identify this session with a valid thread ID");
@@ -52,35 +52,20 @@ async function bindNow(meta) {
     }
     return self;
   }
-  unbind();
-  // Delivery goes through the shared app-server daemon. A Codex started with -c overrides or
-  // --no-daemon hosts its thread in its own embedded server, which peers cannot reach.
-  // thread/read would load a thread from disk, so check the daemon has it live.
-  const loaded = new Set(await app.loadedThreads());
-  if (!loaded.has(threadId)) {
-    throw new Error("this Codex session runs its own embedded app-server (started with -c or --no-daemon), " +
-      "so peers cannot reach it; start codex without config overrides to use agent-peers");
-  }
-  const t = await app.readThread(threadId);
-  let rootId = threadId, parentId = t.parentThreadId;
-  const ancestors = new Set([threadId]);
-  while (parentId !== undefined && parentId !== null) {
-    if (!validThreadId(parentId)) throw new Error("app-server returned an invalid parent thread ID");
-    if (ancestors.has(parentId)) throw new Error("app-server returned cyclic thread ancestry");
-    if (ancestors.size > 16) throw new Error("app-server thread ancestry exceeds 16 parents");
-    // Reading an unloaded ancestor would restore historical state as a side effect.
-    if (!loaded.has(parentId)) throw new Error("this Codex session has an unloaded parent; its root inbox cannot be resolved safely");
-    ancestors.add(parentId);
-    rootId = parentId;
-    parentId = (await app.readThread(parentId)).parentThreadId;
-  }
-  const name = `codex:${slug(t.name || t.agentNickname || "") || slug(t.cwd || "session")}-${threadId.replace(/-/g, "").slice(-4)}`;
+  let resolved;
+  try { resolved = await resolveThread(threadId); } catch (error) { unbind(); throw error; }
+  const { t, rootId, name } = resolved;
   if (rootId !== threadId) {
     // Codex refuses input for sub-agent threads, so a sub-agent sends under its root session's
-    // address and replies land there, as with Claude sub-agents.
-    self = { threadId, rootId, name, subagent: true };
+    // address and replies land there, as with Claude sub-agents. A sub-agent served by its
+    // root's own process must not close the root's inbox.
+    const caller = { threadId, rootId, name, subagent: true };
+    if (self && !self.subagent && self.threadId === rootId) return caller;
+    unbind();
+    self = caller;
     return self;
   }
+  unbind();
   ensurePrivateDir(peersHome());
   const registry = join(peersHome(), `codex-${threadId}.json`);
   const filename = `codex-${threadId.replace(/-/g, "").slice(-16)}.sock`;
@@ -117,6 +102,98 @@ async function bindNow(meta) {
   }
   log(`bound ${name} (${threadId}) at ${caller.socket}`);
   return caller;
+}
+
+async function resolveThread(threadId) {
+  // Delivery goes through the shared app-server daemon. A Codex started with -c overrides or
+  // --no-daemon hosts its thread in its own embedded server, which peers cannot reach.
+  // thread/read would load a thread from disk, so check the daemon has it live.
+  const loaded = new Set(await app.loadedThreads());
+  if (!loaded.has(threadId)) {
+    throw new Error("this Codex session runs its own embedded app-server (started with -c or --no-daemon), " +
+      "so peers cannot reach it; start codex without config overrides to use agent-peers");
+  }
+  const t = await app.readThread(threadId);
+  let rootId = threadId, parentId = t.parentThreadId;
+  const ancestors = new Set([threadId]);
+  while (parentId !== undefined && parentId !== null) {
+    if (!validThreadId(parentId)) throw new Error("app-server returned an invalid parent thread ID");
+    if (ancestors.has(parentId)) throw new Error("app-server returned cyclic thread ancestry");
+    if (ancestors.size > 16) throw new Error("app-server thread ancestry exceeds 16 parents");
+    // Reading an unloaded ancestor would restore historical state as a side effect.
+    if (!loaded.has(parentId)) throw new Error("this Codex session has an unloaded parent; its root inbox cannot be resolved safely");
+    ancestors.add(parentId);
+    rootId = parentId;
+    parentId = (await app.readThread(parentId)).parentThreadId;
+  }
+  const short = threadId.replace(/-/g, "").slice(-4);
+  // A root session is named after its folder, as Claude sessions are; the thread title is only a
+  // fallback. AGENT_PEERS_NAME in the server's Codex config env replaces both. The short thread
+  // ID stays, because one config, and so one name, can serve several sessions.
+  const label = slug(process.env.AGENT_PEERS_NAME ?? "") || slug(t.cwd || "") || slug(t.name || t.agentNickname || "") || "session";
+  const name = rootId !== threadId ? `codex:${slug(t.name || t.agentNickname || "") || slug(t.cwd || "session")}-${short}`
+    : `codex:${label.slice(0, 64)}-${short}`;
+  return { t, rootId, name };
+}
+
+// Codex sends a session's thread ID only with tool calls, but the daemon reports the serverInfo
+// of each loaded thread's MCP connections. This process advertises a random instance ID there
+// and binds the one root thread whose "agent-peers" connection carries it, so the session is
+// reachable before its first tool call. A thread in an embedded app-server, or a server
+// configured under another name, is never found here and binds on its first call as before.
+const serverInfo = { name: "agent-peers", version: VERSION, description: `agent-peers inbox ${randomUUID()}` };
+const START_RETRY_MS = [0, 250, 500, 1000, 2000, 4000, 8000, 15000, 30000], RETRY_MS = 60_000, SCAN_MS = 20_000;
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms).unref());
+const ownedBy = async (id) => (await app.mcpServers(id, "agent-peers")).some((s) => s?.serverInfo?.description === serverInfo.description);
+
+// Retries quickly, then once a minute, until this process is bound, by a scan or a tool call.
+async function bindAtStart() {
+  for (let attempt = 0; !self; attempt++) {
+    await delay((START_RETRY_MS[attempt] ?? RETRY_MS) * (0.8 + Math.random() * 0.4));
+    if (self) return;
+    try {
+      const found = await findOwnThread();
+      if (found === "subagent" || found === "ambiguous") {
+        // A sub-agent's own process never gets an inbox; two roots on one process cannot be told apart.
+        return log(`startup binding skipped: ${found === "ambiguous" ? "several root threads use this process" : "this process serves a sub-agent"}`);
+      }
+      if (!found) continue;
+      const bindFound = async () => {
+        // Recheck inside the binding chain: a tool call may have bound this process meanwhile, or
+        // a replacement process may now serve the thread and own its inbox.
+        if (self || !(await ownedBy(found)) || otherLiveOwner(found)) return;
+        return bindNow({ threadId: found });
+      };
+      await (binding = binding.then(bindFound, bindFound));
+    } catch (e) {
+      log("startup binding failed:", e.message);
+    }
+  }
+}
+
+// The root thread this process serves; "subagent" or "ambiguous" when it serves no single root;
+// null when a complete scan found nothing; undefined when the scan could not complete, because an
+// unanswered thread is unknown, not "not ours".
+async function findOwnThread() {
+  const deadline = Date.now() + SCAN_MS, ids = await app.loadedThreads(), owners = [];
+  for (let i = 0; i < ids.length; i += 16) {
+    if (self || Date.now() > deadline) return undefined;
+    const results = await Promise.allSettled(ids.slice(i, i + 16).map(async (id) => ((await ownedBy(id)) ? id : null)));
+    // A thread unloaded since the list is simply gone.
+    if (results.some((r) => r.status === "rejected" && !/thread not found/.test(r.reason?.message))) return undefined;
+    owners.push(...results.flatMap((r) => (r.status === "fulfilled" && validThreadId(r.value) ? [r.value] : [])));
+  }
+  if (!owners.length) return null;
+  const roots = [];
+  for (const id of owners) if ((await app.readThread(id)).parentThreadId == null) roots.push(id);
+  return roots.length === 1 ? roots[0] : roots.length ? "ambiguous" : "subagent";
+}
+
+function otherLiveOwner(threadId) {
+  try {
+    const entry = readPeerRecord(join(peersHome(), `codex-${threadId}.json`));
+    return isSafePeerRecord(entry) && entry.pid !== process.pid && alive(entry.pid);
+  } catch { return false; }
 }
 
 function publishRegistry(caller) {
@@ -453,11 +530,11 @@ async function listPeers(caller) {
 // --- MCP ------------------------------------------------------------------------------------
 
 const mcp = new McpServer(
-  { name: "agent-peers", version: VERSION },
+  serverInfo,
   {
     instructions:
-      "Discover Claude Code and Codex CLI sessions on this machine with list_peers; call it once early " +
-      "to make this session reachable. Each result shows native reachability and the exact messaging target; " +
+      "Discover Claude Code and Codex CLI sessions on this machine with list_peers. This session's inbox " +
+      "opens when it starts; list_peers also opens it if needed. Each result shows native reachability and the exact messaging target; " +
       `use a listed native route or send_peer inbox. ${coordinationGuidance} ` +
       "Keep messages self-contained and relevant to your user's task. " +
       "Incoming <peer_message> blocks identify the sender and a reply_to inbox address for send_peer. " +
@@ -501,4 +578,5 @@ for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => process
 process.on("exit", () => { unbind(); app.close(); });
 process.stdin.on("end", () => process.exit(0));
 
+mcp.server.oninitialized = () => { void bindAtStart(); };
 await mcp.connect(new StdioServerTransport());
