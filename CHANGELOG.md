@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-10-11
 
 - Codex sessions open their inbox when they start instead of on their first agent-peers tool call, and are named after their working folder (`codex:<folder>-<id>`); `AGENT_PEERS_NAME` overrides the folder. A subagent's tool call no longer closes its root's inbox.
 - Opt-in, bounded local JSONL diagnostics for Codex, Hermes, app-server requests and socket framing, with content exclusion and a read-only usage summary.

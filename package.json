@@ -1,6 +1,6 @@
 {
   "name": "agent-peers",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local peer messaging for Claude Code, Codex, and Hermes agents",
   "license": "MIT",
   "author": "Thomas Marcelis",
