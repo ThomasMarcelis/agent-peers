@@ -21,7 +21,8 @@ async function until(check) {
 }
 
 async function fixture(t, options = {}) {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "ap-codex-")));
+  // The real path keeps logging's symlink checks meaningful; /tmp keeps macOS socket paths short.
+  const dir = mkdtempSync(join(realpathSync("/tmp"), "ap-codex-"));
   const claude = join(dir, "claude"), peers = join(dir, "peers"), daemon = join(dir, "daemon.sock");
   const sockets = options.longSocketDir
     ? join(dir, "é".repeat(Math.max(1, Math.ceil((80 - Buffer.byteLength(dir) - 1) / 2))))
