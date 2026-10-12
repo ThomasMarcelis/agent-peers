@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { MAX_LINE, address, alive, claudeSessions, codexPeers, ensurePrivateDir, peerSocket, post, readLines, socketDir, socketPath } from "../src/wire.mjs";
 
 function fixture(t) {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "ap-wire-")));
+  const dir = mkdtempSync(join(tmpdir(), "ap-wire-"));
   const claude = join(dir, "claude"), peers = join(dir, "peers"), sockets = join(dir, "sockets");
   for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true, mode: 0o700 });
   const before = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME,
@@ -31,7 +31,8 @@ class Connection extends EventEmitter {
 }
 
 test("invalid transport frames are diagnosed without leaking their raw contents", (t) => {
-  const f = fixture(t), logfile = join(f.dir, "wire.jsonl");
+  // Diagnostics refuse symlinked log paths, and macOS tmpdir() sits under the /var symlink.
+  const f = fixture(t), logfile = join(realpathSync(f.dir), "wire.jsonl");
   const before = { AGENT_PEERS_DEBUG: process.env.AGENT_PEERS_DEBUG, AGENT_PEERS_LOG: process.env.AGENT_PEERS_LOG };
   Object.assign(process.env, { AGENT_PEERS_DEBUG: "1", AGENT_PEERS_LOG: logfile });
   t.after(() => {
