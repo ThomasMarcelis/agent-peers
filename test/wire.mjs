@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { createServer } from "node:net";
 import { once } from "node:events";
@@ -29,6 +29,26 @@ class Connection extends EventEmitter {
   setTimeout() {}
   destroy() { this.destroyed = true; }
 }
+
+test("invalid transport frames are diagnosed without leaking their raw contents", (t) => {
+  // Diagnostics refuse symlinked log paths, and macOS tmpdir() sits under the /var symlink.
+  const f = fixture(t), logfile = join(realpathSync(f.dir), "wire.jsonl");
+  const before = { AGENT_PEERS_DEBUG: process.env.AGENT_PEERS_DEBUG, AGENT_PEERS_LOG: process.env.AGENT_PEERS_LOG };
+  Object.assign(process.env, { AGENT_PEERS_DEBUG: "1", AGENT_PEERS_LOG: logfile });
+  t.after(() => {
+    for (const [key, value] of Object.entries(before)) value === undefined ? delete process.env[key] : process.env[key] = value;
+  });
+  const conn = new Connection(), received = [];
+  readLines(conn, (line) => received.push(line));
+  conn.emit("data", Buffer.from('SECRET_BROKEN_JSON\n{"ok":true}\nSECRET_PARTIAL'));
+  conn.emit("end");
+  assert.deepEqual(received, [{ ok: true }]);
+  const text = readFileSync(logfile, "utf8");
+  assert.doesNotMatch(text, /SECRET_/);
+  const rows = text.trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(rows.some((e) => e.event === "frame.drop" && e.reason === "invalid_json"));
+  assert.ok(rows.some((e) => e.event === "frame.drop" && e.reason === "incomplete_frame"));
+});
 
 test("private directories reject shared modes and symlinks", (t) => {
   const f = fixture(t);

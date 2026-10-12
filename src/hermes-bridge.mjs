@@ -6,6 +6,7 @@ import { chmodSync, lstatSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { AppServer } from "./app-server.mjs";
+import { errorFields, logEvent, logIdentity } from "./logging.mjs";
 import {
   MAX_LINE, MAX_SOCKET_PATH, address, allPeers, messageLine, parseEnvelope, peerSocket, post, readLines,
 } from "./wire.mjs";
@@ -14,6 +15,11 @@ const BUCKET = 30, REFILL_PER_S = 0.5, DEDUP_MS = 30_000, IDLE_MS = 600_000;
 const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256;
 const IPC_QUEUE_MAX = 128, IPC_WRITE_TIMEOUT_MS = 5000;
 const logger = (message) => console.error(`[hermes-bridge ${process.pid}] ${message}`);
+const event = (name, fields) => logEvent("hermes-bridge", name, fields);
+const safeError = (error) => {
+  const { reason, errorCode } = errorFields(error);
+  return errorCode && errorCode !== "unknown" ? `${reason} (${errorCode})` : reason;
+};
 
 function requiredString(value, field, max = MAX_LINE) {
   if (typeof value !== "string" || !value.trim() || value.length > max) {
@@ -54,6 +60,29 @@ export class HermesBridge {
   }
 
   async request(method, params = {}) {
+    const operationId = randomUUID(), started = performance.now();
+    const fields = {
+      operationId, method: ["list_peers", "send_peer", "close_session"].includes(method) ? method : "unknown",
+      ...(typeof params?.session === "string" ? { sessionId: logIdentity(params.session) } : {}),
+      ...(typeof params?.to === "string" ? { targetId: logIdentity(params.to) } : {}),
+      ...(typeof params?.message === "string" ? { bytes: Buffer.byteLength(params.message) } : {}),
+    };
+    event("tool.request", fields);
+    try {
+      const result = await this.#request(method, params, operationId);
+      event("tool.result", {
+        ...fields, durationMs: performance.now() - started,
+        outcome: result.note || result.status && result.status !== "delivered" ? "warning" : "success",
+        ...(Array.isArray(result.peers) ? { bridgeCount: result.peers.length } : {}),
+      });
+      return result;
+    } catch (error) {
+      event("tool.result", { ...fields, outcome: "error", durationMs: performance.now() - started, ...errorFields(error) });
+      throw error;
+    }
+  }
+
+  async #request(method, params, operationId) {
     if (this.#closed) throw new Error("Hermes bridge is closed");
     if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("params must be an object");
     if (method === "list_peers") return this.#listPeers();
@@ -63,7 +92,7 @@ export class HermesBridge {
     const previous = this.#locks.get(session) ?? Promise.resolve();
     const operation = previous.catch(() => {}).then(async () => {
       if (this.#closed) throw new Error("Hermes bridge is closed");
-      if (method === "send_peer") return this.#send(session, params);
+      if (method === "send_peer") return this.#send(session, params, operationId);
       const routes = [...this.#routes.values()].filter((route) => route.session === session);
       await Promise.all(routes.map((route) => this.#retire(route)));
       return { closed: routes.length > 0 };
@@ -137,12 +166,18 @@ export class HermesBridge {
       buckets: new Map(), recent: new Map(), pending: new Map(), queued: 0, chain: Promise.resolve(),
     };
     route.server = createServer((conn) => {
-      if (route.closed || route.connections.size >= QUEUE_MAX) return conn.destroy();
+      if (route.closed || route.connections.size >= QUEUE_MAX) {
+        event("receive.dropped", { sessionId: logIdentity(session), reason: route.closed ? "closed" : "queue_full" });
+        return conn.destroy();
+      }
       route.connections.add(conn);
       conn.once("close", () => route.connections.delete(conn));
       readLines(conn, (line) => this.#receive(route, line));
     });
-    route.server.on("error", (error) => this.#log(`inbox error: ${error.message}`));
+    route.server.on("error", (error) => {
+      event("inbox.error", { sessionId: logIdentity(session), ...errorFields(error) });
+      this.#log(`inbox error: ${safeError(error)}`);
+    });
     try {
       await new Promise((resolve, reject) => {
         route.server.once("error", reject);
@@ -152,6 +187,7 @@ export class HermesBridge {
       route.owner = lstatSync(socket);
       chmodSync(socket, 0o600);
       this.#routes.set(key, route);
+      event("inbox.bound", { sessionId: logIdentity(session), targetId: logIdentity(route.address) });
     } catch (error) {
       route.closed = true;
       for (const conn of route.connections) conn.destroy();
@@ -163,7 +199,30 @@ export class HermesBridge {
     return route;
   }
 
-  async #send(session, params) {
+  async #send(session, params, operationId) {
+    const started = performance.now(), messageId = randomUUID();
+    const fields = {
+      operationId, messageId: logIdentity(messageId), sessionId: logIdentity(session),
+      ...(typeof params.to === "string" ? { targetId: logIdentity(params.to) } : {}),
+      ...(typeof params.message === "string" ? { bytes: Buffer.byteLength(params.message) } : {}),
+    };
+    event("send.started", fields);
+    try {
+      const result = await this.#post(session, params, messageId, fields);
+      const status = result.status;
+      event("send.result", {
+        ...fields, durationMs: performance.now() - started,
+        outcome: status === "held" ? "held" : status === "delivered" ? "receipt_delivered" : status ? "rejected" : "inbox_written",
+        receipt: Boolean(status),
+      });
+      return result;
+    } catch (error) {
+      event("send.result", { ...fields, outcome: "error", durationMs: performance.now() - started, ...errorFields(error) });
+      throw error;
+    }
+  }
+
+  async #post(session, params, messageId, fields) {
     const name = requiredString(params.name, "name", 80);
     if (!/^hermes:[A-Za-z0-9:_-]+$/.test(name)) throw new Error("name must identify a Hermes profile as hermes:<profile>");
     const to = requiredString(params.to, "to", 512);
@@ -177,7 +236,7 @@ export class HermesBridge {
     const body = target.kind === "codex" ? message : `${message}\n\n` +
       `(From ${name}, a Hermes profile with a private reply inbox. Use your peer messaging tool ` +
       `to reply to the sender address. Claude's notify_when_idle is unavailable for this peer.)`;
-    const line = messageLine({ from: route.address, fromName: name, body });
+    const line = { ...messageLine({ from: route.address, fromName: name, body }), msg_id: messageId };
     let finish, timer;
     const receipt = new Promise((resolve) => {
       finish = resolve;
@@ -185,7 +244,9 @@ export class HermesBridge {
       timer = setTimeout(() => resolve(undefined), 1500);
     });
     try {
+      const started = performance.now();
       await post(targetSocket, line);
+      event("message.send", { ...fields, outcome: "inbox_written", durationMs: performance.now() - started });
       const status = await receipt;
       const text = status === "held"
         ? `Delivered to ${target.name}'s inbox; its session is holding it for its user's approval.`
@@ -203,42 +264,56 @@ export class HermesBridge {
     const now = Date.now();
     for (const [key, bucket] of route.buckets) if (now - bucket.at > IDLE_MS) route.buckets.delete(key);
     for (const [key, time] of route.recent) if (now - time > DEDUP_MS) route.recent.delete(key);
-    if (!route.buckets.has(from) && route.buckets.size >= SOURCES_MAX) return false;
+    if (!route.buckets.has(from) && route.buckets.size >= SOURCES_MAX) return "rate_limit";
     const bucket = route.buckets.get(from) ?? { tokens: BUCKET, at: now };
     bucket.tokens = Math.min(BUCKET, bucket.tokens + (now - bucket.at) / 1000 * REFILL_PER_S);
     bucket.at = now;
     route.buckets.set(from, bucket);
     const bodyKey = createHash("sha256").update(from).update("\0").update(body).digest("hex");
     const idKey = `${from}\0${id}`;
-    if (bucket.tokens < 1 || route.recent.has(bodyKey) || route.recent.has(idKey) ||
-        route.queued >= QUEUE_MAX || this.#queued >= TOTAL_QUEUE_MAX) return false;
+    if (route.recent.has(bodyKey) || route.recent.has(idKey)) return "duplicate";
+    if (bucket.tokens < 1) return "rate_limit";
+    if (route.queued >= QUEUE_MAX || this.#queued >= TOTAL_QUEUE_MAX) return "queue_full";
     bucket.tokens--;
     route.recent.set(bodyKey, now);
     route.recent.set(idKey, now);
-    return true;
+    return undefined;
   }
 
   #receive(route, line) {
-    if (route.closed || !line || typeof line !== "object") return;
+    const sessionId = logIdentity(route.session);
+    const drop = (reason, fields = {}) => event("receive.dropped", { sessionId, reason, ...fields });
+    if (route.closed) return drop("closed");
+    if (!line || typeof line !== "object") return drop("malformed");
     if (line.type === "control" && line.action === "peer_message_status") {
-      if (typeof line.status === "string" && line.status.length <= 128) route.pending.get(line.orig_msg_id)?.(line.status);
+      if (typeof line.status !== "string" || !line.status.length || line.status.length > 128 ||
+          typeof line.orig_msg_id !== "string") return drop("malformed");
+      route.pending.get(line.orig_msg_id)?.(line.status);
       return;
     }
-    if (line.type !== "user" || typeof line.message?.content !== "string") return;
+    if (line.type !== "user" || typeof line.message?.content !== "string") return drop("malformed");
     const env = parseEnvelope(line.message.content);
-    if (!env || !peerSocket(env.from) || env.from === route.address || (line.from && line.from !== env.from)) return;
+    if (!env || !peerSocket(env.from) || env.from === route.address || (line.from && line.from !== env.from)) return drop("malformed");
     const id = typeof line.msg_id === "string" && line.msg_id.length <= 256 && line.msg_id ? line.msg_id : randomUUID();
-    if (!this.#admit(route, env.from, env.body, id)) return;
+    const fields = { sessionId, messageId: logIdentity(id), targetId: logIdentity(env.from), bytes: Buffer.byteLength(env.body) };
+    const reason = this.#admit(route, env.from, env.body, id);
+    if (reason) return drop(reason, fields);
     route.queued++;
     this.#queued++;
+    event("receive.queued", { ...fields, queueDepth: route.queued });
+    const started = performance.now();
     route.chain = route.chain.then(async () => {
-      if (route.closed) return;
+      if (route.closed) return drop("closed", fields);
       await this.#emit({ method: "peer_message", params: {
         session: route.session, message_id: id, from: env.from,
         from_name: /^[A-Za-z0-9:_ .-]{1,80}$/.test(env.fromName ?? "") ? env.fromName : "an unnamed peer",
         message: env.body,
       } });
-    }).catch((error) => this.#log(`incoming message delivery failed: ${error.message}`))
+      event("delivery.result", { ...fields, outcome: "emitted_to_host", durationMs: performance.now() - started });
+    }).catch((error) => {
+      event("delivery.result", { ...fields, outcome: "error", durationMs: performance.now() - started, ...errorFields(error) });
+      this.#log(`incoming message delivery failed: ${safeError(error)}`);
+    })
       .finally(() => { route.queued--; this.#queued--; });
   }
 
@@ -253,7 +328,7 @@ export class HermesBridge {
       const current = lstatSync(route.socket);
       owned = current.dev === route.owner.dev && current.ino === route.owner.ino;
     } catch (error) {
-      if (error.code !== "ENOENT") this.#log(`cannot inspect inbox ownership: ${error.message}`);
+      if (error.code !== "ENOENT") this.#log(`cannot inspect inbox ownership: ${safeError(error)}`);
     }
     if (owned) {
       // Node closes and unlinks a Unix listener by pathname; do not close it if somebody
@@ -270,6 +345,7 @@ export class HermesBridge {
     }
     route.buckets.clear();
     route.recent.clear();
+    event("inbox.closed", { sessionId: logIdentity(route.session), targetId: logIdentity(route.address), queueDepth: route.queued });
   }
 
   close() {
@@ -292,6 +368,7 @@ export class HermesBridge {
 export function runHermesBridge() {
   const write = (message) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
+      event("bridge.error", { reason: "timeout" });
       reject(new Error("bridge output timed out"));
       void stop(1);
     }, IPC_WRITE_TIMEOUT_MS);
@@ -312,7 +389,8 @@ export function runHermesBridge() {
     try {
       await bridge.close();
     } catch (error) {
-      logger(`bridge shutdown failed: ${error.message}`);
+      event("bridge.error", errorFields(error));
+      logger(`bridge shutdown failed: ${safeError(error)}`);
       code = 1;
     }
     process.exit(code);
@@ -326,6 +404,7 @@ export function runHermesBridge() {
       const raw = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
       if (Buffer.byteLength(raw) + 1 > MAX_LINE || queued >= IPC_QUEUE_MAX) {
+        event("bridge.error", { reason: queued >= IPC_QUEUE_MAX ? "queue_full" : "message_too_large", queueDepth: queued });
         logger("bridge input limit exceeded");
         void stop(1);
         return;
@@ -352,25 +431,28 @@ export function runHermesBridge() {
           const result = await bridge.request(request.method, request.params);
           await write({ id, result });
         } catch (error) {
+          if (id === null) event("bridge.error", { reason: "malformed" });
           await write({ id, error: { message: error.message } });
         }
-      }).catch((error) => { logger(error.message); void stop(1); }).finally(() => queued--);
+      }).catch((error) => { event("bridge.error", errorFields(error)); logger(safeError(error)); void stop(1); }).finally(() => queued--);
     }
     if (Buffer.byteLength(buffer) >= MAX_LINE) {
+      event("bridge.error", { reason: "message_too_large" });
       logger("bridge input line too large");
       void stop(1);
     }
   });
   process.stdin.on("end", () => {
     if (buffer.trim()) {
+      event("bridge.error", { reason: "malformed" });
       logger("incomplete bridge input at EOF");
       void stop(1);
     } else void chain.finally(() => stop());
   });
-  process.stdin.on("error", () => { void stop(1); });
-  process.stdout.on("error", () => { void stop(1); });
+  process.stdin.on("error", (error) => { event("bridge.error", errorFields(error)); void stop(1); });
+  process.stdout.on("error", (error) => { event("bridge.error", errorFields(error)); void stop(1); });
   process.once("SIGINT", () => { void stop(); });
   process.once("SIGTERM", () => { void stop(); });
-  process.on("uncaughtException", (error) => { logger(error.message); void stop(1); });
+  process.on("uncaughtException", (error) => { event("bridge.error", errorFields(error)); logger(safeError(error)); void stop(1); });
   return bridge;
 }

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from "node:fs";
+import { createServer } from "node:net";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,4 +51,27 @@ test("doctor reports invalid paths as errors", () => {
   const result = run(["doctor", "--json"], { AGENT_PEERS_HOME: "relative-peers" });
   assert.equal(result.status, 1);
   assert.equal(JSON.parse(result.stdout).checks.find((c) => c.name === "peer registry").status, "error");
+});
+
+test("doctor accepts Codex's owned daemon symlink but rejects unsafe target directories", async () => {
+  const home = mkdtempSync(join(tmpdir(), "ap-doctor-"));
+  const directory = join(home, "runtime"), link = join(home, "daemon.sock"), socket = join(directory, "actual.sock");
+  mkdirSync(directory, { mode: 0o700 });
+  const server = createServer();
+  try {
+    server.listen(socket);
+    await once(server, "listening");
+    symlinkSync(socket, link);
+    const env = { CLAUDE_CONFIG_DIR: join(home, "claude"), AGENT_PEERS_HOME: join(home, "peers"), AGENT_PEERS_CODEX_APP_SERVER: link };
+    const result = run(["doctor", "--json"], env);
+    assert.equal(result.status, 0, result.stdout);
+    assert.equal(JSON.parse(result.stdout).checks.find((c) => c.name === "codex daemon").status, "ok");
+    chmodSync(directory, 0o777);
+    const unsafe = run(["doctor", "--json"], env);
+    assert.equal(unsafe.status, 1);
+    assert.equal(JSON.parse(unsafe.stdout).checks.find((c) => c.name === "codex daemon").status, "error");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(home, { recursive: true, force: true });
+  }
 });

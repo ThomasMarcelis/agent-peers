@@ -10,6 +10,7 @@ import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdi
 import { connect } from "node:net";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { errorFields, logEvent } from "./logging.mjs";
 
 export const TAG = "cross-session-message";
 export const MAX_LINE = 1_000_000;
@@ -281,7 +282,8 @@ export function post(socket, line) {
 // until the complete line also preserves UTF-8 codepoints split across arbitrary socket writes.
 export function readLines(conn, onLine) {
   let buffer = Buffer.allocUnsafe(4096), bytes = 0;
-  conn.setTimeout(30_000, () => conn.destroy());
+  const dropped = (reason) => logEvent("wire", "frame.drop", { outcome: "dropped", reason, bytes });
+  conn.setTimeout(30_000, () => { dropped("idle_timeout"); conn.destroy(); });
   conn.on("data", (data) => {
     const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
     let offset = 0;
@@ -290,7 +292,10 @@ export function readLines(conn, onLine) {
       const stop = end < 0 ? chunk.length : end + 1;
       const part = chunk.subarray(offset, stop);
       const nextBytes = bytes + part.length;
-      if (nextBytes > MAX_LINE || (end < 0 && nextBytes >= MAX_LINE)) return conn.destroy();
+      if (nextBytes > MAX_LINE || (end < 0 && nextBytes >= MAX_LINE)) {
+        dropped("frame_too_large");
+        return conn.destroy();
+      }
       if (nextBytes > buffer.length) {
         const grown = Buffer.allocUnsafe(Math.min(MAX_LINE, Math.max(nextBytes, buffer.length * 2)));
         buffer.copy(grown, 0, 0, bytes);
@@ -303,11 +308,16 @@ export function readLines(conn, onLine) {
       const raw = buffer.toString("utf8", 0, bytes);
       bytes = 0;
       if (!raw.trim()) continue;
-      try { onLine(JSON.parse(raw)); } catch {}
+      let line;
+      try { line = JSON.parse(raw); }
+      catch { dropped("invalid_json"); continue; }
+      try { onLine(line); }
+      catch (error) { logEvent("wire", "frame.handler", { outcome: "failed", ...errorFields(error) }); }
       if (conn.destroyed) return;
     }
   });
-  conn.on("error", () => {});
+  conn.on("end", () => { if (bytes) dropped("incomplete_frame"); });
+  conn.on("error", (error) => logEvent("wire", "connection.error", { outcome: "failed", ...errorFields(error) }));
 }
 
 export const slug = (s) => basename(s).replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
