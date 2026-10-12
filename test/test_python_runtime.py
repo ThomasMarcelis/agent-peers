@@ -162,9 +162,13 @@ def test_bridge_environment_excludes_credentials_and_preloads(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
     monkeypatch.setenv("NODE_OPTIONS", "--require /untrusted.js")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/test/claude")
+    monkeypatch.setenv("AGENT_PEERS_DEBUG", "1")
+    monkeypatch.setenv("AGENT_PEERS_LOG", "/test/private-diagnostics.jsonl")
     assert "OPENAI_API_KEY" not in runtime.bridge_environment()
     assert "NODE_OPTIONS" not in runtime.bridge_environment()
     assert runtime.bridge_environment()["CLAUDE_CONFIG_DIR"] == "/test/claude"
+    assert runtime.bridge_environment()["AGENT_PEERS_DEBUG"] == "1"
+    assert runtime.bridge_environment()["AGENT_PEERS_LOG"] == "/test/private-diagnostics.jsonl"
 
 
 def test_managed_node_resolution_and_version_validation(tmp_path, monkeypatch):

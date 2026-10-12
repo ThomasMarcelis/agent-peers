@@ -51,6 +51,8 @@ agent-peers list
 agent-peers doctor
 ```
 
+For local development diagnostics, start the integration with `AGENT_PEERS_DEBUG=1` and inspect retained activity with `agent-peers logs --json`. Logs contain bounded metadata, timings, correlation IDs and failure categories; message bodies and raw errors are excluded. See [logging configuration and limits](docs/reference.md#local-diagnostic-logging). Existing processes need a normal restart to inherit the setting.
+
 ### Hermes (experimental)
 
 A native plugin lets Hermes contact Claude and Codex, with private replies to the originating conversation. **Sending requires the [documented Hermes fork](docs/compatibility.md#tested-agent-builds); stock Hermes supports discovery only.**

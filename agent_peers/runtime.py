@@ -34,10 +34,11 @@ def context_thread(target, *, name, args=()):
 
 
 def bridge_environment():
-    # Discovery paths only; provider credentials and Node preload hooks stay out.
+    # Discovery and opt-in diagnostics only; credentials and Node preload hooks stay out.
     return {key: os.environ[key] for key in (
         "PATH", "HOME", "XDG_RUNTIME_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
         "AGENT_PEERS_HOME", "AGENT_PEERS_CODEX_APP_SERVER",
+        "AGENT_PEERS_DEBUG", "AGENT_PEERS_LOG",
     ) if key in os.environ}
 
 

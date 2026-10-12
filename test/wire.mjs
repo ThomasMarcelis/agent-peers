@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { createServer } from "node:net";
 import { once } from "node:events";
@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { MAX_LINE, address, alive, claudeSessions, codexPeers, ensurePrivateDir, peerSocket, post, readLines, socketDir, socketPath } from "../src/wire.mjs";
 
 function fixture(t) {
-  const dir = mkdtempSync(join(tmpdir(), "ap-wire-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "ap-wire-")));
   const claude = join(dir, "claude"), peers = join(dir, "peers"), sockets = join(dir, "sockets");
   for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true, mode: 0o700 });
   const before = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME,
@@ -29,6 +29,25 @@ class Connection extends EventEmitter {
   setTimeout() {}
   destroy() { this.destroyed = true; }
 }
+
+test("invalid transport frames are diagnosed without leaking their raw contents", (t) => {
+  const f = fixture(t), logfile = join(f.dir, "wire.jsonl");
+  const before = { AGENT_PEERS_DEBUG: process.env.AGENT_PEERS_DEBUG, AGENT_PEERS_LOG: process.env.AGENT_PEERS_LOG };
+  Object.assign(process.env, { AGENT_PEERS_DEBUG: "1", AGENT_PEERS_LOG: logfile });
+  t.after(() => {
+    for (const [key, value] of Object.entries(before)) value === undefined ? delete process.env[key] : process.env[key] = value;
+  });
+  const conn = new Connection(), received = [];
+  readLines(conn, (line) => received.push(line));
+  conn.emit("data", Buffer.from('SECRET_BROKEN_JSON\n{"ok":true}\nSECRET_PARTIAL'));
+  conn.emit("end");
+  assert.deepEqual(received, [{ ok: true }]);
+  const text = readFileSync(logfile, "utf8");
+  assert.doesNotMatch(text, /SECRET_/);
+  const rows = text.trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(rows.some((e) => e.event === "frame.drop" && e.reason === "invalid_json"));
+  assert.ok(rows.some((e) => e.event === "frame.drop" && e.reason === "incomplete_frame"));
+});
 
 test("private directories reject shared modes and symlinks", (t) => {
   const f = fixture(t);
