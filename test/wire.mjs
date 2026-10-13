@@ -229,11 +229,12 @@ test("both configured runtime and temp socket directories allow unregistered rep
   const f = fixture(t);
   rmSync(join(f.claude, "sessions", `${process.pid}.json`));
   process.env.TMPDIR = f.dir;
-  process.env.XDG_RUNTIME_DIR = join(f.dir, "runtime");
+  // Leave room for a long TMPDIR without turning this into a pathname-limit test.
+  process.env.XDG_RUNTIME_DIR = join(f.dir, "r");
   const runtime = join(process.env.XDG_RUNTIME_DIR, "cc-socks"), temp = join(f.dir, "cc-socks");
   ensurePrivateDir(runtime); ensurePrivateDir(temp);
   for (const directory of [runtime, temp]) {
-    const path = join(directory, "hermes-in-flight.sock");
+    const path = join(directory, "h.sock");
     assert.equal(peerSocket(address(path)), path);
   }
 });

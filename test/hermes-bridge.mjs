@@ -123,8 +123,10 @@ test("private sessions send, receive replies, and remain absent from every regis
   const second = await f.send("conversation-b", "codex:test", "hello Codex");
   assert.notEqual(first.address, second.address);
   assert.equal(first.status, "delivered");
+  assert.equal(first.text, "Delivered to claude:test's inbox.");
+  assert.equal(second.text, "Delivered to codex:test's inbox.");
   const outbound = f.messages.map((entry) => parseEnvelope(entry.line.message.content));
-  assert.match(outbound[0].body, /hello Claude[\s\S]*Hermes profile/);
+  assert.equal(outbound[0].body, "hello Claude\n\n(Hermes profile; notify_when_idle unavailable.)");
   assert.equal(outbound[0].fromName, "hermes:JD");
   assert.equal(outbound[1].body, "hello Codex");
   assert.equal(peerSocket(first.address), join(f.sockets, first.address.split("/").at(-1)));
@@ -144,7 +146,7 @@ test("private sessions send, receive replies, and remain absent from every regis
   assert.equal(again.address, first.address);
   await until(() => f.events.length === 3);
   assert.equal(f.events[2].params.session, "conversation-b");
-  assert.match(f.events[2].params.message, /private to private/);
+  assert.equal(f.events[2].params.message, "private to private");
   assert.equal((await f.bridge.request("list_peers")).peers.length, 2);
 });
 

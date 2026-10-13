@@ -233,9 +233,9 @@ export class HermesBridge {
     const route = await this.#bind(session, name, dirname(targetSocket));
     if (target.address === route.address) throw new Error("that address is this conversation's own inbox");
     // Claude labels every external envelope as another Claude session. Correct that frame.
-    const body = target.kind === "codex" ? message : `${message}\n\n` +
-      `(From ${name}, a Hermes profile with a private reply inbox. Use your peer messaging tool ` +
-      `to reply to the sender address. Claude's notify_when_idle is unavailable for this peer.)`;
+    const body = target.kind === "claude"
+      ? `${message}\n\n(Hermes profile; notify_when_idle unavailable.)`
+      : message;
     const line = { ...messageLine({ from: route.address, fromName: name, body }), msg_id: messageId };
     let finish, timer;
     const receipt = new Promise((resolve) => {
@@ -251,7 +251,7 @@ export class HermesBridge {
       const text = status === "held"
         ? `Delivered to ${target.name}'s inbox; its session is holding it for its user's approval.`
         : status && status !== "delivered" ? `Not delivered to ${target.name}: ${status}.`
-          : `Delivered to ${target.name}'s inbox. Any reply arrives in this Hermes conversation.`;
+          : `Delivered to ${target.name}'s inbox.`;
       return { text, address: route.address, message_id: line.msg_id, ...(status ? { status } : {}) };
     } finally {
       clearTimeout(timer);

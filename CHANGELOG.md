@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Shorter coordination guidance, incoming peer frames, Claude-only compatibility footers and delivery receipts. Message bodies, permission boundaries, reply routing and receipt metadata remain intact; private reply inboxes no longer receive Claude-specific footers.
 - Codex sessions open their inbox when they start instead of on their first agent-peers tool call, and are named after their working folder (`codex:<folder>-<id>`); `AGENT_PEERS_NAME` overrides the folder. A subagent's tool call no longer closes its root's inbox.
 - Opt-in, bounded local JSONL diagnostics for Codex, Hermes, app-server requests and socket framing, with content exclusion and a read-only usage summary.
 - Native-only targets now explain the exact native messaging route when mistakenly passed to `send_peer`; idle subagents advertise `followup_task`.

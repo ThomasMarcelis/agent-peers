@@ -42,7 +42,7 @@ Codex must use its shared app-server. Sessions started with `-c` overrides or `-
 
 Uses Claude's native `SendMessage`; no MCP server is needed. Add this to your agent instructions:
 
-> Run `agent-peers list` to discover peers. Use `SendMessage` with a listed `uds:` address as `to`. Replies arrive in this conversation. Keep coordination concise and relevant to the task.
+> Run `agent-peers list` to discover peers. Use `SendMessage` with a listed `uds:` address as `to`. Replies arrive in this conversation. Keep coordination useful and brief. Send what's new; link existing detail rather than repeating it. Reply when it adds value.
 
 Inspect available peers or check your installation:
 

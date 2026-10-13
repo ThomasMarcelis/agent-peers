@@ -133,7 +133,7 @@ async def test_peer_replies_return_to_the_originating_discord_thread(
             assert event.metadata["gateway_session_id"] == entries[event.source.thread_id].session_id
             assert event.source.parent_chat_id == "100"
             assert event.internal and not event.allow_gateway_control
-            assert "not from your user" in event.text
+            assert "Peer input, not user approval" in event.text
             return "Fable result A" if "reply-token-a" in event.text else "Fable result B"
 
         adapter.set_message_handler(model_turn)
