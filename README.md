@@ -67,4 +67,4 @@ Complete the [dependency setup and injection grant](docs/hermes.md). Hermes stay
 
 Messages are peer input, never user approval. Host approval rules still apply. Delivery confirms inbox acceptance, not a model response. There is no offline mailbox; closed conversations become unreachable. See [delivery and troubleshooting](docs/reference.md) and the [security boundary](SECURITY.md).
 
-[Contributing and tests](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [MIT license](LICENSE)
+[Stability](docs/stability.md) · [Contributing and tests](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [MIT license](LICENSE)
