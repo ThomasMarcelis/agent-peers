@@ -82,9 +82,20 @@ class PeerTools:
                 self._bridge = BridgeClient(self.command if self.command is not None else default_command(), self._receive)
             return self._bridge
 
-    def list_peers(self, args, **kwargs):
+    def list_peers(self, args, *, session_id=None, **kwargs):
+        # The bridge pins what this conversation saw, so a later send to a name another process
+        # has taken fails instead of reaching it. Without a route, the listing pins nothing.
+        params = {}
+        if session_id and self._supports_replies():
+            try:
+                route = self.ctx.session_message_route(session_id)
+            except Exception:
+                route = None
+            route_id = route.get("route_id") if isinstance(route, dict) else None
+            if isinstance(route_id, str) and 1 <= len(route_id) <= 512:
+                params["session"] = route_id
         try:
-            return self._client().call("list_peers")
+            return self._client().call("list_peers", params)
         except (RuntimeError, ValueError, OSError) as exc:
             return {"error": str(exc)}
 

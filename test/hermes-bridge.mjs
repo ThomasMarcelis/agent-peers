@@ -229,9 +229,13 @@ test("a conversation's inboxes accept only peers it wrote to, in every directory
   }));
   const second = await f.send("guarded", "claude:other");
   assert.equal(dirname(peerSocket(second.from)), otherDir);
-  await post(peerSocket(sent.from), messageLine({ from: codex, body: "reply one" }));
+  const replyOne = messageLine({ from: codex, body: "reply one" });
+  await post(peerSocket(sent.from), replyOne);
   await post(peerSocket(second.from), messageLine({ from: address(otherSocket), body: "reply two" }));
   await until(() => f.events.length === 2, "both replies");
+  // Dedup is per conversation: the same id at its other directory's inbox is a duplicate.
+  await post(peerSocket(second.from), replyOne);
+  await delay(30);
   assert.deepEqual(f.events.map((e) => e.params.message), ["reply one", "reply two"]);
   // Closing forgets every contact: the reopened conversation has written only to the stranger.
   await f.bridge.request("close_session", { session: "guarded" });
@@ -239,6 +243,33 @@ test("a conversation's inboxes accept only peers it wrote to, in every directory
   await post(peerSocket(reopened.from), messageLine({ from: codex, body: "stale reply" }));
   await until(() => f.controls.some(({ kind, line }) => kind === "codex" && line.drop_reason === "not-a-reply-target"), "the refusal after close");
   assert.equal(f.events.length, 2);
+});
+
+test("pins belong to each conversation: no other listing re-pins a name this one saw", async (t) => {
+  const f = await fixture(t);
+  const api = async (label) => {
+    const proc = spawn("sleep", ["60"], { stdio: "ignore" }), socket = join(f.sockets, `${label}.sock`), lines = [];
+    t.after(() => proc.kill());
+    await listen(createServer((conn) => readLines(conn, (line) => { if (line.type === "user") lines.push(line); })), socket, t);
+    const record = join(f.claude, "sessions", `${proc.pid}.json`);
+    writeFileSync(record, JSON.stringify({ pid: proc.pid, name: "api", messagingSocketPath: socket }));
+    return { proc, lines, record };
+  };
+  const old = await api("api-old");
+  assert.notEqual((await f.send("C1", "claude:api", "hi")).status, "failed");
+  // That session exits, and an unrelated one with the same name starts.
+  old.proc.kill();
+  await once(old.proc, "exit");
+  rmSync(old.record);
+  const fresh = await api("api-new");
+  await f.bridge.request("list_peers");
+  await f.bridge.request("list_peers", { session: "C2" });
+  const follow = await f.send("C1", "claude:api", "follow-up");
+  assert.deepEqual([follow.status, follow.reason], ["failed", "not-running"]);
+  assert.equal(fresh.lines.length, 0, "nothing reached the different process");
+  await f.bridge.request("list_peers", { session: "C1" });
+  assert.notEqual((await f.send("C1", "claude:api", "after listing")).status, "failed");
+  assert.equal(fresh.lines.length, 1);
 });
 
 test("receipt controls never become chat, and held delivery status is preserved", async (t) => {

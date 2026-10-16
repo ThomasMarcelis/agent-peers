@@ -262,3 +262,15 @@ def test_arrivals_report_what_the_host_did_to_the_bridge():
         assert bridge.notes[-1][1] == {"session": "route-gone", "message_id": "m4", "accepted": False, "reason": "inbox-closed"}
     finally:
         peers.close()
+
+
+def test_a_listing_pins_only_the_conversation_that_asked():
+    peers = plugin.PeerTools(Context())
+    peers._bridge = bridge = FakeBridge({"peers": []})
+    try:
+        peers.list_peers({}, session_id="chat-a")
+        peers.list_peers({}, session_id="missing")
+        peers.list_peers({})
+        assert bridge.calls == [{"session": "route-a"}, {}, {}]
+    finally:
+        peers.close()

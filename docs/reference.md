@@ -65,7 +65,7 @@ An error status means the message was definitely not delivered. Nothing is retri
 
 **Line extension.** agent-peers adds `agent_peers: {v: 1, receipts: ["queued", "accepted"], generation, in_reply_to}` to each message line it sends, and `agent_peers: {v: 1}` to each receipt. Claude Code and agent-peers 0.x ignore it, and the `<cross-session-message>` envelope is unchanged. Readers ignore unknown fields and accept higher versions. Claude recipients cannot see `in_reply_to`, so a reply to a Claude session ends with `(In reply to <id>.)` instead.
 
-**Generation.** `generation` is an opaque 16-hex-digit string that changes when a different process takes over a PID or an inbox path. Claude sessions keep theirs across `/clear` and `/resume`. A Codex session gets a new one when its MCP server restarts. A record counts as running only if its PID is alive and that process started when the record says. Each sender remembers the generation it saw behind every name and address, from listings, incoming messages and its first send. If a later send finds a different process there, it fails `not-running` instead of reaching the wrong session. Listing again refreshes this.
+**Generation.** `generation` is an opaque 16-hex-digit string that changes when a different process takes over a PID or an inbox path. Claude sessions keep theirs across `/clear` and `/resume`. A Codex session gets a new one when its MCP server restarts. A record counts as running only if its PID is alive and that process started when the record says. Each Codex session (with its subagents) and each Hermes conversation remembers the generation it saw behind every name and address, from its own listings, incoming messages and first send; one never vouches for another. If a later send finds a different process there, it fails `not-running` instead of reaching the wrong session. Listing again refreshes this.
 
 **Names.** Automatic names are `<kind>:<label>`, where the label uses letters, digits and `_ . : -`. Other characters in Claude session names and Codex labels become `-`. Names of the form `<kind>:<scope>/<claim>` are reserved for explicit claims in a later release, so any name containing `/` fails `reserved-name`. `@ * ? ,` and whitespace fail `invalid-request` and will never mean patterns or broadcast. The `names/` directory under `AGENT_PEERS_HOME` is reserved; nothing reads or writes it yet.
 
@@ -103,7 +103,7 @@ An **inbox write** means the local socket write completed. A **receipt** records
 
 Requests are newline-delimited JSON objects `{id, method, params}`. Responses are `{id, result}` or `{id, error}`. The bridge handles requests concurrently, up to 128 at once, keeping order per conversation, so responses can arrive out of order. Methods:
 
-- `list_peers`: no parameters.
+- `list_peers`: optional `session`. The listing pins generations for that conversation only; without it, it pins nothing.
 - `send_peer`: `session`, `name` (a `hermes:` identity), `to`, `message`, optional `in_reply_to`. The result is the [send_peer result](#send_peer-result) plus `text`.
 - `close_session`: `session`.
 - `shutdown`: finish in-flight requests, close owned state and exit.

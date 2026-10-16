@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { app, bind, inboxFor, ownsSocket, roots, serverInfo } from "./codex-binding.mjs";
-import { outboxOf, pins } from "./codex-inbox.mjs";
+import { outboxOf, pinsOf } from "./codex-inbox.mjs";
 import { codexDiscovery, formatCodexPeer, nativeRouteError } from "./discovery.mjs";
 import { coordinationGuidance } from "./guidance.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
@@ -79,7 +79,7 @@ async function send(caller, to, message, inReplyTo) {
   }
   const rootRecord = () => codexPeers().find((peer) => peer.threadId === caller.rootId);
   const out = await sendPeer({
-    to, message, inReplyTo, pins, fromName: caller.name, generation: root?.generation ?? rootRecord()?.generation,
+    to, message, inReplyTo, pins: pinsOf(root, caller.rootId), fromName: caller.name, generation: root?.generation ?? rootRecord()?.generation,
     route: async (target) => {
       const directory = dirname(target.socket);
       if (caller.subagent) {
@@ -133,7 +133,7 @@ mcp.registerTool(
       log("inbox.bind", { ...trace, outcome: "failed", ...errorFields(e) });
     });
     const result = await listPeers(caller);
-    pins.noteRows(result.peers);
+    if (caller) pinsOf(caller.subagent ? roots.get(caller.rootId) : caller, caller.rootId).noteRows(result.peers);
     log("tool.call", { ...trace, outcome: note || result.degraded ? "degraded" : "succeeded", count: result.peers.length,
       durationMs: performance.now() - started });
     return { content: [{ type: "text", text: result.text + note }], structuredContent: { peers: result.peers, self: result.self } };

@@ -13,8 +13,19 @@ const log = (event, fields = {}) => logEvent("codex-peer", event, fields);
 const QUEUE_MAX = 50, QUEUE_BYTES_MAX = 8_000_000, NOTICE_MS = 500;
 const code = (reason) => reason?.replaceAll("-", "_");
 
-export const pins = new Pins();
 const receipts = new Receipts(log);
+// What each root saw behind a name: one root's listing never vouches for another's sends.
+// Subagents share their root's pins; a root served by another process gets a bounded entry here.
+const remotePins = new Map();
+export function pinsOf(root, rootId) {
+  if (root) return root.pins ??= new Pins();
+  let pins = remotePins.get(rootId);
+  if (!pins) {
+    if (remotePins.size >= 16) remotePins.delete(remotePins.keys().next().value);
+    remotePins.set(rootId, pins = new Pins());
+  }
+  return pins;
+}
 export const outboxOf = (root) => root.outbox ??= new Outbox({ onLate: (late) => notice(root, late), log });
 
 export function receive(root, inbox, line) {
@@ -34,7 +45,7 @@ export function receive(root, inbox, line) {
     reply("dropped", reason);
     return log("message.receive", { ...trace, outcome: "dropped", reason: code(reason) });
   }
-  pins.noteSender(message.from, message.ext.generation);
+  pinsOf(root).noteSender(message.from, message.ext.generation);
   reply("queued");
   root.queued++;
   root.queuedBytes += bytes;

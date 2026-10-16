@@ -646,6 +646,12 @@ test("one process serves two root threads, each with its own inbox, registry and
   await until(() => f.turns.length === 2);
   assert.deepEqual(f.turns.map((turn) => [turn.threadId, /to the (\w+)/.exec(turn.input[0].text)[1]]).sort(),
     [[other, "second"], [thread, "first"]].sort());
+  // Pins belong to each root: the second root's new listing does not vouch for the first's sends.
+  rmSync(join(f.claude, "sessions", `${process.pid}.json`));
+  writeFileSync(join(f.claude, "sessions", `${process.ppid}.json`), JSON.stringify({ pid: process.ppid, name: "test", messagingSocketPath: f.inbox }));
+  await peer.call("list_peers", {}, other);
+  assert.equal((await peer.call("send_peer", { to: "claude:test", message: "the first saw the old process" }, thread)).structuredContent.reason, "not-running");
+  assert.equal((await peer.call("send_peer", { to: "claude:test", message: "the second listed again" }, other)).structuredContent.status, "accepted");
   await peer.close();
   assert.deepEqual([existsSync(f.registry), existsSync(otherRegistry), existsSync(firstSocket), existsSync(secondSocket)], [false, false, false, false]);
 });
