@@ -17,8 +17,8 @@ Windows is not supported. WSL must run all participating agents inside the same 
 
 ## Tested agent builds
 
-- Codex CLI **0.160.0**; startup binding verified on **0.162.1**.
-- Claude Code **2.1.288**.
+- Codex CLI **0.162.1**: `node test/contract.mjs` (busy and idle delivery, replies) and startup binding. Earlier releases were verified on 0.160.0.
+- Claude Code **2.1.302**: the same contract run, including a message line that carries the `agent_peers` extension and a Codex reply that Claude accepts without a receipt. Earlier releases were verified on 2.1.288.
 - Hermes fork [ThomasMarcelis/hermes-agent](https://github.com/ThomasMarcelis/hermes-agent) at [`1afb5d16d2d25e1d8e13703c1ce946e3ca0adc0d`](https://github.com/ThomasMarcelis/hermes-agent/commit/1afb5d16d2d25e1d8e13703c1ce946e3ca0adc0d).
 
 The pinned Hermes host is reproducible in CI. It is a fork dependency, not a claim that any upstream version with the same version number includes these APIs.
