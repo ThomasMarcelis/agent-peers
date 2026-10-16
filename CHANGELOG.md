@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A delivery to a peer that closes its connection mid-write is reported as failed instead of delivered.
+
 - `agent-peers whoami [--json]` reports the calling Claude Code (or Codex) session's name and address through process ancestry. Adding the caller to Codex `list_peers` is still to do.
 - `agent-peers list` probes each peer socket and marks refusing sockets `stale` / `reachable: false` without deleting records; `--no-probe` skips this.
 - Peer discovery scans Claude session records once per listing instead of once per peer (about 105 ms to 5 ms for 120 peers).

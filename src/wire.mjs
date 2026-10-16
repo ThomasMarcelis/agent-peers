@@ -344,7 +344,9 @@ export function post(socket, line) {
     };
     const timer = setTimeout(() => finish(new Error("peer inbox did not accept the message within 5 s")), 5000);
     c.on("error", finish);
-    c.on("connect", () => c.end(data, () => finish()));
+    // end() reports a failed write (EPIPE when the peer closes mid-write) to its callback
+    // before the "error" event; ignoring it would report an undelivered line as delivered.
+    c.on("connect", () => c.end(data, (error) => finish(error)));
     c.on("close", () => finish(new Error("peer inbox closed before accepting the message")));
   });
 }

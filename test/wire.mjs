@@ -156,8 +156,6 @@ test("posting times out when the peer accepts but never reads, and closes its co
 
 test("posting rejects promptly when the peer closes before accepting the message", {
   timeout: 20_000,
-  todo: "post() resolves instead: src/wire.mjs:276 passes `() => finish()` to c.end(), and Node calls that " +
-    "callback with the EPIPE error before the 'error' event fires, so the write failure is reported as success",
 }, async (t) => {
   const f = fixture(t), socket = join(f.sockets, "closing.sock");
   await listen(createServer({ pauseOnConnect: true }, (conn) => conn.destroy()), socket, t);
