@@ -2,6 +2,15 @@
 
 Raw live transcripts are excluded from the repository and package.
 
+## 1.0.0-rc.1
+
+Verified on 2026-10-17 on Linux with Node 22.23.1. CI on Linux and macOS gates the release job.
+
+- Deterministic suites: 136 JavaScript tests and 31 Python tests. They include regression tests for every finding of an independent review of the 1.0 core: per-conversation pins, late drop notices after a Hermes conversation closes, no per-message process lookups, bridge input bounds, receipt `from` checks, and never answering app-server requests.
+- The Hermes integration tests pass against the deployed fork build `0d7c749`.
+- Live contract (`node test/contract.mjs`) on Claude Code 2.1.302 and Codex 0.162.1: idle Codex delivery and reply, Claude acceptance of the `agent_peers` line extension, and Codex → Claude results reported as `unconfirmed` (Claude sends no receipt on acceptance). A peer message sent into a busy Codex turn is always delivered into that turn. Whether the model answers it mid-turn varied between runs, and the contract records that rather than requiring it.
+- Still to do before 1.0.0: the four-session live matrix, and real use by local Claude, Codex and Hermes sessions on this candidate.
+
 ## 0.3.0
 
 Verified on 2026-10-16 on Linux with Node 22.23.1. CI on Linux and macOS gates the release job:
