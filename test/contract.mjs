@@ -167,16 +167,24 @@ const ask = (codeword) =>
   });
 const replied = (codeword) => claudeStub.bodies().find((b) => b.body.includes(codeword));
 
-step("busy Codex: message arrives mid-turn and is answered");
+// agent-peers guarantees that a peer message reaches the running turn; whether the model acts on
+// it mid-turn is the model's choice, so an answer is recorded, not required.
+step("busy Codex: message is steered into the running turn");
 const t2 = await turn("Run `sleep 15` in the shell, then summarize what you did.");
 await until("busy turn", () => active === t2, 30_000);
 await sleep(3000);
 await post(peerSocket(codexPeer.address), ask("KIWI-9"));
-const r1 = await until("KIWI-9 reply", () => replied("KIWI-9"));
-assert.ok(!completed.has(t2), "the busy turn answered the peer before it finished, so it was steered");
-assert.equal(r1.from, codexPeer.address);
-assert.equal(r1.fromName, codexPeer.name);
+const steered = await until("KIWI-9 in the busy turn", () => events.find((e) =>
+  e.method?.startsWith("item/") && JSON.stringify(e.params ?? {}).includes("KIWI-9")), 30_000);
+assert.ok(!completed.has(t2), "the message arrived before the busy turn finished, so it was steered");
+if (steered.params?.turnId) assert.equal(steered.params.turnId, t2);
 await until("busy turn completion", () => completed.has(t2));
+const r1 = replied("KIWI-9");
+if (r1) {
+  assert.equal(r1.from, codexPeer.address);
+  assert.equal(r1.fromName, codexPeer.name);
+}
+console.log(`busy turn ${r1 ? "answered the peer" : "received the peer message but did not answer it (model choice)"}`);
 
 step("idle Codex: message wakes the thread and is answered");
 await post(peerSocket(codexPeer.address), ask("MANGO-7"));
