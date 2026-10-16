@@ -153,11 +153,17 @@ test("private sessions send, receive replies, and remain absent from every regis
     ["peer_message", "conversation-a", "reply-0"], ["peer_message", "conversation-b", "reply-1"],
   ]);
   assert.ok(f.events.every((e) => typeof e.params.message_id === "string"));
-  const again = await f.send("conversation-a", second.from, "private to private");
-  assert.equal(again.from, first.from);
+  // conversation-b never wrote to conversation-a, so its inbox refuses it (issue #28) ...
+  const refused = await f.send("conversation-a", second.from, "private to private");
+  assert.equal(refused.from, first.from);
+  assert.deepEqual([refused.status, refused.reason], ["dropped", "not-a-reply-target"]);
+  // ... while conversation-a, which did write to conversation-b, accepts its answer.
+  assert.equal((await f.send("conversation-b", first.from, "b answers a")).status, "queued");
   await until(() => f.events.length === 3);
-  assert.equal(f.events[2].params.session, "conversation-b");
-  assert.equal(f.events[2].params.message, "private to private");
+  assert.deepEqual([f.events[2].params.session, f.events[2].params.message], ["conversation-a", "b answers a"]);
+  assert.equal((await f.send("conversation-a", second.from, "now a reply")).status, "queued");
+  await until(() => f.events.length === 4);
+  assert.equal(f.events[3].params.session, "conversation-b");
   assert.equal((await f.bridge.request("list_peers")).peers.length, 2);
 });
 
@@ -189,6 +195,50 @@ test("one conversation keeps reply inboxes in each peer directory and closes the
   await f.bridge.request("close_session", { session: "mixed" });
   assert.equal(existsSync(first.from.slice(4)), false);
   assert.equal(existsSync(second.from.slice(4)), false);
+});
+
+// A Claude session that lost its Hermes address once picked another conversation's inbox from the
+// socket directory, and its report reached an unrelated Discord thread.
+test("a conversation's inboxes accept only peers it wrote to, in every directory, until it closes (issue #28)", async (t) => {
+  const f = await fixture(t);
+  const recorder = async (socket) => {
+    const lines = [];
+    await listen(createServer((conn) => readLines(conn, (line) => lines.push(line))), socket, t);
+    return lines;
+  };
+  const strangerSocket = join(f.sockets, "stranger.sock"), stranger = await recorder(strangerSocket);
+  const sent = await f.send("guarded", "codex:test");
+  const codex = address(join(f.sockets, "codex-test.sock"));
+  await post(peerSocket(sent.from), messageLine({ from: address(strangerSocket), fromName: "claude:lost", body: "report for another project" }));
+  await until(() => stranger.length === 1, "the refusal");
+  assert.deepEqual([stranger[0].status, stranger[0].drop_reason, stranger[0].from], ["dropped", "not-a-reply-target", sent.from]);
+  // A send that wrote nothing grants nothing, even once a process owns that address.
+  const gone = join(f.sockets, "gone.sock");
+  assert.equal((await f.send("guarded", address(gone))).reason, "not-running");
+  const later = await recorder(gone);
+  await post(peerSocket(sent.from), messageLine({ from: address(gone), body: "new owner" }));
+  await until(() => later.length === 1, "the second refusal");
+  assert.equal(later[0].drop_reason, "not-a-reply-target");
+  // A peer in another directory adds an inbox there; earlier contacts stay allowed.
+  const otherDir = join(f.dir, "other");
+  mkdirSync(otherDir, { mode: 0o700 });
+  const otherSocket = join(otherDir, "claude-other.sock");
+  await recorder(otherSocket);
+  writeFileSync(join(f.claude, "sessions", `${process.pid}.json`), JSON.stringify({
+    pid: process.pid, name: "other", messagingSocketPath: otherSocket,
+  }));
+  const second = await f.send("guarded", "claude:other");
+  assert.equal(dirname(peerSocket(second.from)), otherDir);
+  await post(peerSocket(sent.from), messageLine({ from: codex, body: "reply one" }));
+  await post(peerSocket(second.from), messageLine({ from: address(otherSocket), body: "reply two" }));
+  await until(() => f.events.length === 2, "both replies");
+  assert.deepEqual(f.events.map((e) => e.params.message), ["reply one", "reply two"]);
+  // Closing forgets every contact: the reopened conversation has written only to the stranger.
+  await f.bridge.request("close_session", { session: "guarded" });
+  const reopened = await f.send("guarded", address(strangerSocket));
+  await post(peerSocket(reopened.from), messageLine({ from: codex, body: "stale reply" }));
+  await until(() => f.controls.some(({ kind, line }) => kind === "codex" && line.drop_reason === "not-a-reply-target"), "the refusal after close");
+  assert.equal(f.events.length, 2);
 });
 
 test("receipt controls never become chat, and held delivery status is preserved", async (t) => {
@@ -317,11 +367,12 @@ test("backpressure bounds the inbox queue across senders and recovers after a de
     }
     delivered.push(event);
   } });
+  // Two peers the conversation wrote to, 30 messages each: within each sender's bucket, past the queue.
   const sent = await f.send("backpressure");
-  for (let i = 0; i < 70; i++) {
-    await post(peerSocket(sent.from), messageLine({
-      from: address(join(f.sockets, `source-${i}.sock`)), body: `message-${i}`,
-    }));
+  await f.send("backpressure", "claude:test");
+  const senders = ["codex", "claude"].map((kind) => address(join(f.sockets, `${kind}-test.sock`)));
+  for (let i = 0; i < 60; i++) {
+    await post(peerSocket(sent.from), messageLine({ from: senders[i % 2], body: `message-${i}` }));
   }
   await delay(30);
   assert.equal(delivered.length, 0);
@@ -329,7 +380,7 @@ test("backpressure bounds the inbox queue across senders and recovers after a de
   await until(() => delivered.length === 49);
   await delay(30);
   assert.equal(delivered.length, 49);
-  await post(peerSocket(sent.from), messageLine({ from: address(join(f.sockets, "fresh.sock")), body: "recovered" }));
+  await post(peerSocket(sent.from), messageLine({ from: senders[0], body: "recovered" }));
   await until(() => delivered.length === 50);
   assert.equal(delivered.at(-1).params.message, "recovered");
 });
@@ -402,10 +453,11 @@ test("diagnostics distinguish rate and queue limits", async (t) => {
   const f = await fixture(t, { logging: true, emit: () => gate });
   t.after(() => release());
   const sent = await f.send("bounded");
+  await f.send("bounded", "claude:test");
   const socket = peerSocket(sent.from);
-  const sender = address(join(f.sockets, "codex-test.sock"));
+  const sender = address(join(f.sockets, "codex-test.sock")), other = address(join(f.sockets, "claude-test.sock"));
   for (let i = 0; i < 31; i++) await post(socket, messageLine({ from: sender, body: `rate-${i}` }));
-  for (let i = 0; i < 21; i++) await post(socket, messageLine({ from: address(join(f.sockets, `source-${i}.sock`)), body: `queue-${i}` }));
+  for (let i = 0; i < 21; i++) await post(socket, messageLine({ from: other, body: `queue-${i}` }));
   await until(() => readFileSync(f.logPath, "utf8").includes('"queue_full"'));
   const records = readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse);
   assert.ok(records.some((record) => record.event === "receive.dropped" && record.reason === "rate_limited"));

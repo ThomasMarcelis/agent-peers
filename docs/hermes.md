@@ -35,6 +35,7 @@ If saved platform tool selections exclude new plugins, enable the `agent-peers` 
 `list_peers()` returns Claude Code and Codex inboxes without publishing Hermes. The first `send_peer(to, message)` creates a private inbox for that conversation. Peers reply to its received address through their normal messaging tools. `send_peer` returns the [shared result](reference.md#send_peer-result); an `error` field means the message was not delivered. Pass `in_reply_to` with the `id` of the message being answered.
 
 - Every conversation and profile has an independent reply route.
+- A conversation's inbox accepts messages only from peers that conversation has sent to. Another sender is refused with `not-a-reply-target`, even if it finds the inbox in the socket directory.
 - Busy conversations receive input through the host's steering boundary; idle conversations start a turn.
 - Routes belong to the originating host conversation. Unload or host shutdown closes their inboxes; Hermes must send again to establish fresh return addresses.
 - Discord replies return to the original thread. Switching chats does not change the return destination.

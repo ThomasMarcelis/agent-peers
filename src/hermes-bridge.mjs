@@ -10,7 +10,7 @@ import { Outbox, Pins, sendPeer } from "./outbox.mjs";
 import { SendFailure, isError } from "./status.mjs";
 import { MAX_LINE, address, allPeers, generation, inDiscoveryScope, peerSocket } from "./wire.mjs";
 
-const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256, HANDOFFS_MAX = 256;
+const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256, HANDOFFS_MAX = 256, CONTACTS_MAX = 256;
 const IPC_QUEUE_MAX = 128, IPC_WRITE_TIMEOUT_MS = 5000;
 const logger = (message) => console.error(`[hermes-bridge ${process.pid}] ${message}`);
 const event = (name, fields) => logEvent("hermes-bridge", name, fields);
@@ -39,6 +39,9 @@ export class HermesBridge {
   #pins = new Pins();
   #receipts = new Receipts(event);
   #introduced = new Set();
+  // Per conversation, across all its inboxes: the addresses it has written to, the only senders
+  // its inboxes accept. A Hermes inbox exists for replies; anyone else guessed its address.
+  #contacts = new Map();
 
   constructor({ app = new AppServer(), emit = async () => {}, log = logger } = {}) {
     this.#app = app;
@@ -51,6 +54,15 @@ export class HermesBridge {
     if (this.#introduced.size >= 4096) this.#introduced.clear();
     this.#introduced.add(key);
     return true;
+  }
+
+  // Returns whether `to` is new, so a send that wrote nothing can take it back.
+  #contact(session, to) {
+    const contacts = this.#contacts.get(session) ?? new Set(), added = !contacts.delete(to);
+    contacts.add(to);
+    if (contacts.size > CONTACTS_MAX) contacts.delete(contacts.values().next().value);
+    this.#contacts.set(session, contacts);
+    return added;
   }
 
   async request(method, params = {}) {
@@ -91,6 +103,7 @@ export class HermesBridge {
       if (method === "send_peer") return this.#send(session, params, operationId);
       const routes = [...this.#routes.values()].filter((route) => route.session === session);
       await Promise.all(routes.map((route) => this.#retire(route)));
+      this.#contacts.delete(session);
       return { closed: routes.length > 0 };
     });
     this.#locks.set(session, operation);
@@ -183,6 +196,7 @@ export class HermesBridge {
       ...(typeof params.message === "string" ? { bytes: Buffer.byteLength(params.message) } : {}),
     };
     event("send.started", fields);
+    let added = false;
     const { result, text } = await sendPeer({
       to: params.to, message: params.message, inReplyTo: params.in_reply_to ?? undefined, pins: this.#pins, fromName: name,
       generation: generation("hermes", session),
@@ -190,12 +204,16 @@ export class HermesBridge {
         let route;
         try { route = await this.#bind(session, name, dirname(target.socket)); }
         catch (error) { throw new SendFailure("inbox-unavailable", error.message); }
+        // Recorded before the write, because a reply can arrive before this send's result does;
+        // taken back below if nothing was written, so a later owner of a dead address gets no pass.
+        added = this.#contact(session, target.address);
         return { from: route.address, outbox: route.outbox };
       },
       // Claude labels every external envelope as another Claude session. Correct that frame once
       // per conversation and recipient: the recipient keeps it in context.
       introduction: (target) => (this.#firstContact(`${session}\0${target.address}`) ? "(Hermes profile; notify_when_idle unavailable.)" : undefined),
     });
+    if (added && result.status === "failed") this.#contacts.get(session)?.delete(result.to);
     if (result.message_id) {
       if (result.status !== "failed") event("message.send", { ...fields, messageId: logIdentity(result.message_id), outcome: "inbox_written" });
       event("send.result", { ...fields, messageId: logIdentity(result.message_id), durationMs: performance.now() - started,
@@ -219,6 +237,11 @@ export class HermesBridge {
     const id = message.id ?? randomUUID();
     const fields = { sessionId, messageId: logIdentity(id), targetId: logIdentity(message.from), bytes: Buffer.byteLength(message.body) };
     const reply = (status, reason) => this.#receipts.send({ to: message.from, from: route.address, id: message.id, status, reason, optIn: message.ext.receipts });
+    // Only peers this conversation wrote to may write to it; the sender learns it was refused.
+    if (!this.#contacts.get(route.session)?.has(message.from)) {
+      reply("dropped", "not-a-reply-target");
+      return drop("not_a_reply_target", fields);
+    }
     const notification = { method: "peer_message", params: {
       session: route.session, message_id: id, from: message.from, from_name: message.sender, message: message.body,
       ...(message.ext.inReplyTo ? { in_reply_to: message.ext.inReplyTo } : {}),

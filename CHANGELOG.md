@@ -11,7 +11,7 @@ One delivery protocol for Codex, Hermes and Claude Code peers. See [the referenc
 - Peer names resolve exactly. Unique-substring abbreviations are gone; an exact name without its `claude:` or `codex:` prefix still works when only one kind has it. `not-found` lists exact names to choose from.
 - Names containing `/` are reserved for explicit claims (`<kind>:<scope>/<claim>`) and fail `reserved-name`; `@ * ? ,` and whitespace fail `invalid-request`. Claude session names and Codex labels with other characters are listed with `-` in their place.
 - Inboxes dedup by sender and message id only. Repeated identical bodies are delivered.
-- The Hermes subprocess `peer_message` notification's reply address field is `from`.
+- A Hermes conversation's inboxes accept messages only from peers that conversation has sent to; others get `dropped`/`not-a-reply-target`. A session that lost its Hermes address could otherwise pick another conversation's inbox from the socket directory and post into an unrelated chat (#28).
 
 ### Added
 

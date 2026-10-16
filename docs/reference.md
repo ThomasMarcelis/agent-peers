@@ -52,12 +52,14 @@ An error status means the message was definitely not delivered. Nothing is retri
 `reason` is a stable kebab-case code, or `null`. Clients must tolerate new codes.
 
 - `failed`: `invalid-request`, `not-found`, `ambiguous`, `reserved-name`, `invalid-address`, `self-send`, `native-route-required`, `not-running`, `too-large`, `write-timeout`, `write-failed`, `inbox-unavailable`, `too-many-pending`, `unsupported-host`, `conversation-closed`, `bridge-unavailable`.
-- `dropped`: Claude's `rate-limited`, `duplicate`, `queue-full`, `hop-loop`, `hop-runaway`; agent-peers' `too-large`, `host-rejected`, `inbox-closed`; or `other`.
+- `dropped`: Claude's `rate-limited`, `duplicate`, `queue-full`, `hop-loop`, `hop-runaway`; agent-peers' `too-large`, `host-rejected`, `inbox-closed`, `not-a-reply-target`; or `other`.
 - `unconfirmed`: `no-receipt`, `bridge-lost`.
 
 ## Delivery protocol
 
 **Receipts.** agent-peers inboxes answer in Claude Code's receipt format, `{type:"control", action:"peer_message_status", orig_msg_id, status, …}`. Every sender, including Claude Code and agent-peers 0.x, gets `dropped` with a `drop_reason`. Only senders that opt in also get `queued` when the inbox admits a message and `accepted` when the host takes it. The sender waits up to 1.5 s after its write completes. A repeated `msg_id` from the same sender is discarded with no receipt, so the first copy's outcome stands. Identical bodies with different ids are both delivered.
+
+**Hermes reply inboxes.** A Hermes conversation's inboxes accept messages only from addresses that conversation has sent to, in any of its socket directories, until it closes. Any other sender gets `dropped`/`not-a-reply-target`. Hermes is never listed, so finding one of its inboxes in the socket directory and writing to it is unsupported; ask the Hermes conversation to send first.
 
 **Late outcomes.** A negative or `held` receipt that arrives after the result was returned reaches a Codex session as one short notice appended to its history, which never starts a turn. Hermes logs it only. Late positive receipts are silent.
 
