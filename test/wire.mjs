@@ -10,6 +10,10 @@ import { test } from "node:test";
 import { MAX_LINE, address, alive, ancestorPids, inDiscoveryScope, whoami, claudeSessions, codexPeers, ensurePrivateDir, generation,
   messageLine, nameLabel, peerSocket, post, processStart, readLines, recordRunning, socketDir, socketPath, stalePeers } from "../src/wire.mjs";
 import { closeServer, listen } from "./listeners.mjs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { Receipts, readMessage } from "../src/inbox.mjs";
+import { Pins } from "../src/outbox.mjs";
 
 function fixture(t) {
   const dir = mkdtempSync(join(tmpdir(), "ap-wire-"));
@@ -400,4 +404,36 @@ test("automatic Claude names drop characters reserved for claims and patterns; l
   assert.equal(nameLabel("Überprüfung_1.x:y"), "Überprüfung_1.x:y");
   assert.equal(messageLine({ from: "uds:/a.sock", body: "x" }).agent_peers, undefined);
   assert.deepEqual(messageLine({ from: "uds:/a.sock", body: "x", ext: { v: 1 } }).agent_peers, { v: 1 });
+});
+
+// Each start-time lookup is a ps spawn on macOS, so none may run per post or receipt, and inbound
+// lines share one lookup per second. Every lookup first tries /proc/<pid>/stat, which is counted.
+test("posts and receipts look up no process start times; inbound senders share one per second", async (t) => {
+  const { claude, sockets } = fixture(t);
+  const sleeper = spawn("sleep", ["30"], { stdio: "ignore" });
+  t.after(() => sleeper.kill());
+  const socket = join(sockets, "counted.sock");
+  await listen(createServer((conn) => readLines(conn, () => {})), socket, t);
+  writeFileSync(join(claude, "sessions", `${sleeper.pid}.json`), JSON.stringify({ pid: sleeper.pid, procStart: "1", name: "counted", messagingSocketPath: socket }));
+  let lookups = 0;
+  const original = fs.readFileSync;
+  fs.readFileSync = function (path, ...rest) {
+    if (typeof path === "string" && /^\/proc\/\d+\/stat$/.test(path)) lookups++;
+    return original.call(this, path, ...rest);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.readFileSync = original; syncBuiltinESMExports(); });
+  const counted = async (fn) => { const before = lookups; await fn(); return lookups - before; };
+  assert.equal(await counted(() => post(socket, { type: "user" })), 0, "one post");
+  assert.equal(await counted(async () => {
+    new Receipts().send({ to: address(socket), from: address(socket), id: "a", status: "dropped", reason: "rate-limited" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }), 0, "one receipt");
+  const line = messageLine({ from: address(socket), fromName: "counted", body: "hi" }), pins = new Pins();
+  assert.ok(await counted(() => {
+    for (let i = 0; i < 2; i++) {
+      assert.ok(inDiscoveryScope(() => readMessage(line, [])));
+      pins.noteSender(address(socket));
+    }
+  }) <= 1, "two inbound lines");
 });

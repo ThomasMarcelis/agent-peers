@@ -7,7 +7,7 @@ import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { errorFields } from "./logging.mjs";
 import { OPT_IN, readExtension, receiptLine, validMessageId } from "./status.mjs";
-import { MAX_SOCKET_PATH, address, parseEnvelope, peerSocket, post, readLines } from "./wire.mjs";
+import { MAX_SOCKET_PATH, address, inDiscoveryScope, parseEnvelope, peerSocket, post, readLines } from "./wire.mjs";
 
 export function checkSocketPath(socket) {
   if (Buffer.byteLength(join(dirname(socket), ".ap-00000000.sock")) > MAX_SOCKET_PATH || Buffer.byteLength(socket) > MAX_SOCKET_PATH) {
@@ -143,11 +143,14 @@ export class Receipts {
     this.#post(to, receiptLine({ from, ids: [id], status, reason }));
   }
 
+  // One discovery scope for the address check and post's own, so a receipt verifies directories once.
   #post(to, line) {
-    const socket = peerSocket(to);
-    if (!socket || this.#inFlight >= 16) return this.log("receipt.send", { outcome: "skipped", reason: socket ? "queue_full" : "malformed" });
-    this.#inFlight++;
-    post(socket, line).then(() => this.log("receipt.send", { outcome: "succeeded" }),
-      (error) => this.log("receipt.send", { outcome: "failed", ...errorFields(error) })).finally(() => { this.#inFlight--; });
+    inDiscoveryScope(() => {
+      const socket = peerSocket(to);
+      if (!socket || this.#inFlight >= 16) return this.log("receipt.send", { outcome: "skipped", reason: socket ? "queue_full" : "malformed" });
+      this.#inFlight++;
+      post(socket, line).then(() => this.log("receipt.send", { outcome: "succeeded" }),
+        (error) => this.log("receipt.send", { outcome: "failed", ...errorFields(error) })).finally(() => { this.#inFlight--; });
+    });
   }
 }

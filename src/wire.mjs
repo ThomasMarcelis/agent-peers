@@ -35,9 +35,18 @@ export function alive(pid) {
 // Process start tokens in the format Claude Code records as `procStart`: the starttime field of
 // /proc/<pid>/stat on Linux, `ps -o lstart=` in the C locale and UTC elsewhere. A live PID whose
 // token differs from its record's now belongs to a different process that reused the PID.
+// Answers are kept a second per PID, so a burst of messages costs at most one ps per second on
+// macOS; a PID reused within that second is not worth a process spawn per message.
+const knownStarts = new Map(), STARTS_MS = 1000;
 export function processStarts(pids) {
-  const out = new Map(), missing = [];
+  const out = new Map(), missing = [], looked = [], now = Date.now();
   for (const pid of new Set(pids)) {
+    const known = knownStarts.get(pid);
+    if (known && now - known.at < STARTS_MS) {
+      if (known.start !== undefined) out.set(pid, known.start);
+      continue;
+    }
+    looked.push(pid);
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
       out.set(pid, stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]);
@@ -52,6 +61,8 @@ export function processStarts(pids) {
       if (match) out.set(Number(match[1]), match[2]);
     }
   }
+  if (knownStarts.size > 4096) knownStarts.clear();
+  for (const pid of looked) knownStarts.set(pid, { start: out.get(pid), at: now });
   return out;
 }
 export const processStart = (pid) => processStarts([pid]).get(pid);
@@ -112,9 +123,19 @@ const validSocketPath = (path) => typeof path === "string" && Buffer.byteLength(
 const validPid = (pid) => Number.isInteger(pid) && pid > 0 && pid <= 0x7fffffff;
 export const validThreadId = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 
-// Every well-formed Claude record, marked `running`; read once per discovery scope.
-function claudeRecordScan() {
-  if (discoveryScope?.claude) return discoveryScope.claude;
+// Every well-formed Claude record, marked `running`; read once per discovery scope. Without
+// `starts`, records are not marked: socket-directory checks need only live PIDs, not start times.
+function claudeRecordScan({ starts = true } = {}) {
+  const out = discoveryScope?.claudeRecords ?? readClaudeRecords();
+  if (discoveryScope) discoveryScope.claudeRecords = out;
+  if (starts && !discoveryScope?.claudeMarked) {
+    const current = processStarts(out.filter((s) => s.procStart !== undefined).map((s) => s.pid));
+    for (const s of out) s.running = running(s, current);
+    if (discoveryScope) discoveryScope.claudeMarked = true;
+  }
+  return out;
+}
+function readClaudeRecords() {
   const dir = join(claudeHome(), "sessions");
   let files = [];
   try { safeDirectory(dir); files = readdirSync(dir); } catch {}
@@ -130,9 +151,6 @@ function claudeRecordScan() {
       out.push(s);
     } catch {}
   }
-  const starts = processStarts(out.filter((s) => s.procStart !== undefined).map((s) => s.pid));
-  for (const s of out) s.running = running(s, starts);
-  if (discoveryScope) discoveryScope.claude = out;
   return out;
 }
 const claudeRecords = () => claudeRecordScan().filter((s) => s.running);
@@ -178,7 +196,7 @@ function verifiedSocketDirectories() {
   return new Set(discoveryScope.live);
 }
 function freshVerifiedDirectories() {
-  const live = new Set(claudeRecords().map((session) => dirname(session.messagingSocketPath)));
+  const live = new Set(claudeRecordScan({ starts: false }).filter((s) => alive(s.pid)).map((s) => dirname(s.messagingSocketPath)));
   for (const dir of live) {
     try {
       safeDirectory(dir, true);
@@ -393,7 +411,7 @@ export function messageLine({ from, fromName, fromMode, body, ext }) {
 // Write one line to a peer inbox. Open the connection only once the line is ready:
 // Claude closes connections that send no complete line within 30 seconds.
 export function post(socket, line) {
-  if (typeof socket !== "string" || peerSocket(address(socket)) !== socket) {
+  if (typeof socket !== "string" || inDiscoveryScope(() => peerSocket(address(socket))) !== socket) {
     return Promise.reject(new Error("invalid peer inbox socket"));
   }
   const data = JSON.stringify(line) + "\n";
