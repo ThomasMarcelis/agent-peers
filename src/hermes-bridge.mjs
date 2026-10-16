@@ -296,6 +296,14 @@ export class HermesBridge {
     if (!env || !peerSocket(env.from) || env.from === route.address || (line.from && line.from !== env.from)) return drop("malformed");
     const id = typeof line.msg_id === "string" && line.msg_id.length <= 256 && line.msg_id ? line.msg_id : randomUUID();
     const fields = { sessionId, messageId: logIdentity(id), targetId: logIdentity(env.from), bytes: Buffer.byteLength(env.body) };
+    const notification = { method: "peer_message", params: {
+      session: route.session, message_id: id, from: env.from,
+      from_name: /^[A-Za-z0-9:_ .-]{1,80}$/.test(env.fromName ?? "") ? env.fromName : "an unnamed peer",
+      message: env.body,
+    } };
+    // The host reads at most MAX_LINE per line and restarts the bridge on a longer one; a frame
+    // that fits the inbox can exceed that once re-encoded with session and message IDs.
+    if (Buffer.byteLength(JSON.stringify(notification)) + 1 > MAX_LINE) return drop("message_too_large", fields);
     const reason = this.#admit(route, env.from, env.body, id);
     if (reason) return drop(reason, fields);
     route.queued++;
@@ -304,11 +312,7 @@ export class HermesBridge {
     const started = performance.now();
     route.chain = route.chain.then(async () => {
       if (route.closed) return drop("closed", fields);
-      await this.#emit({ method: "peer_message", params: {
-        session: route.session, message_id: id, from: env.from,
-        from_name: /^[A-Za-z0-9:_ .-]{1,80}$/.test(env.fromName ?? "") ? env.fromName : "an unnamed peer",
-        message: env.body,
-      } });
+      await this.#emit(notification);
       event("delivery.result", { ...fields, outcome: "emitted_to_host", durationMs: performance.now() - started });
     }).catch((error) => {
       event("delivery.result", { ...fields, outcome: "error", durationMs: performance.now() - started, ...errorFields(error) });

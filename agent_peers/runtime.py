@@ -85,7 +85,9 @@ def default_command(*, root=ROOT, hermes_home=None):
     except (OSError, subprocess.TimeoutExpired):
         raise RuntimeError("agent-peers bridge dependency check failed or timed out") from None
     if probe.returncode:
-        command = shlex.join(["npm", "--prefix", str(root), "ci", "--omit=dev", "--ignore-scripts"])
+        # npm tarballs ship no lockfile, so `npm ci` only works for git installs.
+        install = "ci" if (root / "package-lock.json").is_file() else "install"
+        command = shlex.join(["npm", "--prefix", str(root), install, "--omit=dev", "--ignore-scripts"])
         raise RuntimeError(f"agent-peers bridge dependencies are unavailable; run: {command}")
     return [node, str(bridge), "hermes-bridge"]
 

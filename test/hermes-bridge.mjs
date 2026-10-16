@@ -235,6 +235,20 @@ test("malformed messages, invalid reply targets, duplicate bodies and ids are su
   await assert.rejects(f.send("safe", "test"), /ambiguous/);
 });
 
+test("an inbox frame that would exceed the host's line limit once re-encoded is dropped, not emitted", async (t) => {
+  const f = await fixture(t);
+  // Hermes route IDs are opaque and may be long; the notification repeats them.
+  const sent = await f.send("s".repeat(256));
+  const socket = peerSocket(sent.address), sender = address(join(f.sockets, "codex-test.sock"));
+  // The largest body whose frame the inbox still accepts.
+  const overhead = Buffer.byteLength(JSON.stringify(messageLine({ from: sender, fromName: "codex:test", body: "" }))) + 1;
+  await post(socket, messageLine({ from: sender, fromName: "codex:test", body: "x".repeat(MAX_LINE - overhead) }));
+  await post(socket, messageLine({ from: sender, fromName: "codex:test", body: "still reachable" }));
+  await until(() => f.events.length === 1);
+  await delay(30);
+  assert.deepEqual(f.events.map((e) => e.params.message.length), ["still reachable".length]);
+});
+
 test("per-inbox flood limits preserve the other conversation", async (t) => {
   const f = await fixture(t);
   const one = await f.send("one"), two = await f.send("two", "codex:test", "two");

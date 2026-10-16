@@ -183,3 +183,10 @@ def test_retirement_during_send_closes_the_inflight_endpoint():
     finally:
         finish.set()
         peers.close()
+
+
+def test_peer_frame_carries_a_safe_message_id_for_send_arrival_pairing():
+    message = {"from_name": "codex:review", "from": "uds:/safe.sock", "message": "ok"}
+    framed = plugin._frame({**message, "message_id": "4b0c9f7e-1d2a-4c3b-9e8f-0a1b2c3d4e5f"})
+    assert 'reply_to="uds:/safe.sock" id="4b0c9f7e-1d2a-4c3b-9e8f-0a1b2c3d4e5f">' in framed
+    assert ' id="' not in plugin._frame({**message, "message_id": 'x" onload="y'})
