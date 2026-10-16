@@ -428,13 +428,17 @@ export function post(socket, line) {
       error ? reject(error) : resolve();
     };
     // Coded failures let senders say "not running" for a missing or refusing inbox. A timeout means
-    // the final newline never left this process, so the inbox discards the partial line.
+    // the final newline never left this process, so the inbox discards the partial line. If the
+    // whole line already reached the kernel (an event-loop stall delayed only the callback), the
+    // inbox has it: that is a completed write, not a timeout.
     const failed = (message, code) => Object.assign(new Error(message), { code });
-    const timer = setTimeout(() => finish(failed("peer inbox did not accept the message within 5 s", "ETIMEDOUT")), 5000);
+    let ended = false;
+    const timer = setTimeout(() => finish(ended && c.writableLength === 0 ? undefined
+      : failed("peer inbox did not accept the message within 5 s", "ETIMEDOUT")), 5000);
     c.on("error", finish);
     // end() reports a failed write (EPIPE when the peer closes mid-write) to its callback
     // before the "error" event; ignoring it would report an undelivered line as delivered.
-    c.on("connect", () => c.end(data, (error) => finish(error)));
+    c.on("connect", () => { ended = true; c.end(data, (error) => finish(error)); });
     c.on("close", () => finish(failed("peer inbox closed before accepting the message", "ERR_SOCKET_CLOSED")));
   });
 }

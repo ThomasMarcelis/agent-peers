@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { connect, createServer } from "node:net";
+import { Socket, connect, createServer } from "node:net";
 import { once } from "node:events";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -157,6 +157,25 @@ test("posting times out when the peer accepts but never reads, and closes its co
   conn.resume();
   await once(conn, "close");
   assert.deepEqual(lines, []);
+});
+
+test("a line already handed to the kernel is written, even if the deadline passes before its callback", { timeout: 20_000 }, async (t) => {
+  const f = fixture(t), socket = join(f.sockets, "late-callback.sock"), lines = [];
+  await listen(createServer((conn) => readLines(conn, (line) => lines.push(line))), socket, t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const end = Socket.prototype.end;
+  t.after(() => { Socket.prototype.end = end; });
+  // As after a 5 s event-loop stall: end() wrote the line, then the deadline fires first.
+  Socket.prototype.end = function (...args) {
+    Socket.prototype.end = end;
+    const out = end.apply(this, args);
+    t.mock.timers.tick(5000);
+    return out;
+  };
+  await post(socket, { type: "user", msg_id: "m1" });
+  t.mock.timers.reset();
+  for (let i = 0; i < 200 && !lines.length; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(lines.map((line) => line.msg_id), ["m1"]);
 });
 
 test("posting rejects promptly when the peer closes before accepting the message", {
