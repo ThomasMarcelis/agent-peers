@@ -23,7 +23,7 @@ Exit codes: `0` success, `1` runtime/diagnostic failure, `2` invalid CLI usage. 
 `send_peer({to, message, in_reply_to?})` sends one message:
 
 - `to` is an inbox address (`uds:…`), an exact peer name, or an exact name without its `claude:` or `codex:` prefix when only one kind has it. Nothing else matches: no fragments, most-recent guesses, defaults or broadcasts. An unknown name fails `not-found` and lists up to five exact names that contain it.
-- `in_reply_to` is the `id` of the message being answered (`[A-Za-z0-9_-]{1,128}`). It appears on the recipient's frame and is echoed in the result. It is advisory and never checked against received ids.
+- `in_reply_to` is the `id` of the message being answered (`[A-Za-z0-9_-]{1,128}`); an empty string means none. It appears on the recipient's frame and is echoed in the result. It is advisory and never checked against received ids.
 
 Hermes handlers return JSON text, as its dispatcher requires; Codex returns MCP text content plus `structuredContent`.
 

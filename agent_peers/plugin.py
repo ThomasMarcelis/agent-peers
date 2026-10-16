@@ -101,6 +101,8 @@ class PeerTools:
 
     def send_peer(self, args, *, session_id=None, **kwargs):
         raw_reply_to = args.get("in_reply_to") if isinstance(args, dict) else None
+        if raw_reply_to == "":
+            raw_reply_to = None  # models fill optional fields with ""; that means none
         in_reply_to = _message_id(raw_reply_to)
         if not isinstance(args, dict) or not isinstance(args.get("to"), str) or not args["to"].strip():
             return _result("failed", "invalid-request", "to must be a peer name or inbox address", in_reply_to)

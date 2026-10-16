@@ -231,6 +231,8 @@ def test_send_results_share_one_shape_and_an_error_means_not_delivered():
         peers._bridge = FakeBridge({"status": "accepted", "reason": None, "text": "Accepted by x."})
         assert "error" not in peers.send_peer({"to": "x", "message": "body"}, session_id="chat-a")
         assert "in_reply_to" not in peers._bridge.calls[-1]
+        assert "error" not in peers.send_peer({"to": "x", "message": "body", "in_reply_to": ""}, session_id="chat-a")
+        assert "in_reply_to" not in peers._bridge.calls[-1], "an empty in_reply_to means none"
         # A bridge that died mid-request may already have written the line.
         peers._bridge = FakeBridge(RuntimeError(plugin._EXITED))
         result = peers.send_peer({"to": "x", "message": "body"}, session_id="chat-a")

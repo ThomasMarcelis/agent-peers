@@ -156,6 +156,7 @@ export class Outbox {
 // sender's reply address for that target and the outbox that owns it. Footers go only to known
 // Claude recipients, which cannot show attributes: Claude's model knows its own msg_ids.
 export async function sendPeer({ to, message, inReplyTo, pins, fromName, generation, route, introduction }) {
+  if (inReplyTo === "") inReplyTo = undefined; // models fill optional fields with ""
   const result = sendResult({ in_reply_to: validMessageId(inReplyTo) ? inReplyTo : null });
   let options = {};
   try {
