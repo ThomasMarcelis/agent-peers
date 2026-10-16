@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.0.0-rc.1 — 2026-10-17
+
+Release candidate for 1.0.0, published to the npm `next` tag (`npm install -g agent-peers@next`). From 1.0.0, the [stability policy](docs/stability.md) defines what semver covers. One delivery protocol for Codex, Hermes and Claude Code peers. See [the reference](docs/reference.md#send_peer-result).
+
+### Breaking
+
+- `send_peer` returns one result on both hosts: `{status, reason, message_id, in_reply_to, to, name, generation, from}`. Codex's `structuredContent.receipt` is now `status`. Hermes's `address` is now `from`, and Hermes failures return the full result with `error` instead of `{error}` alone. There are no aliases.
+- A send to a Claude Code session reports `unconfirmed` instead of "Delivered", because Claude sends no receipt for an accepted message. A write that times out is `failed`/`write-timeout`.
+- Peer names resolve exactly. Unique-substring abbreviations are gone; an exact name without its `claude:` or `codex:` prefix still works when only one kind has it. `not-found` lists exact names to choose from.
+- Names containing `/` are reserved for explicit claims (`<kind>:<scope>/<claim>`) and fail `reserved-name`; `@ * ? ,` and whitespace fail `invalid-request`. Claude session names and Codex labels with other characters are listed with `-` in their place.
+- Inboxes dedup by sender and message id only. Repeated identical bodies are delivered.
+- A Hermes conversation's inboxes accept messages only from peers that conversation has sent to; others get `dropped`/`not-a-reply-target`. A session that lost its Hermes address could otherwise pick another conversation's inbox from the socket directory and post into an unrelated chat (#28).
+
+### Added
+
+- Receipts from agent-peers inboxes in Claude Code's own format. Every sender gets `dropped` with a reason; agent-peers 1.0 senders opt in to `queued` and `accepted` through an `agent_peers` line extension that Claude Code and 0.x ignore (#8).
+- `send_peer` takes `in_reply_to`, shown on the recipient's frame; Claude recipients get `(In reply to <id>.)` instead (#10).
+- A `generation` on every listed session. A record whose PID now belongs to another process is not listed, and a send to a name or address that a different process has taken over fails `not-running` instead of reaching it (#12).
+- A negative receipt that arrives after `send_peer` returned is appended to the Codex session's history without starting a turn. Hermes logs it only (#18).
+- Codex `list_peers` reports the caller as `self` (#14).
+
+### Changed
+
+- One Codex MCP process serves up to eight root sessions, each with its own inbox, instead of rebinding to the latest (#19). `codex-peer` is split into binding, inbox and tool modules (#16).
+- The Hermes bridge handles requests concurrently, keeping order per conversation (#17).
+- agent-peers never answers an app-server request (approvals, user input, dynamic tools, token refresh, attestation). These fan out to every client and the first answer wins, so an answer could override the client that owns the request. Each is logged by method (#25).
+- Tested on Claude Code 2.1.302 and Codex 0.162.1. CI's Hermes integration job runs against the deployed fork build `0d7c749` (Hermes v0.22.2 plus a minimal host patch).
+- Receipts are unauthenticated between same-user processes; a receipt must name the inbox the message was written to, which rejects stray ones (see [SECURITY.md](SECURITY.md)).
+
 ## 0.3.0 — 2026-10-16
 
 First npm release since 0.1.0. Versions 0.1.1 and 0.2.0 were released on GitHub only, and their changes are included here. From this version on, npm releases are published from CI with provenance.

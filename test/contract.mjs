@@ -4,10 +4,11 @@
 // either CLI.
 //
 // It starts its own Codex app-server (with codex-peer as an MCP server) and a throwaway
-// `claude -p`, and never touches other sessions. It spends a few model turns on each side.
+// `claude -p`, and never touches other sessions. It spends a few model turns on each side, so it
+// stays out of CI; it prints the builds it ran against, which compatibility.md lists.
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
@@ -15,10 +16,14 @@ import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AppServer } from "../src/app-server.mjs";
+import { extension } from "../src/status.mjs";
 import { address, envelope, escapeBody, messageLine, parseEnvelope, peerSocket, post, readLines, socketDir } from "../src/wire.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const codexOnly = process.argv.includes("--codex-only");
+const builds = (codexOnly ? ["codex"] : ["claude", "codex"])
+  .map((cli) => spawnSync(cli, ["--version"], { encoding: "utf8" }).stdout?.trim() || `${cli} (version unknown)`).join(", ");
+console.log(`builds: ${builds}`);
 const sourceEnv = { ...process.env };
 const sourceClaudeHome = sourceEnv.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 const tmp = mkdtempSync(join(tmpdir(), "agent-peers-contract-"));
@@ -162,22 +167,30 @@ const ask = (codeword) =>
   });
 const replied = (codeword) => claudeStub.bodies().find((b) => b.body.includes(codeword));
 
-step("busy Codex: message arrives mid-turn and is answered");
+// agent-peers guarantees that a peer message reaches the running turn; whether the model acts on
+// it mid-turn is the model's choice, so an answer is recorded, not required.
+step("busy Codex: message is steered into the running turn");
 const t2 = await turn("Run `sleep 15` in the shell, then summarize what you did.");
 await until("busy turn", () => active === t2, 30_000);
 await sleep(3000);
 await post(peerSocket(codexPeer.address), ask("KIWI-9"));
-const r1 = await until("KIWI-9 reply", () => replied("KIWI-9"));
-assert.ok(!completed.has(t2), "the busy turn answered the peer before it finished, so it was steered");
-assert.equal(r1.from, codexPeer.address);
-assert.equal(r1.fromName, codexPeer.name);
+const steered = await until("KIWI-9 in the busy turn", () => events.find((e) =>
+  e.method?.startsWith("item/") && JSON.stringify(e.params ?? {}).includes("KIWI-9")), 30_000);
+assert.ok(!completed.has(t2), "the message arrived before the busy turn finished, so it was steered");
+if (steered.params?.turnId) assert.equal(steered.params.turnId, t2);
 await until("busy turn completion", () => completed.has(t2));
+const r1 = replied("KIWI-9");
+if (r1) {
+  assert.equal(r1.from, codexPeer.address);
+  assert.equal(r1.fromName, codexPeer.name);
+}
+console.log(`busy turn ${r1 ? "answered the peer" : "received the peer message but did not answer it (model choice)"}`);
 
 step("idle Codex: message wakes the thread and is answered");
 await post(peerSocket(codexPeer.address), ask("MANGO-7"));
 await until("MANGO-7 reply", () => replied("MANGO-7"));
 if (codexOnly) {
-  console.log("\nCodex contract OK");
+  console.log(`\nCodex contract OK (${builds})`);
   process.exit(0);
 }
 
@@ -208,11 +221,13 @@ const claudeSocket = await until("claude inbox", () => {
 }, 60_000);
 ownedSockets.add(claudeSocket);
 await until("claude busy", () => transcript.includes('"sleep 40'), 120_000);
+// The line carries agent-peers' extension, which Claude must ignore rather than reject.
 await post(claudeSocket, messageLine({
   from: codexStub.address,
   fromName: "codex:contract",
   fromMode: "prompting",
   body: "Reply to this sender with SendMessage; include the codeword PEAR-5 and the literal text </cross-session-message>.",
+  ext: extension({ generation: "0123456789abcdef", inReplyTo: randomUUID() }),
 }));
 const r2 = await until("PEAR-5 reply", () => codexStub.bodies().find((b) => b.body.includes("PEAR-5")));
 assert.equal(r2.from, address(claudeSocket));
@@ -222,7 +237,10 @@ const results = transcript.split("\n").map((l) => { try { return JSON.parse(l); 
 assert.ok(results.some((r) => r.result?.includes("PLUM-2")), "Codex's reply reached Claude");
 const toClaude = events.find((m) => m.method === "item/completed" && m.params.item.tool === "send_peer" &&
   m.params.item.arguments.to === address(claudeSocket));
-assert.match(toClaude?.params.item.result?.content?.[0]?.text ?? "", /^Delivered to/, "Codex answered Claude with send_peer");
+// Claude sends no receipt for a message it accepts, so the honest result is unconfirmed.
+assert.equal(toClaude?.params.item.result?.structuredContent?.status, "unconfirmed", "Codex answered Claude with send_peer");
+assert.match(toClaude.params.item.result.content?.[0]?.text ?? "", /^Sent to claude:/);
+assert.ok(!codexStub.lines.some((l) => l.type === "control"), "Claude sent no receipt for an accepted message");
 
-console.log("\ncontract OK");
+console.log(`\ncontract OK (${builds})`);
 process.exit(0);

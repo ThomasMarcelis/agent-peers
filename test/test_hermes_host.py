@@ -43,7 +43,9 @@ def test_real_plugin_discovery_preserves_profile_scopes(tmp_path, monkeypatch, n
                 handlers.append(handler)
                 result = registry.dispatch("send_peer", {"to": "claude:test", "message": "hello"},
                                            scope=manager.scope_key, session_id="missing")
-                assert json.loads(result) == {"error": "This conversation is no longer reachable for automatic peer replies."}
+                result = json.loads(result)
+                assert (result["status"], result["reason"]) == ("failed", "conversation-closed")
+                assert result["error"] == "This conversation is no longer reachable for automatic peer replies."
                 listing = json.loads(registry.dispatch("list_peers", {}, scope=manager.scope_key))
                 assert "error" not in listing
                 assert "claude:test" in json.dumps(listing)

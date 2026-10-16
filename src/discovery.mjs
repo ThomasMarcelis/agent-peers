@@ -10,7 +10,7 @@ export function codexDiscovery(peers, threads, self) {
     const sameTree = self && (p.threadId === self.rootId || t?.sessionId === self.rootId);
     rows.set(p.threadId || p.address, {
       name: p.name, kind: p.kind, cwd: p.cwd, status: t?.status?.type ?? p.status,
-      threadId: p.threadId,
+      threadId: p.threadId, generation: p.generation ?? null,
       native: { reachable: !self || sameTree ? null : false, reason: !self ? "caller session unknown"
         : sameTree ? "native target unavailable; check list_agents"
         : p.kind === "claude" ? "Claude recipient" : "separate Codex session" },
@@ -30,7 +30,7 @@ export function codexDiscovery(peers, threads, self) {
     }
     rows.set(t.id, {
       name: old?.name ?? `codex:${t.agentNickname || target}`,
-      kind: "codex", cwd: t.cwd, status: t.status?.type, threadId: t.id,
+      kind: "codex", cwd: t.cwd, status: t.status?.type, threadId: t.id, generation: old?.generation ?? null,
       native: { reachable: true, tool: "send_message", target },
       // Inbox addresses belong to roots; do not present the root's inbox as a way to
       // deliver directly to one of its subagents.
@@ -41,13 +41,12 @@ export function codexDiscovery(peers, threads, self) {
 }
 
 // Explain a route mismatch without sending anything or treating a nickname as a bridge
-// address. Match against all discovered peers so an abbreviation cannot silently select
-// one native agent when another peer has a matching name.
+// address. Exact names, native targets and thread ids only, matched against all discovered
+// peers, so a fragment never points at one native agent.
 export function nativeRouteError(to, peers) {
   if (typeof to !== "string" || !to || to.startsWith("uds:")) return null;
-  const exact = peers.filter((p) => p.name === to || p.name === `codex:${to}` || p.name === `claude:${to}` ||
+  const matches = peers.filter((p) => p.name === to || p.name === `codex:${to}` || p.name === `claude:${to}` ||
     p.native?.target === to || p.threadId === to);
-  const matches = exact.length ? exact : peers.filter((p) => p.name.includes(to));
   if (matches.length !== 1) return null;
   const p = matches[0];
   if (p.native?.reachable !== true || !p.native.target || p.bridge) return null;

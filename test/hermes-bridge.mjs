@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { HermesBridge } from "../src/hermes-bridge.mjs";
-import { MAX_LINE, address, allPeers, messageLine, parseEnvelope, peerSocket, post, readLines } from "../src/wire.mjs";
+import { MAX_LINE, address, allPeers, generation, messageLine, parseEnvelope, peerSocket, post, readLines } from "../src/wire.mjs";
 import { closeServer, listen } from "./listeners.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -34,7 +34,7 @@ async function fixture(t, options = {}) {
   process.env.AGENT_PEERS_DEBUG = options.logging ? "1" : "0";
   const logPath = join(dir, "diagnostics.jsonl");
   process.env.AGENT_PEERS_LOG = logPath;
-  const messages = [], servers = [];
+  const messages = [], controls = [], servers = [];
   let bridge;
   // Registered before anything listens, so a failure below cannot leave a handle open.
   t.after(async () => {
@@ -49,11 +49,12 @@ async function fixture(t, options = {}) {
   for (const kind of ["claude", "codex"]) {
     const socket = join(sockets, `${kind}-test.sock`);
     const server = createServer((conn) => readLines(conn, (line) => {
+      if (line.type !== "user") return void controls.push({ kind, line });
       messages.push({ kind, line });
-      if (line.type === "user" && options.receipts !== false) {
+      if (options.receipts !== false) {
         const sender = peerSocket(parseEnvelope(line.message.content).from);
         void post(sender, { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id,
-          status: options.status ?? "delivered" }).catch(() => {});
+          from: address(socket), status: options.status ?? "accepted", ...options.receipt }).catch(() => {});
       }
     }));
     servers.push(server);
@@ -73,13 +74,15 @@ async function fixture(t, options = {}) {
   bridge = new HermesBridge({ app, emit: options.emit ?? (async (event) => { events.push(event); }), log: (message) => diagnostics.push(message) });
   const send = (session, to = "codex:test", message = "hello", name = "hermes:JD") =>
     bridge.request("send_peer", { session, name, to, message });
-  return { bridge, dir, peers, sockets, claude, events, reads, messages, send, logPath, diagnostics };
+  return { bridge, dir, peers, sockets, claude, events, reads, messages, controls, send, logPath, diagnostics };
 }
 
 test("long inbox paths fail before listening and leave no sockets or live handles", async (t) => {
   const f = await fixture(t, { longSockets: true });
   const before = readdirSync(f.sockets).sort();
-  await assert.rejects(f.send("too-long"), /103-byte Unix limit/);
+  const result = await f.send("too-long");
+  assert.deepEqual([result.status, result.reason, result.message_id], ["failed", "inbox-unavailable", null]);
+  assert.match(result.text, /103-byte Unix socket limit/);
   await f.bridge.close();
   assert.deepEqual(readdirSync(f.sockets).sort(), before);
 });
@@ -121,12 +124,16 @@ test("closing releases the app-server once and rejects further bridge requests",
 
 test("private sessions send, receive replies, and remain absent from every registry", async (t) => {
   const f = await fixture(t);
+  // A failed first send does not use up the introduction.
+  assert.equal((await f.send("conversation-a", "claude:test", "x".repeat(MAX_LINE))).reason, "too-large");
   const first = await f.send("conversation-a", "claude:test", "hello Claude");
   const second = await f.send("conversation-b", "codex:test", "hello Codex");
-  assert.notEqual(first.address, second.address);
-  assert.equal(first.status, "delivered");
-  assert.equal(first.text, "Delivered to claude:test's inbox.");
-  assert.equal(second.text, "Delivered to codex:test's inbox.");
+  assert.notEqual(first.from, second.from);
+  assert.deepEqual(first, { status: "accepted", reason: null, message_id: f.messages[0].line.msg_id, in_reply_to: null,
+    to: address(join(f.sockets, "claude-test.sock")), name: "claude:test",
+    generation: generation("claude", process.pid, undefined, join(f.sockets, "claude-test.sock")), from: first.from, text: "Accepted by claude:test." });
+  assert.equal(second.text, "Accepted by codex:test.");
+  assert.deepEqual(f.messages[0].line.agent_peers, { v: 1, receipts: ["queued", "accepted"], generation: generation("hermes", "conversation-a") });
   const outbound = f.messages.map((entry) => parseEnvelope(entry.line.message.content));
   assert.equal(outbound[0].body, "hello Claude\n\n(Hermes profile; notify_when_idle unavailable.)");
   assert.equal(outbound[0].fromName, "hermes:JD");
@@ -135,24 +142,30 @@ test("private sessions send, receive replies, and remain absent from every regis
   await f.send("conversation-b", "claude:test", "other conversation");
   assert.deepEqual(f.messages.slice(2).map((entry) => parseEnvelope(entry.line.message.content).body),
     ["again", "other conversation\n\n(Hermes profile; notify_when_idle unavailable.)"]);
-  assert.equal(peerSocket(first.address), join(f.sockets, first.address.split("/").at(-1)));
+  assert.equal(peerSocket(first.from), join(f.sockets, first.from.split("/").at(-1)));
   assert.deepEqual(allPeers().map((p) => p.kind), ["claude", "codex"]);
   assert.deepEqual(readdirSync(f.peers), ["codex-test.json"]);
   assert.equal(readdirSync(join(f.claude, "sessions")).length, 1);
   for (const [index, sent] of [first, second].entries()) {
     const sender = address(join(f.sockets, `${index ? "codex" : "claude"}-test.sock`));
-    await post(peerSocket(sent.address), messageLine({ from: sender, fromName: `${index ? "codex" : "claude"}:test`, body: `reply-${index}` }));
+    await post(peerSocket(sent.from), messageLine({ from: sender, fromName: `${index ? "codex" : "claude"}:test`, body: `reply-${index}` }));
   }
   await until(() => f.events.length === 2, "both replies");
   assert.deepEqual(f.events.map((e) => [e.method, e.params.session, e.params.message]), [
     ["peer_message", "conversation-a", "reply-0"], ["peer_message", "conversation-b", "reply-1"],
   ]);
   assert.ok(f.events.every((e) => typeof e.params.message_id === "string"));
-  const again = await f.send("conversation-a", second.address, "private to private");
-  assert.equal(again.address, first.address);
+  // conversation-b never wrote to conversation-a, so its inbox refuses it (issue #28) ...
+  const refused = await f.send("conversation-a", second.from, "private to private");
+  assert.equal(refused.from, first.from);
+  assert.deepEqual([refused.status, refused.reason], ["dropped", "not-a-reply-target"]);
+  // ... while conversation-a, which did write to conversation-b, accepts its answer.
+  assert.equal((await f.send("conversation-b", first.from, "b answers a")).status, "queued");
   await until(() => f.events.length === 3);
-  assert.equal(f.events[2].params.session, "conversation-b");
-  assert.equal(f.events[2].params.message, "private to private");
+  assert.deepEqual([f.events[2].params.session, f.events[2].params.message], ["conversation-a", "b answers a"]);
+  assert.equal((await f.send("conversation-a", second.from, "now a reply")).status, "queued");
+  await until(() => f.events.length === 4);
+  assert.equal(f.events[3].params.session, "conversation-b");
   assert.equal((await f.bridge.request("list_peers")).peers.length, 2);
 });
 
@@ -164,7 +177,7 @@ test("one conversation keeps reply inboxes in each peer directory and closes the
   const other = createServer((conn) => readLines(conn, (line) => {
     const sender = peerSocket(parseEnvelope(line.message.content).from);
     assert.equal(dirname(sender), otherDir, "Claude can reply only within its own directory");
-    void post(sender, { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "delivered" });
+    void post(sender, { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, from: address(otherSocket), status: "accepted" });
   }));
   await listen(other, otherSocket, t);
   const first = await f.send("mixed", "claude:test");
@@ -173,17 +186,92 @@ test("one conversation keeps reply inboxes in each peer directory and closes the
     pid: process.pid, name: "other", messagingSocketPath: otherSocket,
   }));
   const second = await f.send("mixed", "claude:other");
-  assert.notEqual(first.address, second.address);
-  assert.equal(second.status, "delivered");
+  assert.notEqual(first.from, second.from);
+  assert.equal(second.status, "accepted");
   for (const [sent, source] of [[first, join(f.sockets, "claude-test.sock")], [second, otherSocket]]) {
-    await post(peerSocket(sent.address), messageLine({ from: address(source), body: source }));
+    await post(peerSocket(sent.from), messageLine({ from: address(source), body: source }));
   }
   await until(() => f.events.length === 2);
   assert.ok(f.events.every((e) => e.params.session === "mixed"));
-  assert.equal((await f.send("mixed", address(join(f.sockets, "claude-test.sock")))).address, first.address);
+  assert.equal((await f.send("mixed", address(join(f.sockets, "claude-test.sock")))).from, first.from);
   await f.bridge.request("close_session", { session: "mixed" });
-  assert.equal(existsSync(first.address.slice(4)), false);
-  assert.equal(existsSync(second.address.slice(4)), false);
+  assert.equal(existsSync(first.from.slice(4)), false);
+  assert.equal(existsSync(second.from.slice(4)), false);
+});
+
+// A Claude session that lost its Hermes address once picked another conversation's inbox from the
+// socket directory, and its report reached an unrelated Discord thread.
+test("a conversation's inboxes accept only peers it wrote to, in every directory, until it closes (issue #28)", async (t) => {
+  const f = await fixture(t);
+  const recorder = async (socket) => {
+    const lines = [];
+    await listen(createServer((conn) => readLines(conn, (line) => lines.push(line))), socket, t);
+    return lines;
+  };
+  const strangerSocket = join(f.sockets, "stranger.sock"), stranger = await recorder(strangerSocket);
+  const sent = await f.send("guarded", "codex:test");
+  const codex = address(join(f.sockets, "codex-test.sock"));
+  await post(peerSocket(sent.from), messageLine({ from: address(strangerSocket), fromName: "claude:lost", body: "report for another project" }));
+  await until(() => stranger.length === 1, "the refusal");
+  assert.deepEqual([stranger[0].status, stranger[0].drop_reason, stranger[0].from], ["dropped", "not-a-reply-target", sent.from]);
+  // A send that wrote nothing grants nothing, even once a process owns that address.
+  const gone = join(f.sockets, "gone.sock");
+  assert.equal((await f.send("guarded", address(gone))).reason, "not-running");
+  const later = await recorder(gone);
+  await post(peerSocket(sent.from), messageLine({ from: address(gone), body: "new owner" }));
+  await until(() => later.length === 1, "the second refusal");
+  assert.equal(later[0].drop_reason, "not-a-reply-target");
+  // A peer in another directory adds an inbox there; earlier contacts stay allowed.
+  const otherDir = join(f.dir, "other");
+  mkdirSync(otherDir, { mode: 0o700 });
+  const otherSocket = join(otherDir, "claude-other.sock");
+  await recorder(otherSocket);
+  writeFileSync(join(f.claude, "sessions", `${process.pid}.json`), JSON.stringify({
+    pid: process.pid, name: "other", messagingSocketPath: otherSocket,
+  }));
+  const second = await f.send("guarded", "claude:other");
+  assert.equal(dirname(peerSocket(second.from)), otherDir);
+  const replyOne = messageLine({ from: codex, body: "reply one" });
+  await post(peerSocket(sent.from), replyOne);
+  await post(peerSocket(second.from), messageLine({ from: address(otherSocket), body: "reply two" }));
+  await until(() => f.events.length === 2, "both replies");
+  // Dedup is per conversation: the same id at its other directory's inbox is a duplicate.
+  await post(peerSocket(second.from), replyOne);
+  await delay(30);
+  assert.deepEqual(f.events.map((e) => e.params.message), ["reply one", "reply two"]);
+  // Closing forgets every contact: the reopened conversation has written only to the stranger.
+  await f.bridge.request("close_session", { session: "guarded" });
+  const reopened = await f.send("guarded", address(strangerSocket));
+  await post(peerSocket(reopened.from), messageLine({ from: codex, body: "stale reply" }));
+  await until(() => f.controls.some(({ kind, line }) => kind === "codex" && line.drop_reason === "not-a-reply-target"), "the refusal after close");
+  assert.equal(f.events.length, 2);
+});
+
+test("pins belong to each conversation: no other listing re-pins a name this one saw", async (t) => {
+  const f = await fixture(t);
+  const api = async (label) => {
+    const proc = spawn("sleep", ["60"], { stdio: "ignore" }), socket = join(f.sockets, `${label}.sock`), lines = [];
+    t.after(() => proc.kill());
+    await listen(createServer((conn) => readLines(conn, (line) => { if (line.type === "user") lines.push(line); })), socket, t);
+    const record = join(f.claude, "sessions", `${proc.pid}.json`);
+    writeFileSync(record, JSON.stringify({ pid: proc.pid, name: "api", messagingSocketPath: socket }));
+    return { proc, lines, record };
+  };
+  const old = await api("api-old");
+  assert.notEqual((await f.send("C1", "claude:api", "hi")).status, "failed");
+  // That session exits, and an unrelated one with the same name starts.
+  old.proc.kill();
+  await once(old.proc, "exit");
+  rmSync(old.record);
+  const fresh = await api("api-new");
+  await f.bridge.request("list_peers");
+  await f.bridge.request("list_peers", { session: "C2" });
+  const follow = await f.send("C1", "claude:api", "follow-up");
+  assert.deepEqual([follow.status, follow.reason], ["failed", "not-running"]);
+  assert.equal(fresh.lines.length, 0, "nothing reached the different process");
+  await f.bridge.request("list_peers", { session: "C1" });
+  assert.notEqual((await f.send("C1", "claude:api", "after listing")).status, "failed");
+  assert.equal(fresh.lines.length, 1);
 });
 
 test("receipt controls never become chat, and held delivery status is preserved", async (t) => {
@@ -198,53 +286,96 @@ test("close retires only its conversation and reopening gets a fresh reply addre
   const f = await fixture(t);
   const one = await f.send("one"), two = await f.send("two", "codex:test", "two");
   assert.deepEqual(await f.bridge.request("close_session", { session: "one" }), { closed: true });
-  assert.equal(existsSync(peerSocket(one.address)), false);
-  assert.equal(existsSync(peerSocket(two.address)), true);
+  assert.equal(existsSync(peerSocket(one.from)), false);
+  assert.equal(existsSync(peerSocket(two.from)), true);
   assert.deepEqual(await f.bridge.request("close_session", { session: "one" }), { closed: false });
   const reopened = await f.send("one", "codex:test", "new");
-  assert.notEqual(reopened.address, one.address);
-  await assert.rejects(f.send("one", "codex:test", "wrong profile", "hermes:Other"), /different Hermes identity/);
+  assert.notEqual(reopened.from, one.from);
+  const wrong = await f.send("one", "codex:test", "wrong profile", "hermes:Other");
+  assert.deepEqual([wrong.status, wrong.reason], ["failed", "inbox-unavailable"]);
+  assert.match(wrong.text, /different Hermes identity/);
   await f.bridge.close();
-  assert.equal(existsSync(peerSocket(two.address)), false);
-  assert.equal(existsSync(peerSocket(reopened.address)), false);
+  assert.equal(existsSync(peerSocket(two.from)), false);
+  assert.equal(existsSync(peerSocket(reopened.from)), false);
 });
 
 test("stale cleanup does not unlink a replacement at a former socket path", async (t) => {
   const f = await fixture(t);
   const sent = await f.send("stale");
-  const socket = peerSocket(sent.address);
+  const socket = peerSocket(sent.from);
   unlinkSync(socket);
   writeFileSync(socket, "new owner");
   await f.bridge.request("close_session", { session: "stale" });
   assert.equal(readFileSync(socket, "utf8"), "new owner");
 });
 
-test("malformed messages, invalid reply targets, duplicate bodies and ids are suppressed", async (t) => {
+test("malformed messages, invalid reply targets and duplicate ids are suppressed; repeated bodies are not", async (t) => {
   const f = await fixture(t);
   const sent = await f.send("safe");
-  const socket = peerSocket(sent.address), sender = address(join(f.sockets, "codex-test.sock"));
+  const socket = peerSocket(sent.from), sender = address(join(f.sockets, "codex-test.sock"));
   await post(socket, { type: "user", message: { content: "unframed" } });
   await post(socket, messageLine({ from: "uds:/outside/invalid.sock", fromName: "evil", body: "bad" }));
-  await post(socket, messageLine({ from: sent.address, body: "self" }));
+  await post(socket, messageLine({ from: sent.from, body: "self" }));
   const line = messageLine({ from: sender, fromName: "codex:test", body: "one safe reply" });
   await post(socket, line);
   await post(socket, line);
   await post(socket, { ...line, message: messageLine({ from: sender, body: "changed body, same id" }).message });
+  // The same "done" again under a new id is a new message.
   await post(socket, messageLine({ from: sender, body: "one safe reply" }));
-  await until(() => f.events.length === 1);
+  await until(() => f.events.length === 2);
   await delay(30);
-  assert.equal(f.events.length, 1);
-  assert.equal(f.events[0].params.message, "one safe reply");
-  await assert.rejects(f.send("safe", "uds:/outside/invalid.sock"), /invalid peer inbox/);
-  await assert.rejects(f.send("safe", sent.address), /own inbox/);
-  await assert.rejects(f.send("safe", "test"), /ambiguous/);
+  assert.deepEqual(f.events.map((e) => e.params.message), ["one safe reply", "one safe reply"]);
+  assert.deepEqual(f.controls, [], "a duplicate id gets no receipt; successes go only to senders that opt in");
+  for (const [to, reason, text] of [["uds:/outside/invalid.sock", "invalid-address", /not a peer inbox address/],
+    [sent.from, "self-send", /own inbox/], ["test", "ambiguous", /"test" is ambiguous: claude:test .*, codex:test/],
+    ["tes", "not-found", /exact names: claude:test, codex:test/], ["hermes:jd/project", "reserved-name", /reserved for explicit claims/]]) {
+    const result = await f.send("safe", to);
+    assert.deepEqual([result.status, result.reason], ["failed", reason]);
+    assert.match(result.text, text);
+  }
+});
+
+test("receipts back to senders: opted-in senders hear queued, then the host's answer through delivery_result", async (t) => {
+  const f = await fixture(t);
+  const sent = await f.send("receipts");
+  const socket = peerSocket(sent.from), sender = address(join(f.sockets, "codex-test.sock"));
+  const optedIn = (body, extra = {}) => ({ ...messageLine({ from: sender, body }), agent_peers: { v: 1, receipts: ["queued", "accepted"], ...extra } });
+  const accepted = optedIn("one", { in_reply_to: sent.message_id }), refused = optedIn("two"), plain = messageLine({ from: sender, body: "three" });
+  for (const line of [accepted, refused, plain]) await post(socket, line);
+  await until(() => f.events.length === 3);
+  assert.equal(f.events[0].params.in_reply_to, sent.message_id);
+  f.bridge.deliveryResult({ session: "receipts", message_id: accepted.msg_id, accepted: true });
+  f.bridge.deliveryResult({ session: "receipts", message_id: refused.msg_id, accepted: false, reason: "queue-full" });
+  f.bridge.deliveryResult({ session: "receipts", message_id: plain.msg_id, accepted: true });
+  f.bridge.deliveryResult({ session: "other", message_id: accepted.msg_id, accepted: false });
+  await until(() => f.controls.length === 4);
+  await delay(50);
+  assert.deepEqual(f.controls.map(({ line }) => [line.orig_msg_id, line.status, line.drop_reason ?? null]).sort(), [
+    [accepted.msg_id, "queued", null], [accepted.msg_id, "accepted", null], [refused.msg_id, "queued", null], [refused.msg_id, "dropped", "queue-full"],
+  ].sort(), "the plain sender heard nothing, and each answer counts once");
+  assert.ok(f.controls.every(({ line }) => line.from === sent.from));
+});
+
+test("a conversation that closes while the plugin holds a message still reports dropped/inbox-closed to its sender", async (t) => {
+  const f = await fixture(t);
+  const sent = await f.send("closing");
+  const line = { ...messageLine({ from: address(join(f.sockets, "codex-test.sock")), body: "reply" }), agent_peers: { v: 1, receipts: ["queued", "accepted"] } };
+  await post(peerSocket(sent.from), line);
+  await until(() => f.events.length === 1 && f.controls.length === 1, "the handoff");
+  await f.bridge.request("close_session", { session: "closing" });
+  f.bridge.deliveryResult({ session: "closing", message_id: line.msg_id, accepted: false, reason: "inbox-closed" });
+  f.bridge.deliveryResult({ session: "closing", message_id: line.msg_id, accepted: true });
+  await until(() => f.controls.length === 2, "the drop receipt");
+  await delay(30);
+  assert.deepEqual(f.controls.map(({ line: receipt }) => [receipt.orig_msg_id, receipt.status, receipt.drop_reason ?? null]),
+    [[line.msg_id, "queued", null], [line.msg_id, "dropped", "inbox-closed"]], "answered once");
 });
 
 test("an inbox frame that would exceed the host's line limit once re-encoded is dropped, not emitted", async (t) => {
   const f = await fixture(t);
   // Hermes route IDs are opaque and may be long; the notification repeats them.
   const sent = await f.send("s".repeat(256));
-  const socket = peerSocket(sent.address), sender = address(join(f.sockets, "codex-test.sock"));
+  const socket = peerSocket(sent.from), sender = address(join(f.sockets, "codex-test.sock"));
   // The largest body whose frame the inbox still accepts.
   const overhead = Buffer.byteLength(JSON.stringify(messageLine({ from: sender, fromName: "codex:test", body: "" }))) + 1;
   await post(socket, messageLine({ from: sender, fromName: "codex:test", body: "x".repeat(MAX_LINE - overhead) }));
@@ -258,12 +389,12 @@ test("per-inbox flood limits preserve the other conversation", async (t) => {
   const f = await fixture(t);
   const one = await f.send("one"), two = await f.send("two", "codex:test", "two");
   const sender = address(join(f.sockets, "codex-test.sock"));
-  for (let i = 0; i < 40; i++) await post(peerSocket(one.address), messageLine({ from: sender, body: `flood-${i}` }));
-  await post(peerSocket(two.address), messageLine({ from: sender, body: "other conversation" }));
+  for (let i = 0; i < 40; i++) await post(peerSocket(one.from), messageLine({ from: sender, body: `flood-${i}` }));
+  await post(peerSocket(two.from), messageLine({ from: sender, body: "other conversation" }));
   await until(() => f.events.some((e) => e.params.session === "two"));
   assert.equal(f.events.filter((e) => e.params.session === "one").length, 30);
   assert.equal(f.events.filter((e) => e.params.session === "two").length, 1);
-  const conn = connect(peerSocket(one.address));
+  const conn = connect(peerSocket(one.from));
   t.after(() => conn.destroy());
   conn.on("error", () => {});
   await once(conn, "connect");
@@ -284,11 +415,12 @@ test("backpressure bounds the inbox queue across senders and recovers after a de
     }
     delivered.push(event);
   } });
+  // Two peers the conversation wrote to, 30 messages each: within each sender's bucket, past the queue.
   const sent = await f.send("backpressure");
-  for (let i = 0; i < 70; i++) {
-    await post(peerSocket(sent.address), messageLine({
-      from: address(join(f.sockets, `source-${i}.sock`)), body: `message-${i}`,
-    }));
+  await f.send("backpressure", "claude:test");
+  const senders = ["codex", "claude"].map((kind) => address(join(f.sockets, `${kind}-test.sock`)));
+  for (let i = 0; i < 60; i++) {
+    await post(peerSocket(sent.from), messageLine({ from: senders[i % 2], body: `message-${i}` }));
   }
   await delay(30);
   assert.equal(delivered.length, 0);
@@ -296,13 +428,13 @@ test("backpressure bounds the inbox queue across senders and recovers after a de
   await until(() => delivered.length === 49);
   await delay(30);
   assert.equal(delivered.length, 49);
-  await post(peerSocket(sent.address), messageLine({ from: address(join(f.sockets, "fresh.sock")), body: "recovered" }));
+  await post(peerSocket(sent.from), messageLine({ from: senders[0], body: "recovered" }));
   await until(() => delivered.length === 50);
   assert.equal(delivered.at(-1).params.message, "recovered");
 });
 
 for (const [status, outcome] of [
-  ["delivered", "receipt_delivered"], ["held", "held"], ["rejected", "rejected"], [undefined, "inbox_written"],
+  ["accepted", "accepted"], ["held", "held"], ["dropped", "dropped"], [undefined, "unconfirmed"],
 ]) test(`diagnostics report ${outcome} without claiming model consumption`, async (t) => {
   const f = await fixture(t, { logging: true, status, receipts: status !== undefined });
   await f.bridge.request("list_peers");
@@ -319,16 +451,16 @@ for (const [status, outcome] of [
   assert.match(result.messageId, /^sha256:[a-f0-9]{24}$/);
   assert.notEqual(result.messageId, sent.message_id);
   assert.equal(started.operationId, request.operationId);
-  assert.equal(started.messageId, result.messageId);
+  assert.equal(started.messageId, undefined, "the id exists only once the line is built");
   assert.equal(result.operationId, request.operationId);
   assert.equal(completed.operationId, request.operationId);
   assert.ok(records.some((record) => record.event === "message.send" && record.outcome === "inbox_written" && record.messageId === result.messageId));
-  assert.equal(completed.outcome, status && status !== "delivered" ? "warning" : "success");
+  assert.equal(completed.outcome, status === "dropped" ? "warning" : "success");
   assert.equal(result.bytes, Buffer.byteLength("private-body-sentinel"));
   assert.ok(result.durationMs >= 0);
   assert.ok(records.some((record) => record.event === "inbox.bound"));
   assert.ok(records.some((record) => record.event === "inbox.closed"));
-  for (const secret of ["private-session-sentinel", "private-body-sentinel", "codex:test", f.dir, sent.address]) {
+  for (const secret of ["private-session-sentinel", "private-body-sentinel", "codex:test", f.dir, sent.from]) {
     assert.equal(raw.includes(secret), false);
   }
 });
@@ -340,7 +472,7 @@ test("diagnostics classify dropped and failed incoming delivery without retainin
   } });
   const sent = await f.send("private-session-sentinel");
   const sender = address(join(f.sockets, "codex-test.sock"));
-  const socket = peerSocket(sent.address);
+  const socket = peerSocket(sent.from);
   await post(socket, { type: "user", message: { content: "secret-malformed-sentinel" } });
   const line = { ...messageLine({ from: sender, body: "secret-first-body-sentinel" }), msg_id: "secret-id-sentinel" };
   await post(socket, line);
@@ -349,7 +481,7 @@ test("diagnostics classify dropped and failed incoming delivery without retainin
   const records = () => readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse)
     .filter((record) => record.component === "hermes-bridge");
   await until(() => records().some((record) => record.event === "delivery.result" && record.outcome === "emitted_to_host"));
-  await assert.rejects(f.send("private-session-sentinel", "secret-missing-target-sentinel"), /no live peer/);
+  assert.equal((await f.send("private-session-sentinel", "secret-missing-target-sentinel")).reason, "not-found");
   const result = records();
   assert.ok(result.some((record) => record.event === "receive.dropped" && record.reason === "malformed"));
   assert.ok(result.some((record) => record.event === "receive.dropped" && record.reason === "duplicate"));
@@ -369,13 +501,14 @@ test("diagnostics distinguish rate and queue limits", async (t) => {
   const f = await fixture(t, { logging: true, emit: () => gate });
   t.after(() => release());
   const sent = await f.send("bounded");
-  const socket = peerSocket(sent.address);
-  const sender = address(join(f.sockets, "codex-test.sock"));
+  await f.send("bounded", "claude:test");
+  const socket = peerSocket(sent.from);
+  const sender = address(join(f.sockets, "codex-test.sock")), other = address(join(f.sockets, "claude-test.sock"));
   for (let i = 0; i < 31; i++) await post(socket, messageLine({ from: sender, body: `rate-${i}` }));
-  for (let i = 0; i < 21; i++) await post(socket, messageLine({ from: address(join(f.sockets, `source-${i}.sock`)), body: `queue-${i}` }));
+  for (let i = 0; i < 21; i++) await post(socket, messageLine({ from: other, body: `queue-${i}` }));
   await until(() => readFileSync(f.logPath, "utf8").includes('"queue_full"'));
   const records = readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse);
-  assert.ok(records.some((record) => record.event === "receive.dropped" && record.reason === "rate_limit"));
+  assert.ok(records.some((record) => record.event === "receive.dropped" && record.reason === "rate_limited"));
   assert.ok(records.some((record) => record.event === "receive.dropped" && record.reason === "queue_full"));
   release();
 });
@@ -413,7 +546,7 @@ for (const ending of ["EOF", "SIGTERM", "shutdown"]) test(`stdout IPC and owned 
   const response = await until(() => replies.find((r) => r.id === 2), "IPC send reply");
   assert.ok(replies[0].error);
   assert.equal(replies.find((r) => r.id === 1).result.peers.length, 2);
-  const socket = peerSocket(response.result.address);
+  const socket = peerSocket(response.result.from);
   await post(socket, messageLine({ from: address(join(f.sockets, "claude-test.sock")), body: "IPC reply" }));
   const event = await until(() => replies.find((r) => r.method === "peer_message"));
   assert.equal(event.params.session, "ipc-conversation");
@@ -426,6 +559,39 @@ for (const ending of ["EOF", "SIGTERM", "shutdown"]) test(`stdout IPC and owned 
   if (ending === "shutdown") assert.equal(replies.find((r) => r.id === 3).result.closed, true);
   assert.equal(existsSync(socket), false);
   assert.equal(stderr, "");
+});
+
+test("IPC serves conversations concurrently while each conversation stays in order (issue #17)", { timeout: 15_000 }, async (t) => {
+  // No receipts: every send waits out its 1.5 s window, like a send to an unresponsive peer.
+  const f = await fixture(t, { receipts: false });
+  const child = spawn(process.execPath, [join(root, "bin", "agent-peers.mjs"), "hermes-bridge"], {
+    env: { ...process.env, AGENT_PEERS_CODEX_APP_SERVER: join(f.dir, "missing.sock") }, stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  child.stderr.resume();
+  const replies = [];
+  let buffer = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (data) => {
+    buffer += data;
+    for (let newline; (newline = buffer.indexOf("\n")) >= 0; buffer = buffer.slice(newline + 1)) replies.push(JSON.parse(buffer.slice(0, newline)));
+  });
+  const request = (id, method, params) => child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
+  const send = (id, session, message) => request(id, "send_peer", { session, name: "hermes:JD", to: "claude:test", message });
+  send(1, "a", "first in a");
+  send(2, "a", "second in a");
+  request(3, "list_peers");
+  send(4, "b", "only in b");
+  for (let i = 0; i < 1000 && replies.length < 4; i++) await delay(10);
+  const order = replies.map((reply) => reply.id);
+  assert.equal(order[0], 3, "listing does not wait for anyone's receipt window");
+  assert.equal(order.at(-1), 2, "a's second send waits for its first; b waits for neither");
+  assert.deepEqual(replies.filter((reply) => reply.result?.status).map((reply) => reply.result.status), ["unconfirmed", "unconfirmed", "unconfirmed"]);
+  assert.deepEqual(f.messages.map(({ line }) => parseEnvelope(line.message.content).body.split("\n")[0]).filter((body) => body.endsWith("in a")),
+    ["first in a", "second in a"]);
+  const closed = once(child, "exit");
+  child.stdin.end(JSON.stringify({ id: 5, method: "shutdown" }) + "\n");
+  assert.deepEqual(await closed, [0, null]);
 });
 
 test("IPC rejects malformed request ids without echoing untrusted objects", async (t) => {
@@ -453,9 +619,29 @@ test("IPC rejects malformed request ids without echoing untrusted objects", asyn
   assert.deepEqual(lines.at(-1), { id: "done", result: { closed: true } });
 });
 
+test("IPC delivery_result notifications never count toward the request limit", { timeout: 10_000 }, async (t) => {
+  const f = await fixture(t);
+  const child = spawn(process.execPath, [join(root, "bin", "agent-peers.mjs"), "hermes-bridge"], {
+    env: { ...process.env, AGENT_PEERS_CODEX_APP_SERVER: join(f.dir, "missing.sock") }, stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  child.stderr.resume();
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (data) => { output += data; });
+  const notifications = Array.from({ length: 300 }, (_, i) =>
+    JSON.stringify({ method: "delivery_result", params: { session: "s", message_id: `m${i}`, accepted: true } })).join("\n");
+  child.stdin.write(`${notifications}\n${JSON.stringify({ id: 1, method: "list_peers", params: {} })}\n`);
+  for (let i = 0; i < 500 && !output.includes("\n"); i++) await delay(10);
+  assert.deepEqual(Object.keys(JSON.parse(output.split("\n")[0])), ["id", "result"]);
+  const closed = once(child, "exit");
+  child.stdin.end(JSON.stringify({ id: 2, method: "shutdown" }) + "\n");
+  assert.deepEqual(await closed, [0, null]);
+});
+
 for (const [label, data, expected, reason] of [
   ["oversized frame", "x".repeat(MAX_LINE), /input line too large/, "message_too_large"],
-  ["request flood", "{}\n".repeat(129), /input limit exceeded/, "queue_full"],
+  ["request flood", `${JSON.stringify({ id: 1, method: "list_peers" })}\n`.repeat(129), /input limit exceeded/, "queue_full"],
   ["truncated frame", '{"id":1', /incomplete bridge input/, "malformed"],
 ]) test(`IPC terminates promptly on ${label}`, { timeout: 10_000 }, async (t) => {
   const f = await fixture(t, { logging: true });
@@ -490,9 +676,9 @@ test("a parent that stops reading notifications cannot keep the bridge alive", {
   } }) + "\n");
   const [chunk] = await output;
   const sent = JSON.parse(chunk.toString()).result;
-  assert.ok(sent.address);
+  assert.ok(sent.from);
   child.stdout.pause();
-  const socket = peerSocket(sent.address);
+  const socket = peerSocket(sent.from);
   const closed = once(child, "exit");
   await post(socket, messageLine({ from: address(join(f.sockets, "claude-test.sock")),
     body: "x".repeat(MAX_LINE - 1000) }));
@@ -500,4 +686,12 @@ test("a parent that stops reading notifications cannot keep the bridge alive", {
   assert.equal(existsSync(socket), false);
   const records = readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse);
   assert.ok(records.some((record) => record.event === "bridge.error" && record.reason === "timeout"));
+});
+
+test("a Claude introduction dropped by the recipient is sent again with the next message", async (t) => {
+  const f = await fixture(t, { status: "dropped" });
+  await f.send("intro", "claude:test", "first");
+  await f.send("intro", "claude:test", "second");
+  const bodies = f.messages.filter((m) => m.kind === "claude").map((m) => parseEnvelope(m.line.message.content).body);
+  assert.deepEqual(bodies.map((b) => b.endsWith("(Hermes profile; notify_when_idle unavailable.)")), [true, true]);
 });

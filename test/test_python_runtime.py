@@ -227,3 +227,33 @@ def test_compatibility_installer_uses_native_manager_only(monkeypatch):
     assert installer.main(["https://example.org/peers.git", "--profile", "test", "--ref", pin]) == 0
     assert commands == [["/usr/bin/hermes", "--profile", "test", "plugins", "install",
                          "https://example.org/peers.git", "--enable", "--ref", pin]]
+
+
+def test_a_full_incoming_queue_is_reported_to_the_bridge(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr(runtime, "QUEUE_MAX", 1)
+    notes, gate = tmp_path / "notes", threading.Event()
+    bridge = client(f"""
+import json, sys
+request = json.loads(sys.stdin.readline())
+for index in range(3):
+    print(json.dumps({{'method': 'peer_message', 'params': {{'session': 'r', 'message_id': f'm{{index}}'}}}}), flush=True)
+print(json.dumps({{'id': request['id'], 'result': 'ok'}}), flush=True)
+with open({str(notes)!r}, 'w') as out:
+    for line in sys.stdin:
+        out.write(line)
+        out.flush()
+""", lambda message: gate.wait(2))
+    try:
+        assert bridge.call("echo") == "ok"
+        deadline = time.monotonic() + 2
+        while not (notes.exists() and notes.read_text()):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        first = json.loads(notes.read_text().splitlines()[0])
+        assert first["method"] == "delivery_result" and "id" not in first
+        assert first["params"]["accepted"] is False and first["params"]["reason"] == "queue-full"
+    finally:
+        gate.set()
+        bridge.close()

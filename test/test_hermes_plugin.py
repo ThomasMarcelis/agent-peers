@@ -190,3 +190,89 @@ def test_peer_frame_carries_a_safe_message_id_for_send_arrival_pairing():
     framed = plugin._frame({**message, "message_id": "4b0c9f7e-1d2a-4c3b-9e8f-0a1b2c3d4e5f"})
     assert 'reply_to="uds:/safe.sock" id="4b0c9f7e-1d2a-4c3b-9e8f-0a1b2c3d4e5f">' in framed
     assert ' id="' not in plugin._frame({**message, "message_id": 'x" onload="y'})
+    assert framed.endswith("Reply via send_peer(to=reply_to). Final text goes to your user.")
+    threaded = plugin._frame({**message, "message_id": "m-2", "in_reply_to": "m-1"})
+    assert 'id="m-2" in_reply_to="m-1">' in threaded
+    assert "in_reply_to=\"" not in plugin._frame({**message, "in_reply_to": 'x" y'})
+
+
+class FakeBridge:
+    def __init__(self, outcome=None):
+        self.outcome, self.calls, self.notes = outcome, [], []
+
+    def call(self, method, params, **kwargs):
+        self.calls.append(params)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+    def notify(self, method, params):
+        self.notes.append((method, params))
+        return True
+
+    def close(self):
+        pass
+
+
+def test_send_results_share_one_shape_and_an_error_means_not_delivered():
+    peers = plugin.PeerTools(Context())
+    try:
+        result = peers.send_peer({"to": "", "message": "x"}, session_id="chat-a")
+        assert list(result) == ["status", "reason", "message_id", "in_reply_to", "to", "name", "generation", "from", "text", "error"]
+        assert (result["status"], result["reason"]) == ("failed", "invalid-request")
+        assert peers.send_peer({"to": "x", "message": "x", "in_reply_to": 'a" b'}, session_id="chat-a")["reason"] == "invalid-request"
+        assert peers.send_peer({"to": "x", "message": "x"}, session_id="missing")["reason"] == "conversation-closed"
+        assert peers._bridge is None
+
+        peers._bridge = FakeBridge({"status": "dropped", "reason": "rate-limited", "text": "Not delivered."})
+        result = peers.send_peer({"to": "x", "message": "body", "in_reply_to": "abc-1"}, session_id="chat-a")
+        assert peers._bridge.calls[-1]["in_reply_to"] == "abc-1"
+        assert result["error"] == "Not delivered."
+        peers._bridge = FakeBridge({"status": "accepted", "reason": None, "text": "Accepted by x."})
+        assert "error" not in peers.send_peer({"to": "x", "message": "body"}, session_id="chat-a")
+        assert "in_reply_to" not in peers._bridge.calls[-1]
+        assert "error" not in peers.send_peer({"to": "x", "message": "body", "in_reply_to": ""}, session_id="chat-a")
+        assert "in_reply_to" not in peers._bridge.calls[-1], "an empty in_reply_to means none"
+        # A bridge that died mid-request may already have written the line.
+        peers._bridge = FakeBridge(RuntimeError(plugin._EXITED))
+        result = peers.send_peer({"to": "x", "message": "body"}, session_id="chat-a")
+        assert (result["status"], result["reason"], "error" in result) == ("unconfirmed", "bridge-lost", False)
+        peers._bridge = FakeBridge(RuntimeError("agent-peers bridge is busy; no message was sent"))
+        result = peers.send_peer({"to": "x", "message": "body"}, session_id="chat-a")
+        assert (result["status"], result["reason"], "error" in result) == ("failed", "bridge-unavailable", True)
+    finally:
+        peers.close()
+
+
+def test_arrivals_report_what_the_host_did_to_the_bridge():
+    context = Context()
+    peers = plugin.PeerTools(context)
+    peers._bridge = bridge = FakeBridge()
+    peers._sessions["route-a"] = plugin._RouteState("chat-a")
+    message = {"session": "route-a", "message_id": "m1", "from": "uds:/a.sock", "message": "hi", "in_reply_to": "abc-1"}
+    try:
+        peers._receive(message)
+        assert bridge.notes[-1] == ("delivery_result", {"session": "route-a", "message_id": "m1", "accepted": True})
+        assert 'in_reply_to="abc-1"' in context.received[-1][1]
+        context.inject_session_message = lambda *args, **kwargs: {"accepted": False, "status": "busy"}
+        peers._receive({**message, "message_id": "m2"})
+        assert bridge.notes[-1][1] == {"session": "route-a", "message_id": "m2", "accepted": False}
+        context.inject_session_message = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("host"))
+        peers._receive({**message, "message_id": "m3"})
+        assert bridge.notes[-1][1]["accepted"] is False
+        peers._receive({**message, "session": "route-gone", "message_id": "m4"})
+        assert bridge.notes[-1][1] == {"session": "route-gone", "message_id": "m4", "accepted": False, "reason": "inbox-closed"}
+    finally:
+        peers.close()
+
+
+def test_a_listing_pins_only_the_conversation_that_asked():
+    peers = plugin.PeerTools(Context())
+    peers._bridge = bridge = FakeBridge({"peers": []})
+    try:
+        peers.list_peers({}, session_id="chat-a")
+        peers.list_peers({}, session_id="missing")
+        peers.list_peers({})
+        assert bridge.calls == [{"session": "route-a"}, {}, {}]
+    finally:
+        peers.close()

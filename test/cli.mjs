@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { VERSION } from "../src/version.mjs";
+import { generation } from "../src/wire.mjs";
 
 const cli = fileURLToPath(new URL("../bin/agent-peers.mjs", import.meta.url));
 // For tests whose fake servers live in this process: spawnSync would block their event loop.
@@ -152,7 +153,8 @@ test("whoami finds the calling Claude session through process ancestry and fails
     await once(shell, "close");
     server.close();
     const [json, text] = out.split("---\n");
-    assert.deepEqual(JSON.parse(json), { name: "claude:worker", address: `uds:${socket}`, kind: "claude", cwd: "/tmp", pid: shell.pid });
+    assert.deepEqual(JSON.parse(json), { name: "claude:worker", address: `uds:${socket}`, kind: "claude", cwd: "/tmp", pid: shell.pid,
+      generation: generation("claude", shell.pid, undefined, socket) });
     assert.equal(text.trim(), `claude:worker\nuds:${socket}`);
 
     const outside = run(["whoami"], env);

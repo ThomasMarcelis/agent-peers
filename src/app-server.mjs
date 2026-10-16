@@ -105,6 +105,10 @@ export class AppServer {
           if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error();
         } catch { connection.fail(new Error("invalid app-server JSON response")); return; }
         if (typeof message.method === "string") {
+          // Server requests fan out to every subscribed client and the first answer wins, so any
+          // answer from agent-peers (even "unsupported") could override the client that owns the
+          // request: approvals, user input, dynamic tools (openai/codex#35894). Never answer.
+          if (Object.hasOwn(message, "id")) this.#options.log("app-server", "server_request", { method: message.method, outcome: "skipped" });
           try { this.#onNotification?.(message); } catch { /* Consumer callbacks cannot break RPC cleanup. */ }
           return;
         }

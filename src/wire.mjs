@@ -5,8 +5,8 @@
 // sender's own socket, so the receiver replies by writing to that address.
 // Claude Code does not document this line format; test/contract.mjs pins it.
 
-import { randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir, tmpdir, userInfo } from "node:os";
@@ -31,6 +31,57 @@ export function alive(pid) {
     return e.code === "EPERM";
   }
 }
+
+// Process start tokens in the format Claude Code records as `procStart`: the starttime field of
+// /proc/<pid>/stat on Linux, `ps -o lstart=` in the C locale and UTC elsewhere. A live PID whose
+// token differs from its record's now belongs to a different process that reused the PID.
+// Answers are kept a second per PID, so a burst of messages costs at most one ps per second on
+// macOS; a PID reused within that second is not worth a process spawn per message.
+const knownStarts = new Map(), STARTS_MS = 1000;
+export function processStarts(pids) {
+  const out = new Map(), missing = [], looked = [], now = Date.now();
+  for (const pid of new Set(pids)) {
+    const known = knownStarts.get(pid);
+    if (known && now - known.at < STARTS_MS) {
+      if (known.start !== undefined) out.set(pid, known.start);
+      continue;
+    }
+    looked.push(pid);
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      out.set(pid, stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]);
+    } catch { missing.push(pid); }
+  }
+  if (missing.length && process.platform !== "linux") {
+    // One ps for the batch; it exits nonzero when some PIDs are gone, so read stdout regardless.
+    const ps = spawnSync("ps", ["-o", "pid=,lstart=", "-p", missing.join(",")], { encoding: "utf8", timeout: 2000,
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" }, stdio: ["ignore", "pipe", "ignore"] });
+    for (const row of (ps.stdout ?? "").split("\n")) {
+      const match = /^\s*(\d+)\s+(\S.*?)\s*$/.exec(row);
+      if (match) out.set(Number(match[1]), match[2]);
+    }
+  }
+  if (knownStarts.size > 4096) knownStarts.clear();
+  for (const pid of looked) knownStarts.set(pid, { start: out.get(pid), at: now });
+  return out;
+}
+export const processStart = (pid) => processStarts([pid]).get(pid);
+
+// A record's process runs when its PID is alive and, if the record carries a start token, the PID
+// still has that start. Records without one (agent-peers 0.x, older Claude) rely on the PID alone.
+function running(record, starts) {
+  if (!alive(record.pid)) return false;
+  if (record.procStart === undefined) return true;
+  const current = starts.get(record.pid);
+  return current === undefined || current === String(record.procStart);
+}
+export const recordRunning = (record) => running(record, processStarts(record.procStart === undefined ? [] : [record.pid]));
+
+// The opaque identity of the process behind an inbox; a pin on it stops delivery to a different
+// process that reused a PID or socket path. Claude: pid, start and socket path. Codex: thread and
+// start. Hermes: its host route.
+export const generation = (kind, ...parts) =>
+  createHash("sha256").update([kind, ...parts.map((part) => String(part ?? ""))].join("\0")).digest("hex").slice(0, 16);
 
 function safeDirectory(path, privateOnly = false) {
   const st = lstatSync(path);
@@ -72,23 +123,37 @@ const validSocketPath = (path) => typeof path === "string" && Buffer.byteLength(
 const validPid = (pid) => Number.isInteger(pid) && pid > 0 && pid <= 0x7fffffff;
 export const validThreadId = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 
-function claudeRecords() {
+// Every well-formed Claude record, marked `running`; read once per discovery scope. Without
+// `starts`, records are not marked: socket-directory checks need only live PIDs, not start times.
+function claudeRecordScan({ starts = true } = {}) {
+  const out = discoveryScope?.claudeRecords ?? readClaudeRecords();
+  if (discoveryScope) discoveryScope.claudeRecords = out;
+  if (starts && !discoveryScope?.claudeMarked) {
+    const current = processStarts(out.filter((s) => s.procStart !== undefined).map((s) => s.pid));
+    for (const s of out) s.running = running(s, current);
+    if (discoveryScope) discoveryScope.claudeMarked = true;
+  }
+  return out;
+}
+function readClaudeRecords() {
   const dir = join(claudeHome(), "sessions");
-  let files;
-  try { safeDirectory(dir); files = readdirSync(dir); } catch { return []; }
+  let files = [];
+  try { safeDirectory(dir); files = readdirSync(dir); } catch {}
   const out = [];
   for (const f of files.filter((f) => /^[1-9]\d*\.json$/.test(f))) {
     try {
       const s = readPeerRecord(join(dir, f));
-      if (!validPid(s.pid) || String(s.pid) !== f.slice(0, -5) || !alive(s.pid) || !validSocketPath(s.messagingSocketPath)) continue;
+      if (!validPid(s.pid) || String(s.pid) !== f.slice(0, -5) || !validSocketPath(s.messagingSocketPath)) continue;
       if (s.name !== undefined && !safeText(s.name, 128)) continue;
       if (s.cwd !== undefined && !safeText(s.cwd, 4096)) continue;
+      if (s.procStart !== undefined && !safeText(String(s.procStart), 64)) continue;
       safeDirectory(dirname(s.messagingSocketPath), true);
       out.push(s);
     } catch {}
   }
   return out;
 }
+const claudeRecords = () => claudeRecordScan().filter((s) => s.running);
 
 // The preferred directory is only for NEW inboxes. It must never invalidate an address
 // created in another directory: Claude versions and launch environments may coexist.
@@ -131,7 +196,7 @@ function verifiedSocketDirectories() {
   return new Set(discoveryScope.live);
 }
 function freshVerifiedDirectories() {
-  const live = new Set(claudeRecords().map((session) => dirname(session.messagingSocketPath)));
+  const live = new Set(claudeRecordScan({ starts: false }).filter((s) => alive(s.pid)).map((s) => dirname(s.messagingSocketPath)));
   for (const dir of live) {
     try {
       safeDirectory(dir, true);
@@ -195,14 +260,17 @@ export function socketPath(addr) {
   try { return decodeURIComponent(addr.slice(4)); } catch { return undefined; }
 }
 
+// Automatic names never contain the characters reserved for explicit claims (`/`) or patterns.
+export const nameLabel = (s) => String(s).replace(/[^\p{L}\p{N}_.:-]/gu, "-").slice(0, 128);
+
+const claudeRow = (s) => ({ kind: "claude", name: `claude:${nameLabel(s.name ?? s.pid)}`, address: address(s.messagingSocketPath),
+  socket: s.messagingSocketPath, cwd: s.cwd, status: safeText(s.status, 64) ? s.status : undefined, pid: s.pid,
+  generation: generation("claude", s.pid, s.procStart, s.messagingSocketPath) });
+
 // Live Claude sessions from Claude's public session registry (never its key files).
 export const claudeSessions = () => inDiscoveryScope(listClaudeSessions);
 function listClaudeSessions() {
-  return claudeRecords().flatMap((s) => {
-    if (!peerSocket(address(s.messagingSocketPath))) return [];
-    return [{ kind: "claude", name: `claude:${s.name ?? s.pid}`, address: address(s.messagingSocketPath),
-      socket: s.messagingSocketPath, cwd: s.cwd, status: safeText(s.status, 64) ? s.status : undefined, pid: s.pid }];
-  });
+  return claudeRecords().flatMap((s) => (peerSocket(address(s.messagingSocketPath)) ? [claudeRow(s)] : []));
 }
 
 export function isSafePeerRecord(p) {
@@ -210,27 +278,41 @@ export function isSafePeerRecord(p) {
     validThreadId(p.threadId) && (p.cwd === undefined || safeText(p.cwd, 4096)) && !!peerSocket(p.address);
 }
 
-export const codexPeers = () => inDiscoveryScope(listCodexPeers);
-function listCodexPeers() {
+// Every safe Codex record, marked `running`; read once per discovery scope.
+function codexRecordScan() {
+  if (discoveryScope?.codex) return discoveryScope.codex;
   const dir = resolve(peersHome());
-  let files;
-  try { safeDirectory(dir, true); files = readdirSync(dir); } catch { return []; }
+  let files = [];
+  try { safeDirectory(dir, true); files = readdirSync(dir); } catch {}
   const out = [];
   for (const f of files.filter((f) => /^codex-[A-Za-z0-9_-]+\.json$/.test(f))) {
     try {
       const p = readPeerRecord(join(dir, f));
-      if (!isSafePeerRecord(p) || !alive(p.pid)) continue;
-      out.push({ kind: "codex", name: p.name, address: p.address, socket: peerSocket(p.address), cwd: p.cwd,
-        threadId: p.threadId, pid: p.pid, startedAt: p.startedAt,
-        addresses: Array.isArray(p.addresses) ? p.addresses.slice(0, 16).filter((addr) => peerSocket(addr)) : [p.address] });
+      if (isSafePeerRecord(p) && (p.procStart === undefined || safeText(String(p.procStart), 64))) out.push(p);
     } catch {}
   }
+  const starts = processStarts(out.filter((p) => p.procStart !== undefined).map((p) => p.pid));
+  for (const p of out) p.running = running(p, starts);
+  if (discoveryScope) discoveryScope.codex = out;
   return out;
 }
+
+const codexRow = (p) => ({ kind: "codex", name: p.name, address: p.address, socket: peerSocket(p.address), cwd: p.cwd,
+  threadId: p.threadId, pid: p.pid, startedAt: p.startedAt, generation: generation("codex", p.threadId, p.procStart),
+  addresses: Array.isArray(p.addresses) ? p.addresses.slice(0, 16).filter((addr) => peerSocket(addr)) : [p.address] });
+
+export const codexPeers = () => inDiscoveryScope(() => codexRecordScan().filter((p) => p.running).map(codexRow));
 
 // One listing shares a single directory scan across its rows.
 export function allPeers() {
   return inDiscoveryScope(() => [...claudeSessions(), ...codexPeers()]);
+}
+
+// Registered sessions whose process exited or whose PID was reused. They are never listed, but
+// a send to their name or address fails as "not running" instead of "not found".
+export function stalePeers() {
+  return inDiscoveryScope(() => [...claudeRecordScan().filter((s) => !s.running).map(claudeRow),
+    ...codexRecordScan().filter((p) => !p.running).map(codexRow)]);
 }
 
 // Process ancestry of this process, nearest parent first. Linux reads /proc; elsewhere ps.
@@ -312,7 +394,9 @@ export function parseEnvelope(content) {
   return { from: attrs.from, fromName: attrs["from-name"], fromMode: attrs["from-mode"], body: m[2] };
 }
 
-export function messageLine({ from, fromName, fromMode, body }) {
+// `ext` is agent-peers' namespaced line extension (status.mjs); Claude Code and agent-peers 0.x
+// read none of it, and the envelope itself never changes because Claude rejects new attributes.
+export function messageLine({ from, fromName, fromMode, body, ext }) {
   return {
     msgV: 1,
     msg_id: randomUUID(),
@@ -320,18 +404,19 @@ export function messageLine({ from, fromName, fromMode, body }) {
     message: { role: "user", content: envelope({ from, fromName, fromMode, body }) },
     priority: "next",
     from,
+    ...(ext ? { agent_peers: ext } : {}),
   };
 }
 
 // Write one line to a peer inbox. Open the connection only once the line is ready:
 // Claude closes connections that send no complete line within 30 seconds.
 export function post(socket, line) {
-  if (typeof socket !== "string" || peerSocket(address(socket)) !== socket) {
+  if (typeof socket !== "string" || inDiscoveryScope(() => peerSocket(address(socket))) !== socket) {
     return Promise.reject(new Error("invalid peer inbox socket"));
   }
   const data = JSON.stringify(line) + "\n";
   const bytes = Buffer.byteLength(data);
-  if (bytes > MAX_LINE) return Promise.reject(new Error(`message too large (${bytes} bytes)`));
+  if (bytes > MAX_LINE) return Promise.reject(Object.assign(new Error(`message too large (${bytes} bytes)`), { code: "E2BIG" }));
   return new Promise((resolve, reject) => {
     const c = connect(socket);
     let settled = false;
@@ -342,12 +427,19 @@ export function post(socket, line) {
       c.destroy();
       error ? reject(error) : resolve();
     };
-    const timer = setTimeout(() => finish(new Error("peer inbox did not accept the message within 5 s")), 5000);
+    // Coded failures let senders say "not running" for a missing or refusing inbox. A timeout means
+    // the final newline never left this process, so the inbox discards the partial line. If the
+    // whole line already reached the kernel (an event-loop stall delayed only the callback), the
+    // inbox has it: that is a completed write, not a timeout.
+    const failed = (message, code) => Object.assign(new Error(message), { code });
+    let ended = false;
+    const timer = setTimeout(() => finish(ended && c.writableLength === 0 ? undefined
+      : failed("peer inbox did not accept the message within 5 s", "ETIMEDOUT")), 5000);
     c.on("error", finish);
     // end() reports a failed write (EPIPE when the peer closes mid-write) to its callback
     // before the "error" event; ignoring it would report an undelivered line as delivered.
-    c.on("connect", () => c.end(data, (error) => finish(error)));
-    c.on("close", () => finish(new Error("peer inbox closed before accepting the message")));
+    c.on("connect", () => { ended = true; c.end(data, (error) => finish(error)); });
+    c.on("close", () => finish(failed("peer inbox closed before accepting the message", "ERR_SOCKET_CLOSED")));
   });
 }
 

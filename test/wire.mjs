@@ -3,12 +3,17 @@ import { EventEmitter } from "node:events";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { connect, createServer } from "node:net";
+import { Socket, connect, createServer } from "node:net";
 import { once } from "node:events";
 import { join } from "node:path";
 import { test } from "node:test";
-import { MAX_LINE, address, alive, ancestorPids, inDiscoveryScope, whoami, claudeSessions, codexPeers, ensurePrivateDir, peerSocket, post, readLines, socketDir, socketPath } from "../src/wire.mjs";
+import { MAX_LINE, address, alive, ancestorPids, inDiscoveryScope, whoami, claudeSessions, codexPeers, ensurePrivateDir, generation,
+  messageLine, nameLabel, peerSocket, post, processStart, readLines, recordRunning, socketDir, socketPath, stalePeers } from "../src/wire.mjs";
 import { closeServer, listen } from "./listeners.mjs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { Receipts, readMessage } from "../src/inbox.mjs";
+import { Pins } from "../src/outbox.mjs";
 
 function fixture(t) {
   const dir = mkdtempSync(join(tmpdir(), "ap-wire-"));
@@ -152,6 +157,25 @@ test("posting times out when the peer accepts but never reads, and closes its co
   conn.resume();
   await once(conn, "close");
   assert.deepEqual(lines, []);
+});
+
+test("a line already handed to the kernel is written, even if the deadline passes before its callback", { timeout: 20_000 }, async (t) => {
+  const f = fixture(t), socket = join(f.sockets, "late-callback.sock"), lines = [];
+  await listen(createServer((conn) => readLines(conn, (line) => lines.push(line))), socket, t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const end = Socket.prototype.end;
+  t.after(() => { Socket.prototype.end = end; });
+  // As after a 5 s event-loop stall: end() wrote the line, then the deadline fires first.
+  Socket.prototype.end = function (...args) {
+    Socket.prototype.end = end;
+    const out = end.apply(this, args);
+    t.mock.timers.tick(5000);
+    return out;
+  };
+  await post(socket, { type: "user", msg_id: "m1" });
+  t.mock.timers.reset();
+  for (let i = 0; i < 200 && !lines.length; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(lines.map((line) => line.msg_id), ["m1"]);
 });
 
 test("posting rejects promptly when the peer closes before accepting the message", {
@@ -363,4 +387,72 @@ test("ancestorPids walks real process ancestry and whoami matches only an ancest
   assert.equal(whoami([]), undefined);
   assert.equal(whoami([process.pid + 1_000_000]), undefined);
   assert.ok(sockets);
+});
+
+test("a record whose PID now belongs to another process is stale, never live", (t) => {
+  const { claude, peers, sockets } = fixture(t);
+  const start = processStart(process.pid), socket = join(sockets, "claude.sock");
+  assert.match(start, /\S/);
+  assert.equal(processStart(process.pid), start, "stable for one process");
+  const record = (procStart) => writeFileSync(join(claude, "sessions", `${process.pid}.json`),
+    JSON.stringify({ pid: process.pid, name: "fixture", messagingSocketPath: socket, procStart }));
+  record(start);
+  assert.deepEqual(claudeSessions().map((p) => [p.name, p.generation]), [["claude:fixture", generation("claude", process.pid, start, socket)]]);
+  assert.deepEqual(stalePeers(), []);
+  record("a-different-start");
+  assert.deepEqual(claudeSessions(), [], "the PID was reused: not this session any more");
+  assert.deepEqual(stalePeers().map((p) => p.name), ["claude:fixture"]);
+  record(undefined);
+  assert.equal(claudeSessions().length, 1, "records without a start token fall back to the PID");
+  const codex = (procStart) => writeFileSync(join(peers, "codex-t.json"), JSON.stringify({ pid: process.pid, name: "codex:t",
+    address: address(join(sockets, "codex-t.sock")), threadId: "t", procStart }));
+  codex(start);
+  assert.deepEqual(codexPeers().map((p) => p.generation), [generation("codex", "t", start)]);
+  codex("a-different-start");
+  assert.deepEqual(codexPeers(), []);
+  assert.ok(stalePeers().some((p) => p.name === "codex:t"));
+  assert.equal(recordRunning({ pid: process.pid, procStart: start }), true);
+  assert.equal(recordRunning({ pid: process.pid, procStart: "other" }), false);
+});
+
+test("automatic Claude names drop characters reserved for claims and patterns; lines carry the extension", (t) => {
+  const { claude, sockets } = fixture(t);
+  writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "api/v2 lead@home",
+    messagingSocketPath: join(sockets, "claude.sock") }));
+  assert.equal(claudeSessions()[0].name, "claude:api-v2-lead-home");
+  assert.equal(nameLabel("Überprüfung_1.x:y"), "Überprüfung_1.x:y");
+  assert.equal(messageLine({ from: "uds:/a.sock", body: "x" }).agent_peers, undefined);
+  assert.deepEqual(messageLine({ from: "uds:/a.sock", body: "x", ext: { v: 1 } }).agent_peers, { v: 1 });
+});
+
+// Each start-time lookup is a ps spawn on macOS, so none may run per post or receipt, and inbound
+// lines share one lookup per second. Every lookup first tries /proc/<pid>/stat, which is counted.
+test("posts and receipts look up no process start times; inbound senders share one per second", async (t) => {
+  const { claude, sockets } = fixture(t);
+  const sleeper = spawn("sleep", ["30"], { stdio: "ignore" });
+  t.after(() => sleeper.kill());
+  const socket = join(sockets, "counted.sock");
+  await listen(createServer((conn) => readLines(conn, () => {})), socket, t);
+  writeFileSync(join(claude, "sessions", `${sleeper.pid}.json`), JSON.stringify({ pid: sleeper.pid, procStart: "1", name: "counted", messagingSocketPath: socket }));
+  let lookups = 0;
+  const original = fs.readFileSync;
+  fs.readFileSync = function (path, ...rest) {
+    if (typeof path === "string" && /^\/proc\/\d+\/stat$/.test(path)) lookups++;
+    return original.call(this, path, ...rest);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.readFileSync = original; syncBuiltinESMExports(); });
+  const counted = async (fn) => { const before = lookups; await fn(); return lookups - before; };
+  assert.equal(await counted(() => post(socket, { type: "user" })), 0, "one post");
+  assert.equal(await counted(async () => {
+    new Receipts().send({ to: address(socket), from: address(socket), id: "a", status: "dropped", reason: "rate-limited" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }), 0, "one receipt");
+  const line = messageLine({ from: address(socket), fromName: "counted", body: "hi" }), pins = new Pins();
+  assert.ok(await counted(() => {
+    for (let i = 0; i < 2; i++) {
+      assert.ok(inDiscoveryScope(() => readMessage(line, [])));
+      pins.noteSender(address(socket));
+    }
+  }) <= 1, "two inbound lines");
 });

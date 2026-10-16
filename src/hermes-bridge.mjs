@@ -1,21 +1,21 @@
 // Private reply inboxes for Hermes. This process never writes a discovery registry entry:
 // a conversation becomes reachable only by sharing its address with a recipient.
 
-import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, rmSync } from "node:fs";
-import { createServer } from "node:net";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { AppServer } from "./app-server.mjs";
+import { Admission, Receipts, checkSocketPath, closeInbox, listenInbox, readMessage } from "./inbox.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
-import {
-  MAX_LINE, MAX_SOCKET_PATH, address, allPeers, messageLine, parseEnvelope, peerSocket, post, readLines,
-} from "./wire.mjs";
+import { Outbox, Pins, sendPeer } from "./outbox.mjs";
+import { SendFailure, isError } from "./status.mjs";
+import { MAX_LINE, address, allPeers, generation, inDiscoveryScope, peerSocket } from "./wire.mjs";
 
-const BUCKET = 30, REFILL_PER_S = 0.5, DEDUP_MS = 30_000, IDLE_MS = 600_000;
-const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256;
+const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256, HANDOFFS_MAX = 256, CONTACTS_MAX = 256,
+  CONVERSATIONS_MAX = 2 * SESSIONS_MAX, RETIRED_HANDOFF_MS = 60_000;
 const IPC_QUEUE_MAX = 128, IPC_WRITE_TIMEOUT_MS = 5000;
 const logger = (message) => console.error(`[hermes-bridge ${process.pid}] ${message}`);
 const event = (name, fields) => logEvent("hermes-bridge", name, fields);
+const code = (reason) => reason?.replaceAll("-", "_");
 const safeError = (error) => {
   const { reason, errorCode } = errorFields(error);
   return errorCode && errorCode !== "unknown" ? `${reason} (${errorCode})` : reason;
@@ -28,21 +28,6 @@ function requiredString(value, field, max = MAX_LINE) {
   return value;
 }
 
-function resolveTarget(to) {
-  const peers = allPeers();
-  if (to.startsWith("uds:")) {
-    const socket = peerSocket(to);
-    if (!socket) throw new Error("invalid peer inbox address; use an address from list_peers or a received message");
-    return peers.find((p) => p.address === to) ?? { address: to, socket, name: to };
-  }
-  const exact = peers.filter((p) => p.name === to || p.name === `claude:${to}` || p.name === `codex:${to}`);
-  const matches = exact.length ? exact : peers.filter((p) => p.name.includes(to));
-  if (matches.length === 1) return matches[0];
-  throw new Error(matches.length
-    ? `"${to}" is ambiguous: ${matches.map((p) => `${p.name} (${p.address})`).join(", ")}`
-    : `no live peer named "${to}"; call list_peers`);
-}
-
 export class HermesBridge {
   #app;
   #emit;
@@ -52,6 +37,13 @@ export class HermesBridge {
   #closed = false;
   #closing;
   #queued = 0;
+  #receipts = new Receipts(event);
+  #introduced = new Set();
+  // Per conversation, shared by its inboxes in every socket directory: the generations it saw
+  // (pins), the addresses it has written to (the only senders its inboxes accept; anyone else
+  // guessed the address), and its dedup and token buckets. Cleared when it closes.
+  #conversations = new Map();
+  #retiredHandoffs = new Map();
 
   constructor({ app = new AppServer(), emit = async () => {}, log = logger } = {}) {
     this.#app = app;
@@ -59,13 +51,31 @@ export class HermesBridge {
     this.#log = log;
   }
 
-  #introduced = new Set();
-
-  #firstContact(key) {
-    if (this.#introduced.has(key)) return false;
+  #introduce(key) {
     if (this.#introduced.size >= 4096) this.#introduced.clear();
     this.#introduced.add(key);
-    return true;
+  }
+
+  #conversation(session) {
+    let state = this.#conversations.get(session);
+    if (state) return state;
+    if (this.#conversations.size >= CONVERSATIONS_MAX) {
+      // Only conversations without an inbox or a send in flight are evicted; those with an inbox
+      // are bounded by SESSIONS_MAX, and a send keeps the pins it resolved against.
+      const open = new Set([...this.#routes.values()].map((route) => route.session));
+      for (const [key, value] of this.#conversations) if (!open.has(key) && !value.sending) { this.#conversations.delete(key); break; }
+    }
+    state = { pins: new Pins(), contacts: new Set(), admission: new Admission({ senders: SOURCES_MAX }), sending: 0 };
+    this.#conversations.set(session, state);
+    return state;
+  }
+
+  // Returns whether `to` is new, so a send that wrote nothing can take it back.
+  #contact(session, to) {
+    const { contacts } = this.#conversation(session), added = !contacts.delete(to);
+    contacts.add(to);
+    if (contacts.size > CONTACTS_MAX) contacts.delete(contacts.values().next().value);
+    return added;
   }
 
   async request(method, params = {}) {
@@ -81,7 +91,8 @@ export class HermesBridge {
       const result = await this.#request(method, params, operationId);
       event("tool.result", {
         ...fields, durationMs: performance.now() - started,
-        outcome: result.note || result.status && result.status !== "delivered" ? "warning" : "success",
+        outcome: result.status === "failed" ? "error" : result.note || isError(result.status) ? "warning" : "success",
+        ...(result.status === "failed" ? { reason: code(result.reason) } : {}),
         ...(Array.isArray(result.peers) ? { bridgeCount: result.peers.length } : {}),
       });
       return result;
@@ -94,16 +105,19 @@ export class HermesBridge {
   async #request(method, params, operationId) {
     if (this.#closed) throw new Error("Hermes bridge is closed");
     if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("params must be an object");
-    if (method === "list_peers") return this.#listPeers();
+    // A listing pins only the conversation that asked for it.
+    if (method === "list_peers") return this.#listPeers(params.session === undefined ? undefined : requiredString(params.session, "session", 512));
     if (method !== "send_peer" && method !== "close_session") throw new Error(`unknown method: ${method}`);
     const session = requiredString(params.session, "session", 512);
-    // A close cannot race a send creating the same route. Other conversations remain independent.
+    // One conversation's requests run in order, so a close cannot race a send creating the same
+    // route. Other conversations run concurrently.
     const previous = this.#locks.get(session) ?? Promise.resolve();
     const operation = previous.catch(() => {}).then(async () => {
       if (this.#closed) throw new Error("Hermes bridge is closed");
       if (method === "send_peer") return this.#send(session, params, operationId);
       const routes = [...this.#routes.values()].filter((route) => route.session === session);
       await Promise.all(routes.map((route) => this.#retire(route)));
+      this.#conversations.delete(session);
       return { closed: routes.length > 0 };
     });
     this.#locks.set(session, operation);
@@ -114,7 +128,7 @@ export class HermesBridge {
     }
   }
 
-  async #listPeers() {
+  async #listPeers(session) {
     const peers = allPeers().filter((p) => p.kind === "claude" || p.kind === "codex");
     let note;
     const live = new Map();
@@ -141,10 +155,11 @@ export class HermesBridge {
         clearTimeout(timer);
       }
     }
+    if (session) this.#conversation(session).pins.noteRows(peers);
     return {
       peers: peers.map((p) => ({
         name: p.name, kind: p.kind, cwd: p.cwd ?? null,
-        status: live.get(p.threadId)?.status?.type ?? p.status ?? null, address: p.address,
+        status: live.get(p.threadId)?.status?.type ?? p.status ?? null, address: p.address, generation: p.generation,
       })),
       ...(note ? { note } : {}),
     };
@@ -160,134 +175,75 @@ export class HermesBridge {
       }
     }
     const previous = this.#routes.get(key);
-    if (previous) {
-      if (previous.name !== name) throw new Error("this conversation already belongs to a different Hermes identity");
-      return previous;
-    }
+    if (previous) return previous;
     if (this.#routes.size >= SESSIONS_MAX) throw new Error("too many open Hermes conversation inboxes");
     const socket = join(directory, `hermes-${randomUUID().replaceAll("-", "")}.sock`);
-    if (Buffer.byteLength(socket) > MAX_SOCKET_PATH) {
-      throw new Error("peer socket path exceeds the 103-byte Unix limit; use a shorter XDG_RUNTIME_DIR for all participating agents");
-    }
-    if (!peerSocket(address(socket))) throw new Error("unsafe Hermes reply inbox directory");
+    const sessionId = logIdentity(session);
     const route = {
-      key, session, name, socket, address: address(socket), closed: false, connections: new Set(),
-      buckets: new Map(), recent: new Map(), pending: new Map(), queued: 0, chain: Promise.resolve(),
+      key, session, name, socket, address: address(socket), closed: false, queued: 0, chain: Promise.resolve(),
+      handoffs: new Map(),
+      // Late outcomes are logged only: 1.0 injects nothing into a Hermes conversation unasked.
+      outbox: new Outbox({ log: (name, fields) => event(name, { sessionId, ...fields }) }),
     };
-    route.server = createServer((conn) => {
-      if (route.closed || route.connections.size >= QUEUE_MAX) {
-        event("receive.dropped", { sessionId: logIdentity(session), reason: route.closed ? "closed" : "queue_full" });
-        return conn.destroy();
-      }
-      route.connections.add(conn);
-      conn.once("close", () => route.connections.delete(conn));
-      readLines(conn, (line) => this.#receive(route, line));
+    checkSocketPath(socket);
+    if (!peerSocket(route.address)) throw new Error("unsafe Hermes reply inbox directory");
+    route.inbox = await listenInbox(socket, {
+      maxConnections: QUEUE_MAX, onLine: (line) => this.#receive(route, line),
+      onRefused: (reason) => event("receive.dropped", { sessionId, reason: reason === "closed" ? "closed" : "queue_full" }),
+      onError: (error) => {
+        event("inbox.error", { sessionId, ...errorFields(error) });
+        this.#log(`inbox error: ${safeError(error)}`);
+      },
     });
-    route.server.on("error", (error) => {
-      event("inbox.error", { sessionId: logIdentity(session), ...errorFields(error) });
-      this.#log(`inbox error: ${safeError(error)}`);
-    });
-    try {
-      await new Promise((resolve, reject) => {
-        route.server.once("error", reject);
-        // Never unlink before binding, even in the unlikely event of an address collision.
-        route.server.listen(socket, () => { route.server.off("error", reject); resolve(); });
-      });
-      route.owner = lstatSync(socket);
-      chmodSync(socket, 0o600);
-      this.#routes.set(key, route);
-      event("inbox.bound", { sessionId: logIdentity(session), targetId: logIdentity(route.address) });
-    } catch (error) {
-      route.closed = true;
-      for (const conn of route.connections) conn.destroy();
-      // Binding is not yet published in #routes: clean the listener even if stat or
-      // chmod fails, otherwise close() cannot find it and the process stays alive.
-      await new Promise((resolve) => route.server.close(resolve));
-      throw error;
-    }
+    this.#routes.set(key, route);
+    event("inbox.bound", { sessionId, targetId: logIdentity(route.address) });
     return route;
   }
 
   async #send(session, params, operationId) {
-    const started = performance.now(), messageId = randomUUID();
+    const started = performance.now();
+    const name = requiredString(params.name, "name", 80);
+    if (!/^hermes:[A-Za-z0-9:_-]+$/.test(name)) throw new Error("name must identify a Hermes profile as hermes:<profile>");
     const fields = {
-      operationId, messageId: logIdentity(messageId), sessionId: logIdentity(session),
+      operationId, sessionId: logIdentity(session),
       ...(typeof params.to === "string" ? { targetId: logIdentity(params.to) } : {}),
       ...(typeof params.message === "string" ? { bytes: Buffer.byteLength(params.message) } : {}),
     };
     event("send.started", fields);
-    try {
-      const result = await this.#post(session, params, messageId, fields);
-      const status = result.status;
-      event("send.result", {
-        ...fields, durationMs: performance.now() - started,
-        outcome: status === "held" ? "held" : status === "delivered" ? "receipt_delivered" : status ? "rejected" : "inbox_written",
-        receipt: Boolean(status),
-      });
-      return result;
-    } catch (error) {
-      event("send.result", { ...fields, outcome: "error", durationMs: performance.now() - started, ...errorFields(error) });
-      throw error;
+    let added = false, introducing;
+    const conversation = this.#conversation(session);
+    conversation.sending++;
+    const { result, text } = await sendPeer({
+      to: params.to, message: params.message, inReplyTo: params.in_reply_to ?? undefined, pins: conversation.pins, fromName: name,
+      generation: generation("hermes", session),
+      route: async (target) => {
+        let route;
+        try { route = await this.#bind(session, name, dirname(target.socket)); }
+        catch (error) { throw new SendFailure("inbox-unavailable", error.message); }
+        // Recorded before the write, because a reply can arrive before this send's result does;
+        // taken back below if nothing was written, so a later owner of a dead address gets no pass.
+        added = this.#contact(session, target.address);
+        return { from: route.address, outbox: route.outbox };
+      },
+      // Claude labels every external envelope as another Claude session. Correct that frame once
+      // per conversation and recipient (the recipient keeps it in context), counted only once a
+      // send wrote something.
+      introduction: (target) => {
+        const key = `${session}\0${target.address}`;
+        if (this.#introduced.has(key)) return undefined;
+        introducing = key;
+        return "(Hermes profile; notify_when_idle unavailable.)";
+      },
+    }).finally(() => { conversation.sending--; });
+    // Claude saw the introduction only if the message was not refused or dropped.
+    if (introducing && !isError(result.status)) this.#introduce(introducing);
+    if (added && result.status === "failed") this.#conversations.get(session)?.contacts.delete(result.to);
+    if (result.message_id) {
+      if (result.status !== "failed") event("message.send", { ...fields, messageId: logIdentity(result.message_id), outcome: "inbox_written" });
+      event("send.result", { ...fields, messageId: logIdentity(result.message_id), durationMs: performance.now() - started,
+        outcome: result.status, receipt: !["unconfirmed", "failed"].includes(result.status) });
     }
-  }
-
-  async #post(session, params, messageId, fields) {
-    const name = requiredString(params.name, "name", 80);
-    if (!/^hermes:[A-Za-z0-9:_-]+$/.test(name)) throw new Error("name must identify a Hermes profile as hermes:<profile>");
-    const to = requiredString(params.to, "to", 512);
-    const message = requiredString(params.message, "message");
-    const target = resolveTarget(to);
-    const targetSocket = peerSocket(target.address);
-    if (!targetSocket) throw new Error("the peer registry contains an invalid inbox address; call list_peers again");
-    const route = await this.#bind(session, name, dirname(targetSocket));
-    if (target.address === route.address) throw new Error("that address is this conversation's own inbox");
-    // Claude labels every external envelope as another Claude session. Correct that frame once
-    // per conversation and recipient: the recipient keeps it in context.
-    const body = target.kind === "claude" && this.#firstContact(`${session}\0${target.address}`)
-      ? `${message}\n\n(Hermes profile; notify_when_idle unavailable.)`
-      : message;
-    const line = { ...messageLine({ from: route.address, fromName: name, body }), msg_id: messageId };
-    let finish, timer;
-    const receipt = new Promise((resolve) => {
-      finish = resolve;
-      route.pending.set(line.msg_id, resolve);
-      timer = setTimeout(() => resolve(undefined), 1500);
-    });
-    try {
-      const started = performance.now();
-      await post(targetSocket, line);
-      event("message.send", { ...fields, outcome: "inbox_written", durationMs: performance.now() - started });
-      const status = await receipt;
-      const text = status === "held"
-        ? `Delivered to ${target.name}'s inbox; its session is holding it for its user's approval.`
-        : status && status !== "delivered" ? `Not delivered to ${target.name}: ${status}.`
-          : `Delivered to ${target.name}'s inbox.`;
-      return { text, address: route.address, message_id: line.msg_id, ...(status ? { status } : {}) };
-    } finally {
-      clearTimeout(timer);
-      route.pending.delete(line.msg_id);
-      finish(undefined);
-    }
-  }
-
-  #admit(route, from, body, id) {
-    const now = Date.now();
-    for (const [key, bucket] of route.buckets) if (now - bucket.at > IDLE_MS) route.buckets.delete(key);
-    for (const [key, time] of route.recent) if (now - time > DEDUP_MS) route.recent.delete(key);
-    if (!route.buckets.has(from) && route.buckets.size >= SOURCES_MAX) return "rate_limit";
-    const bucket = route.buckets.get(from) ?? { tokens: BUCKET, at: now };
-    bucket.tokens = Math.min(BUCKET, bucket.tokens + (now - bucket.at) / 1000 * REFILL_PER_S);
-    bucket.at = now;
-    route.buckets.set(from, bucket);
-    const bodyKey = createHash("sha256").update(from).update("\0").update(body).digest("hex");
-    const idKey = `${from}\0${id}`;
-    if (route.recent.has(bodyKey) || route.recent.has(idKey)) return "duplicate";
-    if (bucket.tokens < 1) return "rate_limit";
-    if (route.queued >= QUEUE_MAX || this.#queued >= TOTAL_QUEUE_MAX) return "queue_full";
-    bucket.tokens--;
-    route.recent.set(bodyKey, now);
-    route.recent.set(idKey, now);
-    return undefined;
+    return { ...result, text };
   }
 
   #receive(route, line) {
@@ -295,33 +251,56 @@ export class HermesBridge {
     const drop = (reason, fields = {}) => event("receive.dropped", { sessionId, reason, ...fields });
     if (route.closed) return drop("closed");
     if (!line || typeof line !== "object") return drop("malformed");
-    if (line.type === "control" && line.action === "peer_message_status") {
-      if (typeof line.status !== "string" || !line.status.length || line.status.length > 128 ||
-          typeof line.orig_msg_id !== "string") return drop("malformed");
-      route.pending.get(line.orig_msg_id)?.(line.status);
+    if (line.type === "control") {
+      if (!route.outbox.receive(line)) drop("malformed");
       return;
     }
-    if (line.type !== "user" || typeof line.message?.content !== "string") return drop("malformed");
-    const env = parseEnvelope(line.message.content);
-    if (!env || !peerSocket(env.from) || env.from === route.address || (line.from && line.from !== env.from)) return drop("malformed");
-    const id = typeof line.msg_id === "string" && line.msg_id.length <= 256 && line.msg_id ? line.msg_id : randomUUID();
-    const fields = { sessionId, messageId: logIdentity(id), targetId: logIdentity(env.from), bytes: Buffer.byteLength(env.body) };
+    const message = inDiscoveryScope(() => readMessage(line, [route.address]));
+    if (!message) return drop("malformed");
+    // The host needs an id even for a line without one; such a line cannot be deduplicated.
+    const id = message.id ?? randomUUID();
+    const fields = { sessionId, messageId: logIdentity(id), targetId: logIdentity(message.from), bytes: Buffer.byteLength(message.body) };
+    const reply = (status, reason) => this.#receipts.send({ to: message.from, from: route.address, id: message.id, status, reason, optIn: message.ext.receipts });
+    // Only peers this conversation wrote to may write to it; the sender learns it was refused.
+    const conversation = this.#conversations.get(route.session);
+    if (!conversation?.contacts.has(message.from)) {
+      reply("dropped", "not-a-reply-target");
+      return drop("not_a_reply_target", fields);
+    }
     const notification = { method: "peer_message", params: {
-      session: route.session, message_id: id, from: env.from,
-      from_name: /^[A-Za-z0-9:_ .-]{1,80}$/.test(env.fromName ?? "") ? env.fromName : "an unnamed peer",
-      message: env.body,
+      session: route.session, message_id: id, from: message.from, from_name: message.sender, message: message.body,
+      ...(message.ext.inReplyTo ? { in_reply_to: message.ext.inReplyTo } : {}),
     } };
     // The host reads at most MAX_LINE per line and restarts the bridge on a longer one; a frame
     // that fits the inbox can exceed that once re-encoded with session and message IDs.
-    if (Buffer.byteLength(JSON.stringify(notification)) + 1 > MAX_LINE) return drop("message_too_large", fields);
-    const reason = this.#admit(route, env.from, env.body, id);
-    if (reason) return drop(reason, fields);
+    if (Buffer.byteLength(JSON.stringify(notification)) + 1 > MAX_LINE) {
+      reply("dropped", "too-large");
+      return drop("message_too_large", fields);
+    }
+    const reason = conversation.admission.admit(message.from, message.id, { full: route.queued >= QUEUE_MAX || this.#queued >= TOTAL_QUEUE_MAX });
+    // A repeated id gets no receipt: the first copy's outcome stands.
+    if (reason === "duplicate") return drop(reason, fields);
+    if (reason) {
+      reply("dropped", reason);
+      return drop(code(reason), fields);
+    }
+    conversation.pins.noteSender(message.from, message.ext.generation);
+    reply("queued");
+    // The plugin reports the host's answer with delivery_result; only then is it accepted.
+    if (message.id) {
+      if (route.handoffs.size >= HANDOFFS_MAX) route.handoffs.delete(route.handoffs.keys().next().value);
+      route.handoffs.set(message.id, reply);
+    }
     route.queued++;
     this.#queued++;
     event("receive.queued", { ...fields, queueDepth: route.queued });
     const started = performance.now();
     route.chain = route.chain.then(async () => {
-      if (route.closed) return drop("closed", fields);
+      if (route.closed) {
+        if (message.id) this.#takeHandoff(route.session, message.id);
+        reply("dropped", "inbox-closed");
+        return drop("closed", fields);
+      }
       await this.#emit(notification);
       event("delivery.result", { ...fields, outcome: "emitted_to_host", durationMs: performance.now() - started });
     }).catch((error) => {
@@ -331,34 +310,45 @@ export class HermesBridge {
       .finally(() => { route.queued--; this.#queued--; });
   }
 
+  // The receipt callback for a message handed to the plugin, removed so it answers once. A
+  // retired route's handoffs stay a minute, so the plugin's late inbox-closed still reaches them.
+  #takeHandoff(session, id) {
+    for (const route of this.#routes.values()) {
+      const reply = route.session === session && route.handoffs.get(id);
+      if (reply) {
+        route.handoffs.delete(id);
+        return reply;
+      }
+    }
+    const key = `${session}\0${id}`, kept = this.#retiredHandoffs.get(key);
+    this.#retiredHandoffs.delete(key);
+    return kept && kept.expires > Date.now() ? kept.reply : undefined;
+  }
+
+  // The plugin's report of what the host did with a peer_message: accepted, or why not.
+  deliveryResult(params) {
+    if (!params || typeof params.session !== "string" || typeof params.message_id !== "string") return;
+    const reply = this.#takeHandoff(params.session, params.message_id);
+    if (!reply) return;
+    const reason = ["queue-full", "inbox-closed"].includes(params.reason) ? params.reason : "host-rejected";
+    event("delivery.host", { sessionId: logIdentity(params.session), messageId: logIdentity(params.message_id),
+      outcome: params.accepted === true ? "accepted" : "rejected" });
+    return params.accepted === true ? reply("accepted") : reply("dropped", reason);
+  }
+
   async #retire(route) {
     route.closed = true;
     this.#routes.delete(route.key);
-    for (const resolve of route.pending.values()) resolve("closed");
-    route.pending.clear();
-    for (const conn of route.connections) conn.destroy();
-    let owned = false;
-    try {
-      const current = lstatSync(route.socket);
-      owned = current.dev === route.owner.dev && current.ino === route.owner.ino;
-    } catch (error) {
-      if (error.code !== "ENOENT") this.#log(`cannot inspect inbox ownership: ${safeError(error)}`);
+    // listenInbox bound a private temporary name, so closing never unlinks a replacement at the
+    // public path, and the socket is removed only while this route still owns it.
+    await closeInbox(route.inbox);
+    for (const [id, reply] of route.handoffs) {
+      const key = `${route.session}\0${id}`;
+      this.#retiredHandoffs.delete(key);
+      this.#retiredHandoffs.set(key, { reply, expires: Date.now() + RETIRED_HANDOFF_MS });
+      if (this.#retiredHandoffs.size > HANDOFFS_MAX) this.#retiredHandoffs.delete(this.#retiredHandoffs.keys().next().value);
     }
-    if (owned) {
-      // Node closes and unlinks a Unix listener by pathname; do not close it if somebody
-      // replaced that pathname, because Node would also unlink their replacement.
-      await new Promise((resolve) => route.server.close(resolve));
-      try {
-        const current = lstatSync(route.socket);
-        if (current.dev === route.owner.dev && current.ino === route.owner.ino) rmSync(route.socket, { force: true });
-      } catch {}
-    } else {
-      // No longer discoverable at our address; retain the inactive handle until process
-      // exit rather than delete another owner's socket. It cannot keep the process alive.
-      route.server.unref();
-    }
-    route.buckets.clear();
-    route.recent.clear();
+    route.handoffs.clear();
     event("inbox.closed", { sessionId: logIdentity(route.session), targetId: logIdentity(route.address), queueDepth: route.queued });
   }
 
@@ -378,7 +368,8 @@ export class HermesBridge {
 }
 
 // The subprocess protocol is newline-delimited JSON. Stdout is reserved for protocol
-// messages and respects stream backpressure; diagnostic text goes to stderr.
+// messages and respects stream backpressure; diagnostic text goes to stderr. Requests run
+// concurrently (HermesBridge keeps each conversation in order) and responses carry their id.
 export function runHermesBridge() {
   const write = (message) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -392,7 +383,8 @@ export function runHermesBridge() {
     });
   });
   const bridge = new HermesBridge({ emit: write });
-  let buffer = "", queued = 0, chain = Promise.resolve(), stopping = false;
+  const inFlight = new Set();
+  let buffer = "", stopping = false, requests = 0;
   const stop = async (code = 0) => {
     if (stopping) return;
     stopping = true;
@@ -409,6 +401,31 @@ export function runHermesBridge() {
     }
     process.exit(code);
   };
+  const handle = async (raw, parsed) => {
+    let request, id = null;
+    try {
+      request = parsed ?? JSON.parse(raw);
+      if (!request || typeof request !== "object" || Array.isArray(request) || typeof request.method !== "string" || request.method.length > 80) {
+        throw new Error("expected {id, method, params}");
+      }
+      if (!(typeof request.id === "string" && request.id.length > 0 && request.id.length <= 256 || Number.isSafeInteger(request.id))) {
+        throw new Error("expected {id, method, params}");
+      }
+      id = request.id;
+      if (request.method === "shutdown") {
+        // Only earlier requests are in flight here: this one is added after its first await.
+        await Promise.allSettled([...inFlight]);
+        await write({ id, result: { closed: true } });
+        await stop();
+        return;
+      }
+      const result = await bridge.request(request.method, request.params);
+      await write({ id, result });
+    } catch (error) {
+      if (id === null) event("bridge.error", { reason: "malformed" });
+      await write({ id, error: { message: error.message } });
+    }
+  };
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (data) => {
     if (stopping) return;
@@ -417,38 +434,34 @@ export function runHermesBridge() {
     while ((newline = buffer.indexOf("\n")) >= 0) {
       const raw = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
-      if (Buffer.byteLength(raw) + 1 > MAX_LINE || queued >= IPC_QUEUE_MAX) {
-        event("bridge.error", { reason: queued >= IPC_QUEUE_MAX ? "queue_full" : "message_too_large", queueDepth: queued });
+      if (Buffer.byteLength(raw) + 1 > MAX_LINE) {
+        event("bridge.error", { reason: "message_too_large", queueDepth: requests });
         logger("bridge input limit exceeded");
         void stop(1);
         return;
       }
       if (!raw.trim()) continue;
-      queued++;
-      chain = chain.then(async () => {
-        if (stopping) return;
-        let request, id = null;
-        try {
-          request = JSON.parse(raw);
-          if (!request || typeof request !== "object" || Array.isArray(request) ||
-              !(typeof request.id === "string" && request.id.length > 0 && request.id.length <= 256 ||
-                Number.isSafeInteger(request.id)) || typeof request.method !== "string" ||
-              request.method.length > 80) {
-            throw new Error("expected {id, method, params}");
-          }
-          id = request.id;
-          if (request.method === "shutdown") {
-            await write({ id, result: { closed: true } });
-            await stop();
-            return;
-          }
-          const result = await bridge.request(request.method, request.params);
-          await write({ id, result });
-        } catch (error) {
-          if (id === null) event("bridge.error", { reason: "malformed" });
-          await write({ id, error: { message: error.message } });
-        }
-      }).catch((error) => { event("bridge.error", errorFields(error)); logger(safeError(error)); void stop(1); }).finally(() => queued--);
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch {}
+      const notification = parsed && typeof parsed === "object" && !Array.isArray(parsed) && !Object.hasOwn(parsed, "id");
+      // The plugin's one notification needs no response and is handled at once, so a burst of
+      // them never counts toward the limit on requests awaiting a response.
+      if (notification && parsed.method === "delivery_result") {
+        bridge.deliveryResult(parsed.params);
+        continue;
+      }
+      const counted = Boolean(parsed && typeof parsed === "object" && Object.hasOwn(parsed, "id"));
+      if (counted && requests >= IPC_QUEUE_MAX) {
+        event("bridge.error", { reason: "queue_full", queueDepth: requests });
+        logger("bridge input limit exceeded");
+        void stop(1);
+        return;
+      }
+      if (counted) requests++;
+      const task = handle(raw, parsed)
+        .catch((error) => { event("bridge.error", errorFields(error)); logger(safeError(error)); void stop(1); })
+        .finally(() => { inFlight.delete(task); if (counted) requests--; });
+      inFlight.add(task);
     }
     if (Buffer.byteLength(buffer) >= MAX_LINE) {
       event("bridge.error", { reason: "message_too_large" });
@@ -461,7 +474,7 @@ export function runHermesBridge() {
       event("bridge.error", { reason: "malformed" });
       logger("incomplete bridge input at EOF");
       void stop(1);
-    } else void chain.finally(() => stop());
+    } else void Promise.allSettled([...inFlight]).finally(() => stop());
   });
   process.stdin.on("error", (error) => { event("bridge.error", errorFields(error)); void stop(1); });
   process.stdout.on("error", (error) => { event("bridge.error", errorFields(error)); void stop(1); });
