@@ -198,6 +198,31 @@ class BridgeClient:
             with self._lock:
                 self._pending.pop(request_id, None)
 
+    def notify(self, method: str, params: dict) -> bool:
+        """Write one id-less line that gets no response; skipped when the bridge is busy or stopped."""
+        data = (json.dumps({"method": method, "params": params}, ensure_ascii=False) + "\n").encode("utf-8")
+        # The reader thread calls this too, so never wait long for a writer holding the lock.
+        if len(data) > MAX_LINE or not self._write_lock.acquire(timeout=1):
+            return False
+        try:
+            with self._lock:
+                process = self._process
+            if self._stopped or process is None or process.poll() is not None:
+                return False
+            try:
+                self._write(process, data, time.monotonic() + 1)
+            except (TimeoutError, OSError, ValueError):
+                # A partially written frame cannot be reused safely.
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                self._fail_pending(process, _EXITED)
+                return False
+            return True
+        finally:
+            self._write_lock.release()
+
     def _read(self, process):
         try:
             while not self._stopped:
@@ -215,10 +240,14 @@ class BridgeClient:
                 if not isinstance(result, dict):
                     continue
                 if result.get("method") == "peer_message":
+                    params = result.get("params", {})
                     try:
-                        self._messages.put_nowait(result.get("params", {}))
+                        self._messages.put_nowait(params)
                     except Full:
                         logger.warning("agent-peers incoming queue is full; dropped peer message")
+                        if isinstance(params, dict):
+                            self.notify("delivery_result", {"session": params.get("session"), "message_id": params.get("message_id"),
+                                                            "accepted": False, "reason": "queue-full"})
                     continue
                 request_id = result.get("id")
                 if type(request_id) is not int:
