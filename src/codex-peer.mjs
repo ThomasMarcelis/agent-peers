@@ -141,6 +141,13 @@ async function resolveThread(threadId) {
 // configured under another name, is never found here and binds on its first call as before.
 const serverInfo = { name: "agent-peers", version: VERSION, description: `agent-peers inbox ${randomUUID()}` };
 const SCAN_MS = 20_000;
+const introduced = new Set();
+const firstContact = (key) => {
+  if (introduced.has(key)) return false;
+  if (introduced.size >= 4096) introduced.clear();
+  introduced.add(key);
+  return true;
+};
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms).unref());
 const ownedBy = async (id) => (await app.mcpServers(id, "agent-peers")).some((s) => s?.serverInfo?.description === serverInfo.description);
 
@@ -516,8 +523,9 @@ async function send(to, message, meta, trace) {
     if (!from) throw new Error("your root Codex session has no inbox in this peer's directory; ask your root agent to call list_peers or send_peer first");
   } else from = (await inboxFor(caller, directory)).address;
   if (target.address === from) throw new Error("that address is this session's own inbox");
-  // Claude Code frames every peer as "another Claude session", so tell Claude what this is.
-  const body = target.kind === "claude"
+  // Claude Code frames every peer as "another Claude session", so tell Claude what this is, once
+  // per sending thread and recipient: the recipient keeps it in context.
+  const body = target.kind === "claude" && firstContact(`${caller.threadId}\0${target.address}`)
     ? `${message}\n\n(Codex CLI ${caller.subagent ? "subagent; replies reach root" : "peer"}; notify_when_idle unavailable.)`
     : message;
   const line = messageLine({ from, fromName: caller.name, body });

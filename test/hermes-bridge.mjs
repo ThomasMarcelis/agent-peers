@@ -129,6 +129,10 @@ test("private sessions send, receive replies, and remain absent from every regis
   assert.equal(outbound[0].body, "hello Claude\n\n(Hermes profile; notify_when_idle unavailable.)");
   assert.equal(outbound[0].fromName, "hermes:JD");
   assert.equal(outbound[1].body, "hello Codex");
+  await f.send("conversation-a", "claude:test", "again");
+  await f.send("conversation-b", "claude:test", "other conversation");
+  assert.deepEqual(f.messages.slice(2).map((entry) => parseEnvelope(entry.line.message.content).body),
+    ["again", "other conversation\n\n(Hermes profile; notify_when_idle unavailable.)"]);
   assert.equal(peerSocket(first.address), join(f.sockets, first.address.split("/").at(-1)));
   assert.deepEqual(allPeers().map((p) => p.kind), ["claude", "codex"]);
   assert.deepEqual(readdirSync(f.peers), ["codex-test.json"]);

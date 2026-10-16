@@ -59,6 +59,15 @@ export class HermesBridge {
     this.#log = log;
   }
 
+  #introduced = new Set();
+
+  #firstContact(key) {
+    if (this.#introduced.has(key)) return false;
+    if (this.#introduced.size >= 4096) this.#introduced.clear();
+    this.#introduced.add(key);
+    return true;
+  }
+
   async request(method, params = {}) {
     const operationId = randomUUID(), started = performance.now();
     const fields = {
@@ -232,8 +241,9 @@ export class HermesBridge {
     if (!targetSocket) throw new Error("the peer registry contains an invalid inbox address; call list_peers again");
     const route = await this.#bind(session, name, dirname(targetSocket));
     if (target.address === route.address) throw new Error("that address is this conversation's own inbox");
-    // Claude labels every external envelope as another Claude session. Correct that frame.
-    const body = target.kind === "claude"
+    // Claude labels every external envelope as another Claude session. Correct that frame once
+    // per conversation and recipient: the recipient keeps it in context.
+    const body = target.kind === "claude" && this.#firstContact(`${session}\0${target.address}`)
       ? `${message}\n\n(Hermes profile; notify_when_idle unavailable.)`
       : message;
     const line = { ...messageLine({ from: route.address, fromName: name, body }), msg_id: messageId };

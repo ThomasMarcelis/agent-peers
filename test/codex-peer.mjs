@@ -130,6 +130,9 @@ test("compatibility footers are short and only added for known Claude recipients
   await peer.call("send_peer", { to: "claude:test", message: "hello" });
   assert.equal(parseEnvelope(f.messages.at(-1).message.content).body,
     "hello\n\n(Codex CLI peer; notify_when_idle unavailable.)");
+  // Once per recipient: later messages carry only their body.
+  await peer.call("send_peer", { to: "claude:test", message: "again" });
+  assert.equal(parseEnvelope(f.messages.at(-1).message.content).body, "again");
   rmSync(join(f.dir, "claude", "sessions", `${process.pid}.json`));
   // A private reply address need not appear in discovery; do not guess it is Claude.
   await peer.call("send_peer", { to: address(f.inbox), message: "private reply" });

@@ -7,6 +7,7 @@
 - Documented headless Codex workers on a private app-server; the unreachable-thread error now names the app-server in use and the alternatives.
 - Hermes frames carry the message `id` like Codex frames; Hermes sender names are sanitized for any route ID; the dependency recovery command uses `npm install` when the package has no lockfile.
 - The Hermes bridge drops an inbound message whose re-encoded notification would exceed the host's line limit instead of restarting the bridge.
+- The Claude compatibility footer is sent once per sender and recipient instead of on every message.
 - `send_peer` results carry a message ID that matches the `id` on the recipient's frame.
 - Startup-binding scans log `mcpServerStatus/list` instead of an unknown method. The internal observatory design draft is no longer packaged.
 
