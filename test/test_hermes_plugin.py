@@ -190,7 +190,7 @@ def test_peer_frame_carries_a_safe_message_id_for_send_arrival_pairing():
     framed = plugin._frame({**message, "message_id": "4b0c9f7e-1d2a-4c3b-9e8f-0a1b2c3d4e5f"})
     assert 'reply_to="uds:/safe.sock" id="4b0c9f7e-1d2a-4c3b-9e8f-0a1b2c3d4e5f">' in framed
     assert ' id="' not in plugin._frame({**message, "message_id": 'x" onload="y'})
-    assert framed.endswith("Reply via send_peer(to=reply_to, in_reply_to=id). Final text goes to your user.")
+    assert framed.endswith("Reply via send_peer(to=reply_to). Final text goes to your user.")
     threaded = plugin._frame({**message, "message_id": "m-2", "in_reply_to": "m-1"})
     assert 'id="m-2" in_reply_to="m-1">' in threaded
     assert "in_reply_to=\"" not in plugin._frame({**message, "in_reply_to": 'x" y'})

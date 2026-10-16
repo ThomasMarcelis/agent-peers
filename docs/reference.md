@@ -18,7 +18,7 @@ Exit codes: `0` success, `1` runtime/diagnostic failure, `2` invalid CLI usage. 
 
 ## Tools
 
-`list_peers()` takes no arguments. Codex's structured result contains `peers`, each with its name, kind, working directory, available activity status, native/bridge route and `generation`, and `self`, the caller: `{name, kind, address, addresses, generation, threadId, subagent}`. A subagent's address is its root's, and `self` is never in `peers`. The text opens with `You are <name> (<address>).` Native reachability is caller-relative: another root is bridge-only even on the same daemon. Discovery does not load historical Codex threads. Hermes's result is `{peers}` with each row's name, kind, working directory, status, address and `generation`; Hermes itself is unlisted.
+`list_peers()` takes no arguments. Codex's structured result contains `peers`, each with its name, kind, working directory, available activity status, native/bridge route and `generation`, and `self`, the caller: `{name, kind, address, addresses, generation, threadId, subagent}`. A subagent's address is its root's, and `self` is never in `peers`. The text opens with `You are <name>.` Native reachability is caller-relative: another root is bridge-only even on the same daemon. Discovery does not load historical Codex threads. Hermes's result is `{peers}` with each row's name, kind, working directory, status, address and `generation`; Hermes itself is unlisted.
 
 `send_peer({to, message, in_reply_to?})` sends one message:
 
