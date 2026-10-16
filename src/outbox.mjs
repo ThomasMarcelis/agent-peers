@@ -123,7 +123,8 @@ export class Outbox {
     const receipt = readReceipt(line);
     for (const id of receipt?.ids ?? []) {
       const entry = this.#sends.get(id);
-      if (!entry || (receipt.from && receipt.from !== entry.to)) continue;
+      // Only the inbox the message was written to may report on it; Claude's receipts name it too.
+      if (!entry || receipt.from !== entry.to) continue;
       if (!entry.reported) {
         if (receipt.status === "queued") entry.queued = true;
         else if (!entry.outcome) entry.settle(entry.outcome = { status: receipt.status, reason: receipt.reason });

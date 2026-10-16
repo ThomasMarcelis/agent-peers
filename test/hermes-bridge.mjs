@@ -175,7 +175,7 @@ test("one conversation keeps reply inboxes in each peer directory and closes the
   const other = createServer((conn) => readLines(conn, (line) => {
     const sender = peerSocket(parseEnvelope(line.message.content).from);
     assert.equal(dirname(sender), otherDir, "Claude can reply only within its own directory");
-    void post(sender, { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "accepted" });
+    void post(sender, { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, from: address(otherSocket), status: "accepted" });
   }));
   await listen(other, otherSocket, t);
   const first = await f.send("mixed", "claude:test");

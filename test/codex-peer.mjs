@@ -279,6 +279,8 @@ test("no receipt from Claude is honest: unconfirmed, not an error; unknown statu
   assert.equal((await second.call("send_peer", { to: "claude:test", message: "unknown status" })).structuredContent.status, "unconfirmed");
   const forged = await fixture(t, { receipt: { from: "uds:/elsewhere/forged.sock", status: "dropped" } }), third = await forged.start();
   assert.equal((await third.call("send_peer", { to: "claude:test", message: "foreign receipt" })).structuredContent.status, "unconfirmed");
+  const anonymous = await fixture(t, { receipt: { from: undefined, status: "dropped" } }), fourth = await anonymous.start();
+  assert.equal((await fourth.call("send_peer", { to: "claude:test", message: "receipt without from" })).structuredContent.status, "unconfirmed");
 });
 
 test("late held and negative outcomes are appended to the thread without a turn; late successes stay silent", async (t) => {
@@ -455,7 +457,7 @@ test("MCP refresh preserves its primary address and eagerly restores destination
   const destination = join(newer, "claude-new.sock"), received = [];
   const receiver = createServer((connection) => readLines(connection, (line) => {
     received.push(line);
-    void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "accepted" }).catch(() => {});
+    void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, from: address(destination), status: "accepted" }).catch(() => {});
     void post(peerSocket(line.from), messageLine({ from: address(destination), body: "reply through the new alias" })).catch(() => {});
   }));
   try {
@@ -558,7 +560,7 @@ test("refresh takes over prior permitted aliases without live Claude records, an
   const hiddenDir = join(f.dir, "cc-socks"); mkdirSync(hiddenDir, { mode: 0o700 });
   const destination = join(hiddenDir, "hermes-hidden.sock");
   const receiver = createServer((connection) => readLines(connection, (line) => {
-    void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "accepted" }).catch(() => {});
+    void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, from: address(destination), status: "accepted" }).catch(() => {});
   }));
   try {
     await listen(receiver, destination);
