@@ -1,8 +1,13 @@
 name: CI
+# Kept small on purpose: five jobs per run. Pull requests run CI; pushes run only on main,
+# because the release workflow requires a successful run for the exact tagged commit.
+# Docs-only changes skip CI; run it manually with `gh workflow run ci.yml --ref <branch-or-tag>`.
 on:
   push:
-    branches: [main, 'release/**']
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
   pull_request:
+    paths-ignore: ['**/*.md', 'docs/**']
   workflow_dispatch:
 permissions:
   contents: read
@@ -15,8 +20,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        node: [22, 24, 26]
+        include:
+          - os: ubuntu-latest
+            node: 22
+            audit: true
+          - os: ubuntu-latest
+            node: 26
+          - os: macos-latest
+            node: 24
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
@@ -29,14 +40,12 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run test:package
-      - run: npm audit --omit=dev --audit-level=high
+      - if: matrix.audit
+        run: npm audit --omit=dev --audit-level=high
   python:
-    name: Python ${{ matrix.python }}
+    name: Python 3.11 and 3.13
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      matrix:
-        python: ['3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -45,10 +54,18 @@ jobs:
           cache: npm
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python }}
+          python-version: |
+            3.11
+            3.13
       - run: npm ci --ignore-scripts
-      - run: python -m pip install 'pytest>=8,<10' 'pytest-asyncio>=0.24,<2'
-      - run: python -m pytest -q
+      - name: Test the oldest and newest supported Python
+        run: |
+          for python in python3.11 python3.13; do
+            echo "::group::$python"
+            "$python" -m pip install 'pytest>=8,<10' 'pytest-asyncio>=0.24,<2'
+            "$python" -m pytest -q
+            echo "::endgroup::"
+          done
   hermes:
     name: Hermes pinned host
     runs-on: ubuntu-latest
