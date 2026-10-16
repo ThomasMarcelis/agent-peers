@@ -1,0 +1,82 @@
+name: Release
+# One job. It does not re-run the CI matrix: the tagged commit must already have a successful CI run.
+# npm authenticates through trusted publishing (OIDC); no npm token is stored in the repository.
+on:
+  push:
+    tags: ['v*.*.*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    name: Publish ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Require a successful CI run for the tagged commit
+        run: |
+          commit=$(git rev-parse HEAD)
+          passed=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$commit&status=success&per_page=1" --jq '.total_count')
+          if [ "$passed" -eq 0 ]; then
+            echo "::error::No successful CI run for $commit ($TAG). Run CI on the tag with 'gh workflow run ci.yml --repo $GITHUB_REPOSITORY --ref $TAG', wait for it to pass, then re-run this workflow with 'gh run rerun $GITHUB_RUN_ID --repo $GITHUB_REPOSITORY'."
+            exit 1
+          fi
+          echo "CI passed for $commit."
+      - name: Check tag, package and plugin versions and changelog notes
+        run: node scripts/release-check.mjs "$TAG" "$RUNNER_TEMP/release-notes.md"
+      - name: Use npm with trusted publishing support
+        run: |
+          if ! node -e 'const [a, b, c] = process.argv[1].split(".").map(Number); process.exit(a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1))) ? 0 : 1)' "$(npm --version)"; then
+            npm install --global npm@11
+          fi
+          npm --version
+      - run: npm ci --ignore-scripts
+      - run: npm run test:package
+      - name: Publish to npm with provenance
+        # CI already ran check, tests and Python tests for this commit; prepublishOnly is the local-publish gate.
+        run: |
+          version="${TAG#v}"
+          if npm view "agent-peers@$version" version >/dev/null 2>&1; then
+            echo "agent-peers@$version is already on npm; skipping publish."
+            exit 0
+          fi
+          dist_tag=latest
+          case "$version" in *-*) dist_tag=next ;; esac
+          npm publish --provenance --access public --tag "$dist_tag" --ignore-scripts
+      - name: Verify the version is on the registry
+        run: |
+          version="${TAG#v}"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if [ "$(npm view "agent-peers@$version" version 2>/dev/null)" = "$version" ]; then
+              echo "agent-peers@$version is on npm."
+              exit 0
+            fi
+            echo "Waiting for registry propagation (attempt $attempt)."
+            sleep 15
+          done
+          echo "::error::agent-peers@$version is not visible on npm after publishing."
+          exit 1
+      - name: Create the GitHub release from the changelog
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving it unchanged."
+            exit 0
+          fi
+          prerelease=()
+          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "agent-peers ${TAG#v}" --notes-file "$RUNNER_TEMP/release-notes.md" "${prerelease[@]}"

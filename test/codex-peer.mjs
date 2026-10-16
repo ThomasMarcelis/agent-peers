@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { once } from "node:events";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as httpServer } from "node:http";
 import { connect, createServer } from "node:net";
@@ -11,6 +10,7 @@ import { WebSocketServer } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { address, messageLine, parseEnvelope, peerSocket, post, readLines } from "../src/wire.mjs";
+import { closeServer, listen } from "./listeners.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const thread = "01900000-0000-0000-0000-123456789abc";
@@ -36,9 +36,19 @@ async function fixture(t, options = {}) {
     void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id,
       status: options.receiptStatus ?? "delivered" }).catch(() => {});
   }));
-  receiver.listen(inbox); await once(receiver, "listening");
-  writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "test", cwd: dir, messagingSocketPath: inbox }));
   const http = httpServer(), wss = new WebSocketServer({ server: http });
+  // Registered before anything listens, so a failure below cannot leave a handle open.
+  t.after(async () => {
+    await Promise.all(clients.map(({ close }) => close()));
+    for (const ws of wss.clients) ws.terminate();
+    await new Promise((resolve) => wss.close(resolve));
+    await closeServer(http);
+    await closeServer(receiver);
+    for (const [key, value] of Object.entries(before)) value === undefined ? delete process.env[key] : process.env[key] = value;
+    rmSync(dir, { recursive: true, force: true });
+  });
+  await listen(receiver, inbox);
+  writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "test", cwd: dir, messagingSocketPath: inbox }));
   const reply = (ws, message, result) => ws.send(JSON.stringify({ id: message.id, result }));
   let hold = !!options.hold;
   wss.on("connection", (ws) => ws.on("message", (data) => {
@@ -68,27 +78,19 @@ async function fixture(t, options = {}) {
       else reply(ws, message, {});
     }
   }));
-  http.listen(daemon); await once(http, "listening");
+  await listen(http, daemon);
   const start = async (extraEnv = {}) => {
     const transport = new StdioClientTransport({ command: process.execPath, args: [join(root, "src", "codex-peer.mjs")],
       env: { ...process.env, CLAUDE_CONFIG_DIR: claude, AGENT_PEERS_HOME: peers, AGENT_PEERS_CODEX_APP_SERVER: daemon,
         AGENT_PEERS_DEBUG: options.logging ? "1" : "0", AGENT_PEERS_LOG: "", ...extraEnv }, stderr: "pipe" });
     const client = new Client({ name: "test", version: "1" });
     transport.stderr.resume();
-    await client.connect(transport);
     const close = () => client.close();
+    // Tracked before connecting: a failed handshake must still stop the child process.
     clients.push({ client, close });
+    await client.connect(transport);
     return { client, transport, close, call: (name, args = {}, id = thread) => client.callTool({ name, arguments: args, _meta: { threadId: id } }) };
   };
-  t.after(async () => {
-    await Promise.all(clients.map(({ close }) => close()));
-    for (const ws of wss.clients) ws.terminate();
-    await new Promise((resolve) => wss.close(resolve));
-    await new Promise((resolve) => http.close(resolve));
-    await new Promise((resolve) => receiver.close(resolve));
-    for (const [key, value] of Object.entries(before)) value === undefined ? delete process.env[key] : process.env[key] = value;
-    rmSync(dir, { recursive: true, force: true });
-  });
   return { dir, peers, sockets, inbox, messages, turns, reads, start, mcpServers, statusCalls,
     registry: join(peers, `codex-${thread}.json`),
     release: () => { hold = false; held.splice(0).forEach((release) => release()); } };
@@ -377,8 +379,8 @@ test("MCP refresh preserves its primary address and eagerly restores destination
     void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "delivered" }).catch(() => {});
     void post(peerSocket(line.from), messageLine({ from: address(destination), body: "reply through the new alias" })).catch(() => {});
   }));
-  receiver.listen(destination); await once(receiver, "listening");
   try {
+    await listen(receiver, destination);
     // Preserve the old directory's verified record, while a lexically earlier registry
     // switches the preferred directory before the replacement MCP process starts.
     const claude = join(f.dir, "claude", "sessions");
@@ -409,21 +411,22 @@ test("MCP refresh preserves its primary address and eagerly restores destination
     for (const addr of record.addresses) assert.equal(existsSync(addr.slice(4)), false);
     assert.deepEqual(readdirSync(f.sockets), ["claude.sock"]);
     assert.deepEqual(readdirSync(newer), ["claude-new.sock"]);
-  } finally { await new Promise((resolve) => receiver.close(resolve)); }
+  } finally { await closeServer(receiver); }
 });
 
 test("an unverified listener at the deterministic inbox pathname is never overwritten", async (t) => {
   const f = await fixture(t), socket = join(f.sockets, `codex-${thread.replace(/-/g, "").slice(-16)}.sock`);
-  const occupied = createServer(); occupied.listen(socket); await once(occupied, "listening");
-  const identity = lstatSync(socket);
+  const occupied = createServer();
   try {
+    await listen(occupied, socket);
+    const identity = lstatSync(socket);
     const peer = await f.start();
     const result = await peer.call("send_peer", { to: "claude:test", message: "hello" });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /unverified listener/);
     assert.equal(lstatSync(socket).ino, identity.ino);
     assert.equal(existsSync(f.registry), false);
-  } finally { await new Promise((resolve) => occupied.close(resolve)); }
+  } finally { await closeServer(occupied); }
 });
 
 
@@ -475,8 +478,8 @@ test("refresh takes over prior permitted aliases without live Claude records, an
   const receiver = createServer((connection) => readLines(connection, (line) => {
     void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "delivered" }).catch(() => {});
   }));
-  receiver.listen(destination); await once(receiver, "listening");
   try {
+    await listen(receiver, destination);
     const old = await f.start(); await old.call("list_peers");
     await old.call("send_peer", { to: address(destination), message: "create a non-live-directory alias" });
     const previous = JSON.parse(readFileSync(f.registry, "utf8"));
@@ -495,14 +498,14 @@ test("refresh takes over prior permitted aliases without live Claude records, an
     await until(() => f.turns.length === 2);
     const result = await current.call("send_peer", { to: address(destination), message: "after alias repair" });
     assert.match(result.content[0].text, /Delivered/);
-  } finally { await new Promise((resolve) => receiver.close(resolve)); }
+  } finally { await closeServer(receiver); }
 });
 
 test("a replacement appearing between repair validation and publication is never overwritten", async (t) => {
   const f = await fixture(t), marker = join(f.dir, "race"), contenderPath = join(f.sockets, "contender.sock");
   const socket = join(f.sockets, `codex-${thread.replaceAll("-", "").slice(-16)}.sock`);
   const contender = createServer((connection) => connection.end());
-  contender.listen(contenderPath); await once(contender, "listening");
+  await listen(contender, contenderPath, t);
   const original = lstatSync(contenderPath);
   const preload = join(f.dir, "race.mjs");
   writeFileSync(preload, `
@@ -532,6 +535,33 @@ test("a replacement appearing between repair validation and publication is never
     assert.equal(lstatSync(socket).ino, original.ino, "failed repair cleanup preserves the competitor");
   } finally {
     rmSync(socket, { force: true });
-    await new Promise((resolve) => contender.close(resolve));
+    await closeServer(contender);
   }
+});
+
+// Documents current behaviour, not the intended design: issue #19 asks for either several roots
+// per process or a clear refusal of the second. When that lands, this test must change with it.
+test("alternating tool calls from two root threads on one process unbind each other (issue #19)", async (t) => {
+  const other = "01900000-0000-0000-0000-00000000beef";
+  const f = await fixture(t, { loaded: [thread, other] }), peer = await f.start();
+  const otherRegistry = join(f.peers, `codex-${other}.json`);
+  const record = (registry) => JSON.parse(readFileSync(registry, "utf8"));
+  await peer.call("list_peers", {}, thread);
+  const first = record(f.registry), firstSocket = peerSocket(first.address);
+  assert.equal(lstatSync(firstSocket).isSocket(), true);
+  await peer.call("list_peers", {}, other);
+  const second = record(otherRegistry), secondSocket = peerSocket(second.address);
+  assert.notEqual(second.address, first.address);
+  assert.equal(existsSync(f.registry), false, "the second root's call removed the first root's registry");
+  assert.equal(existsSync(firstSocket), false, "and closed the first root's inbox");
+  await assert.rejects(post(firstSocket, messageLine({ from: address(f.inbox), body: "to the unbound root" })), /ENOENT/);
+  const sent = await peer.call("send_peer", { to: "claude:test", message: "from the first root again" }, thread);
+  assert.match(sent.content[0].text, /Delivered/);
+  assert.equal(parseEnvelope(f.messages.at(-1).message.content).from, first.address, "the first root rebinds its address");
+  assert.notEqual(record(f.registry).token, first.token);
+  assert.equal(existsSync(otherRegistry), false, "and in turn unbinds the second root");
+  assert.equal(existsSync(secondSocket), false);
+  await post(firstSocket, messageLine({ from: address(f.inbox), body: "after rebinding" }));
+  await until(() => f.turns.length === 1);
+  assert.equal(f.turns[0].threadId, thread);
 });

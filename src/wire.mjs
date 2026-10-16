@@ -6,7 +6,8 @@
 // Claude Code does not document this line format; test/contract.mjs pins it.
 
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
@@ -114,8 +115,22 @@ function refreshDirectoryScope() {
   const scope = JSON.stringify([resolve(claudeHome()), resolve(peersHome()), process.env.XDG_RUNTIME_DIR, tmpdir()]);
   if (directoryScope !== scope) { directoryScope = scope; observedDirectories.clear(); }
 }
+// Rereading every Claude record per peerSocket call made a listing quadratic. Within one
+// discovery call the verified set is scanned once and reused; nothing is cached across calls,
+// and every permittedSocketDirectory use still rechecks the directory with safeDirectory.
+let discoveryScope;
+export function inDiscoveryScope(fn) {
+  if (discoveryScope) return fn();
+  discoveryScope = {};
+  try { return fn(); } finally { discoveryScope = undefined; }
+}
 function verifiedSocketDirectories() {
   refreshDirectoryScope();
+  if (!discoveryScope) return freshVerifiedDirectories();
+  discoveryScope.live ??= freshVerifiedDirectories();
+  return new Set(discoveryScope.live);
+}
+function freshVerifiedDirectories() {
   const live = new Set(claudeRecords().map((session) => dirname(session.messagingSocketPath)));
   for (const dir of live) {
     try {
@@ -131,7 +146,8 @@ function verifiedSocketDirectories() {
 
 // Enumerate only directories verified in this registry scope. Standard host directories
 // remain valid explicit destinations, but must not create cross-profile eager aliases.
-export function socketDirectories() {
+export const socketDirectories = () => inDiscoveryScope(listSocketDirectories);
+function listSocketDirectories() {
   const live = verifiedSocketDirectories();
   return [...new Set([...live, ...observedDirectories.keys()])].filter(permittedSocketDirectory);
 }
@@ -180,7 +196,8 @@ export function socketPath(addr) {
 }
 
 // Live Claude sessions from Claude's public session registry (never its key files).
-export function claudeSessions() {
+export const claudeSessions = () => inDiscoveryScope(listClaudeSessions);
+function listClaudeSessions() {
   return claudeRecords().flatMap((s) => {
     if (!peerSocket(address(s.messagingSocketPath))) return [];
     return [{ kind: "claude", name: `claude:${s.name ?? s.pid}`, address: address(s.messagingSocketPath),
@@ -193,7 +210,8 @@ export function isSafePeerRecord(p) {
     validThreadId(p.threadId) && (p.cwd === undefined || safeText(p.cwd, 4096)) && !!peerSocket(p.address);
 }
 
-export function codexPeers() {
+export const codexPeers = () => inDiscoveryScope(listCodexPeers);
+function listCodexPeers() {
   const dir = resolve(peersHome());
   let files;
   try { safeDirectory(dir, true); files = readdirSync(dir); } catch { return []; }
@@ -210,7 +228,60 @@ export function codexPeers() {
   return out;
 }
 
-export const allPeers = () => [...claudeSessions(), ...codexPeers()];
+// One listing shares a single directory scan across its rows.
+export function allPeers() {
+  return inDiscoveryScope(() => [...claudeSessions(), ...codexPeers()]);
+}
+
+// Process ancestry of this process, nearest parent first. Linux reads /proc; elsewhere ps.
+export function ancestorPids(start = process.ppid, limit = 64) {
+  const out = [];
+  let pid = start;
+  while (validPid(pid) && pid > 1 && out.length < limit && !out.includes(pid)) {
+    out.push(pid);
+    pid = parentPid(pid);
+  }
+  return out;
+}
+
+function parentPid(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+  } catch {}
+  try {
+    const out = execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
+    return Number(out.trim());
+  } catch { return NaN; }
+}
+
+// The calling session: the nearest ancestor that owns a live Claude registry record, else a
+// Codex inbox record. Never guessed from the working directory.
+export function whoami(ancestors = ancestorPids()) {
+  const peers = allPeers();
+  for (const pid of ancestors) {
+    const found = peers.find((p) => p.pid === pid);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+// Connect without sending data: a refused or missing socket marks the row stale. A short
+// timeout means a wedged listener is reported reachable only if it accepted the connection.
+export function probe(socket, timeoutMs = 200) {
+  return new Promise((resolve) => {
+    let done = false;
+    const c = connect(socket);
+    const finish = (ok) => { if (!done) { done = true; clearTimeout(timer); c.destroy(); resolve(ok); } };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    c.on("connect", () => finish(true));
+    c.on("error", () => finish(false));
+  });
+}
+
+export async function probePeers(peers, timeoutMs = 200) {
+  return Promise.all(peers.map(async (p) => ({ ...p, reachable: p.socket ? await probe(p.socket, timeoutMs) : false })));
+}
 
 // Claude rejects an envelope unless it re-renders byte for byte, and its renderer
 // escapes any closing tag in the body as `<\`. Do the same, tolerating the
@@ -273,7 +344,9 @@ export function post(socket, line) {
     };
     const timer = setTimeout(() => finish(new Error("peer inbox did not accept the message within 5 s")), 5000);
     c.on("error", finish);
-    c.on("connect", () => c.end(data, () => finish()));
+    // end() reports a failed write (EPIPE when the peer closes mid-write) to its callback
+    // before the "error" event; ignoring it would report an undelivered line as delivered.
+    c.on("connect", () => c.end(data, (error) => finish(error)));
     c.on("close", () => finish(new Error("peer inbox closed before accepting the message")));
   });
 }

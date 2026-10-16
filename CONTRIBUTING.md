@@ -21,8 +21,10 @@ Portable Python checks need Python 3.11–3.13:
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install 'pytest>=8,<10' 'pytest-asyncio>=0.24,<2'
-.venv/bin/python -m pytest -q
+npm run test:python
 ```
+
+`npm run test:python` uses `$AGENT_PEERS_PYTHON`, else `.venv/bin/python`, else `python3`, and fails with setup instructions when pytest or pytest-asyncio is missing. `npm publish` runs it through `prepublishOnly`, together with `check`, `test` and `test:package`.
 
 For host integration, use the exact fork revision in [compatibility](docs/compatibility.md), install its test prerequisites, and run its `scripts/run_tests.sh` with the absolute path to this repository's `test/test_hermes_host.py` with `-m hermes_integration`. CI does this against a separate checkout. Tests cover real discovery, profile isolation, native dispatcher result serialization, and Discord thread returns.
 
@@ -45,11 +47,15 @@ Explain the concrete behavior change and include the checks you ran. Add a regre
 
 Treat installed integrations as production infrastructure. Develop and test in a separate checkout, with isolated discovery registries. Never edit a checkout referenced by live MCP commands, global npm links, or Hermes plugin symlinks. Deploy a tested snapshot through the host's supported lifecycle; preserve agent conversations and verify real replies after a transport update.
 
-1. Synchronize package and plugin versions and update the changelog.
-2. Run local checks, the CI matrix, and live checks for advertised integrations.
-3. Audit `npm pack --dry-run` and repository history for unintended files or secrets.
-4. Publish the reviewed commit to npm and tag the same revision on GitHub.
-5. Attach the packed artifact and SHA-256 checksum; verify a fresh install from npm.
-6. Record compatibility evidence. Do not claim an untested agent build is supported.
+### Releasing
+
+GitHub Actions ([`release.yml`](.github/workflows/release.yml)) publishes to npm when a `v*.*.*` tag is pushed. Do not run `npm publish` locally.
+
+1. On a branch, set the same version in `package.json`, `package-lock.json`, `plugin.yaml` and `hermes-plugin/plugin.yaml`, and add a `## <version> — <date>` section to `CHANGELOG.md`. That section becomes the GitHub release notes.
+2. Run the local checks and the live checks for advertised integrations. Audit `npm pack --dry-run` and the history for unintended files or secrets.
+3. Merge the pull request, wait for CI to pass on the resulting `main` commit, then tag that commit and push the tag: `git tag v<version> <commit> && git push origin v<version>`.
+4. The release job requires a successful CI run for the tagged commit and does not re-run the matrix. If there is none (CI skipped a docs-only commit, or a newer push cancelled it), run `gh workflow run ci.yml --ref v<version>`, wait for it to pass, and re-run the release job.
+5. The job checks the tag against the package and plugin versions, runs `npm run test:package`, publishes with npm provenance through trusted publishing (no npm token), waits until `npm view agent-peers@<version> version` answers, and creates the GitHub release from the changelog section unless one already exists. Versions with a prerelease suffix go to the `next` dist-tag and become GitHub prereleases. Re-running the job after a partial failure skips what already happened.
+6. Verify a fresh install from npm and record compatibility evidence. Do not claim an untested agent build is supported.
 
 A Hermes catalog entry is separate from a GitHub/npm release and requires upstream review. Do not submit one while required host APIs are unavailable upstream.

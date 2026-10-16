@@ -5,7 +5,8 @@
 | Command | Output |
 | --- | --- |
 | `agent-peers list` | Sessions with exact Claude `SendMessage` and Codex `send_peer` targets |
-| `agent-peers list --json` | `{ "peers": [...] }`; no status text mixed into stdout |
+| `agent-peers list --json` | `{ "peers": [...] }`; no status text mixed into stdout. Each peer socket gets a short (200 ms) connect probe with no data sent; a refusing socket is shown as `stale` and has `reachable: false`. Records are never deleted. `--no-probe` skips the probe and omits `reachable` |
+| `agent-peers whoami [--json]` | The calling session's name and `uds:` address, found by walking process ancestry to a PID with a Claude session record (or a Codex inbox record). Exits 1 outside a session; never guesses by working directory |
 | `agent-peers doctor [--json]` | Runtime, dependency, and local path checks, plus one read-only request to the Codex app-server to confirm it answers; does not modify configuration, start servers, or send messages |
 | `agent-peers logs [--json]` | Read-only summary of retained local diagnostic events |
 | `agent-peers --version` | Package version |

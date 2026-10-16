@@ -2,6 +2,15 @@
 
 Raw live transcripts are excluded from the repository and package.
 
+## 0.3.0
+
+Verified on 2026-10-16 on Linux with Node 22.23.1. CI on Linux and macOS gates the release job:
+
+- Deterministic suites: 113 JavaScript tests, including new transport edge cases (post timeout, refused and closed-before-accept connections, idle timeout, oversized app-server frames); 27 Python tests; the packed npm artifact installed and completed an MCP handshake.
+- Live on the maintainer's machine: `agent-peers whoami` identified the calling Claude Code session; `agent-peers list` probed four live Claude inboxes.
+
+Transport behaviour otherwise matches 0.2.0. That release was deployed locally and verified end to end, including a Hermes ↔ Claude round trip through a fresh 0.2.0 bridge.
+
 ## 0.2.0
 
 Verified on 2026-10-16 with Node 22.23.1 and Codex CLI 0.162.1 on Linux, plus CI on Linux and macOS:
