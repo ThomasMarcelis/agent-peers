@@ -1,16 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-16
 
-- A delivery to a peer that closes its connection mid-write is reported as failed instead of delivered.
+First npm release since 0.1.0. Versions 0.1.1 and 0.2.0 were released on GitHub only, and their changes are included here. From this version on, npm releases are published from CI with provenance.
 
-- `agent-peers whoami [--json]` reports the calling Claude Code (or Codex) session's name and address through process ancestry. Adding the caller to Codex `list_peers` is still to do.
+- `agent-peers whoami [--json]` reports the calling Claude Code session's name and address, found through process ancestry rather than guessed from the working directory.
 - `agent-peers list` probes each peer socket and marks refusing sockets `stale` / `reachable: false` without deleting records; `--no-probe` skips this.
-- Peer discovery scans Claude session records once per listing instead of once per peer (about 105 ms to 5 ms for 120 peers).
+- Peer discovery scans Claude session records once per listing instead of once per peer (about 110 ms to 5 ms for 120 peers).
+- A delivery to a peer that closes its connection mid-write is reported as failed instead of delivered.
+- Releases publish from a single CI job on version tags, after the tagged commit has passed CI; CI runs five jobs instead of ten.
 
 ## 0.2.0 — 2026-10-16
 
-First npm release since 0.1.0: 0.1.1 was tagged on GitHub but never published to npm, and its changes are included here.
+GitHub release only; not published to npm.
 
 - `agent-peers doctor` asks the Codex app-server one read-only question instead of trusting socket presence, and reports a stale daemon link or a server that does not answer, with the start command.
 - Startup binding backs off to every 10 minutes after its quick retries and logs each failure reason once, plus one `unreachable` event and stderr line, instead of every minute forever.
