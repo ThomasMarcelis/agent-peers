@@ -8,7 +8,7 @@ import { WebSocketServer } from "ws";
 import { AppServer } from "../src/app-server.mjs";
 import { closeServer, listen } from "./listeners.mjs";
 
-async function fixture(t, handler, onNotification) {
+async function fixture(t, handler, onNotification, options = {}) {
   const dir = mkdtempSync(join(tmpdir(), "ap-app-")), path = join(dir, "daemon.sock");
   const http = createServer(), wss = new WebSocketServer({ server: http });
   const before = process.env.AGENT_PEERS_CODEX_APP_SERVER;
@@ -23,7 +23,7 @@ async function fixture(t, handler, onNotification) {
       handler?.(ws, message, connections);
     });
   });
-  const app = new AppServer(onNotification, { handshakeTimeoutMs: 60 });
+  const app = new AppServer(onNotification, { handshakeTimeoutMs: 60, ...options });
   // Registered before listening, so a failed assertion cannot leave the daemon open.
   t.after(async () => {
     app.close();
@@ -117,22 +117,23 @@ test("a JSON-RPC request from the server reaches the notification callback and c
   assert.equal(await f.app.request("next", {}), "ok", "the connection stays usable");
 });
 
-test("approvals are left to a human client; capabilities agent-peers never set up are refused at once", async (t) => {
-  const answers = [];
+// Server requests fan out and the first answer wins, so any answer, even "unsupported", could
+// override the client that owns the request (openai/codex#35894).
+test("server requests are logged by method and never answered", async (t) => {
+  const answers = [], logged = [];
+  const log = (component, event, fields) => { if (event === "server_request") logged.push(fields.method); };
+  const methods = ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "mcpServer/elicitation/request",
+    "item/tool/call", "account/chatgptAuthTokens/refresh", "attestation/generate", "execCommandApproval"];
   const f = await fixture(t, (ws, message) => {
     if (message.method === "initialize") reply(ws, message, {});
     else if (message.method === "go") {
-      for (const [id, method] of [[901, "item/commandExecution/requestApproval"], [902, "item/fileChange/requestApproval"],
-        [903, "mcpServer/elicitation/request"], [904, "item/tool/call"], [905, "account/chatgptAuthTokens/refresh"],
-        [906, "attestation/generate"], [907, "execCommandApproval"]]) {
-        ws.send(JSON.stringify({ id, method, params: { threadId: "t", turnId: "u" } }));
-      }
+      for (const [index, method] of methods.entries()) ws.send(JSON.stringify({ id: 900 + index, method, params: { threadId: "t", turnId: "u" } }));
       setTimeout(() => reply(ws, message, "done"), 30);
     } else if (!message.method) answers.push(message);
-  });
+  }, undefined, { log });
   assert.equal(await f.app.request("go", {}), "done");
-  assert.deepEqual(answers.map((m) => [m.id, m.error?.code]), [[904, -32601], [905, -32601], [906, -32601]]);
-  assert.ok(answers.every((m) => !Object.hasOwn(m, "result")), "never a decision or token");
+  assert.deepEqual(answers, []);
+  assert.deepEqual(logged, methods);
 });
 
 test("a frame over the 4 MiB maxPayload fails pending work promptly and a later call reconnects", async (t) => {

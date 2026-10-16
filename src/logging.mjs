@@ -32,7 +32,10 @@ const outcomes = new Set(["started", "succeeded", "failed", "success", "error", 
   "skipped", "closed", "accepted", "bound", "unbound", "native_only", "degraded", "receipt_unavailable", "unreachable",
   "delivered", "denied", "expired", "refused", "unconfirmed"]);
 const methods = new Set(["list_peers", "send_peer", "close_session", "shutdown", "initialize", "initialized", "thread/loaded/list",
-  "thread/read", "thread/resume", "turn/start", "turn/steer", "thread/inject_items", "mcpServerStatus/list",
+  "thread/read", "turn/start", "thread/inject_items", "mcpServerStatus/list",
+  // The app-server's requests to clients (0.162.1), which agent-peers logs and never answers.
+  "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval",
+  "mcpServer/elicitation/request", "item/tool/requestUserInput", "applyPatchApproval", "execCommandApproval",
   "item/tool/call", "account/chatgptAuthTokens/refresh", "attestation/generate", "unknown"]);
 const codes = new Set(["ENOENT", "EACCES", "EPERM", "ELOOP", "ENOTDIR", "EISDIR", "ENOSPC", "EDQUOT", "EROFS", "EMFILE",
   "ENFILE", "EPIPE", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ERR_SOCKET_CLOSED", "ERR_INVALID_ARG_TYPE",

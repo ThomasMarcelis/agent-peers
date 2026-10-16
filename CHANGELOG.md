@@ -25,7 +25,7 @@ One delivery protocol for Codex, Hermes and Claude Code peers. See [the referenc
 
 - One Codex MCP process serves up to eight root sessions, each with its own inbox, instead of rebinding to the latest (#19). `codex-peer` is split into binding, inbox and tool modules (#16).
 - The Hermes bridge handles requests concurrently, keeping order per conversation (#17).
-- agent-peers answers only the app-server requests it can never be the target of (dynamic tools, token refresh, attestation) with "method not supported", and never answers approval or input requests (#25).
+- agent-peers never answers an app-server request (approvals, user input, dynamic tools, token refresh, attestation). These fan out to every client and the first answer wins, so an answer could override the client that owns the request. Each is logged by method (#25).
 - Tested on Claude Code 2.1.302 and Codex 0.162.1.
 
 ## 0.3.0 — 2026-10-16

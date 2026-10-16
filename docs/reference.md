@@ -69,7 +69,7 @@ An error status means the message was definitely not delivered. Nothing is retri
 
 **Names.** Automatic names are `<kind>:<label>`, where the label uses letters, digits and `_ . : -`. Other characters in Claude session names and Codex labels become `-`. Names of the form `<kind>:<scope>/<claim>` are reserved for explicit claims in a later release, so any name containing `/` fails `reserved-name`. `@ * ? ,` and whitespace fail `invalid-request` and will never mean patterns or broadcast. The `names/` directory under `AGENT_PEERS_HOME` is reserved; nothing reads or writes it yet.
 
-**Codex app-server requests.** The app-server sends some requests to every connected client, and the first answer wins. agent-peers answers only requests it can never be the target of: dynamic tool calls, ChatGPT token refresh and attestation, each with "method not supported". It never answers approval or user-input requests, which wait for a human client as they would without agent-peers.
+**Codex app-server requests.** The app-server sends its requests (approvals, user input, dynamic tool calls, token refresh, attestation) to every connected client, and the first answer wins. agent-peers never answers one, so each waits for the client that owns it, as it would without agent-peers. With diagnostics enabled, each is logged as `server_request` with its method.
 
 ## Environment
 
