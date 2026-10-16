@@ -375,7 +375,7 @@ export function runHermesBridge() {
   });
   const bridge = new HermesBridge({ emit: write });
   const inFlight = new Set();
-  let buffer = "", stopping = false;
+  let buffer = "", stopping = false, requests = 0;
   const stop = async (code = 0) => {
     if (stopping) return;
     stopping = true;
@@ -392,15 +392,13 @@ export function runHermesBridge() {
     }
     process.exit(code);
   };
-  const handle = async (raw) => {
+  const handle = async (raw, parsed) => {
     let request, id = null;
     try {
-      request = JSON.parse(raw);
+      request = parsed ?? JSON.parse(raw);
       if (!request || typeof request !== "object" || Array.isArray(request) || typeof request.method !== "string" || request.method.length > 80) {
         throw new Error("expected {id, method, params}");
       }
-      // The plugin's one notification: no id, no response.
-      if (request.method === "delivery_result" && !Object.hasOwn(request, "id")) return bridge.deliveryResult(request.params);
       if (!(typeof request.id === "string" && request.id.length > 0 && request.id.length <= 256 || Number.isSafeInteger(request.id))) {
         throw new Error("expected {id, method, params}");
       }
@@ -427,16 +425,33 @@ export function runHermesBridge() {
     while ((newline = buffer.indexOf("\n")) >= 0) {
       const raw = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
-      if (Buffer.byteLength(raw) + 1 > MAX_LINE || inFlight.size >= IPC_QUEUE_MAX) {
-        event("bridge.error", { reason: inFlight.size >= IPC_QUEUE_MAX ? "queue_full" : "message_too_large", queueDepth: inFlight.size });
+      if (Buffer.byteLength(raw) + 1 > MAX_LINE) {
+        event("bridge.error", { reason: "message_too_large", queueDepth: requests });
         logger("bridge input limit exceeded");
         void stop(1);
         return;
       }
       if (!raw.trim()) continue;
-      const task = handle(raw)
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch {}
+      const notification = parsed && typeof parsed === "object" && !Array.isArray(parsed) && !Object.hasOwn(parsed, "id");
+      // The plugin's one notification needs no response and is handled at once, so a burst of
+      // them never counts toward the limit on requests awaiting a response.
+      if (notification && parsed.method === "delivery_result") {
+        bridge.deliveryResult(parsed.params);
+        continue;
+      }
+      const counted = Boolean(parsed && typeof parsed === "object" && Object.hasOwn(parsed, "id"));
+      if (counted && requests >= IPC_QUEUE_MAX) {
+        event("bridge.error", { reason: "queue_full", queueDepth: requests });
+        logger("bridge input limit exceeded");
+        void stop(1);
+        return;
+      }
+      if (counted) requests++;
+      const task = handle(raw, parsed)
         .catch((error) => { event("bridge.error", errorFields(error)); logger(safeError(error)); void stop(1); })
-        .finally(() => inFlight.delete(task));
+        .finally(() => { inFlight.delete(task); if (counted) requests--; });
       inFlight.add(task);
     }
     if (Buffer.byteLength(buffer) >= MAX_LINE) {

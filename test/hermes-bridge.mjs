@@ -617,9 +617,29 @@ test("IPC rejects malformed request ids without echoing untrusted objects", asyn
   assert.deepEqual(lines.at(-1), { id: "done", result: { closed: true } });
 });
 
+test("IPC delivery_result notifications never count toward the request limit", { timeout: 10_000 }, async (t) => {
+  const f = await fixture(t);
+  const child = spawn(process.execPath, [join(root, "bin", "agent-peers.mjs"), "hermes-bridge"], {
+    env: { ...process.env, AGENT_PEERS_CODEX_APP_SERVER: join(f.dir, "missing.sock") }, stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  child.stderr.resume();
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (data) => { output += data; });
+  const notifications = Array.from({ length: 300 }, (_, i) =>
+    JSON.stringify({ method: "delivery_result", params: { session: "s", message_id: `m${i}`, accepted: true } })).join("\n");
+  child.stdin.write(`${notifications}\n${JSON.stringify({ id: 1, method: "list_peers", params: {} })}\n`);
+  for (let i = 0; i < 500 && !output.includes("\n"); i++) await delay(10);
+  assert.deepEqual(Object.keys(JSON.parse(output.split("\n")[0])), ["id", "result"]);
+  const closed = once(child, "exit");
+  child.stdin.end(JSON.stringify({ id: 2, method: "shutdown" }) + "\n");
+  assert.deepEqual(await closed, [0, null]);
+});
+
 for (const [label, data, expected, reason] of [
   ["oversized frame", "x".repeat(MAX_LINE), /input line too large/, "message_too_large"],
-  ["request flood", "{}\n".repeat(129), /input limit exceeded/, "queue_full"],
+  ["request flood", `${JSON.stringify({ id: 1, method: "list_peers" })}\n`.repeat(129), /input limit exceeded/, "queue_full"],
   ["truncated frame", '{"id":1', /incomplete bridge input/, "malformed"],
 ]) test(`IPC terminates promptly on ${label}`, { timeout: 10_000 }, async (t) => {
   const f = await fixture(t, { logging: true });

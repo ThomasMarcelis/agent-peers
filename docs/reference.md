@@ -101,7 +101,7 @@ An **inbox write** means the local socket write completed. A **receipt** records
 
 ## Hermes subprocess protocol
 
-Requests are newline-delimited JSON objects `{id, method, params}`. Responses are `{id, result}` or `{id, error}`. The bridge handles requests concurrently, up to 128 at once, keeping order per conversation, so responses can arrive out of order. Methods:
+Requests are newline-delimited JSON objects `{id, method, params}`. Responses are `{id, result}` or `{id, error}`. The bridge handles requests concurrently, up to 128 awaiting a response, keeping order per conversation, so responses can arrive out of order. Methods:
 
 - `list_peers`: optional `session`. The listing pins generations for that conversation only; without it, it pins nothing.
 - `send_peer`: `session`, `name` (a `hermes:` identity), `to`, `message`, optional `in_reply_to`. The result is the [send_peer result](#send_peer-result) plus `text`.
