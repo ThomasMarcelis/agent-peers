@@ -159,9 +159,10 @@ async function roundtrip(peer, session, phase, busyTurn) {
   const token = `${nonce}-${peer.kind}-${phase}`;
   const sent = await bridge.request("send_peer", { session, name: `hermes:live-${session}`, to: peer.name,
     message: `PING ${token}\nReply once using ${peer.kind === "codex" ? "send_peer" : "SendMessage"} to this message's sender address with exactly PONG ${token}.` });
-  assert.match(sent.text, /^Delivered to/);
-  if (hidden.has(session)) assert.equal(sent.address, hidden.get(session), "conversation keeps its private address");
-  hidden.set(session, sent.address);
+  // Codex accepts; Claude reports nothing for an accepted message, so its sends stay unconfirmed.
+  assert.equal(sent.status, peer.kind === "codex" ? "accepted" : "unconfirmed", sent.text);
+  if (hidden.has(session)) assert.equal(sent.from, hidden.get(session), "conversation keeps its private address");
+  hidden.set(session, sent.from);
   await assertInvisible(`${peer.kind}-${phase}-awaiting-reply`);
   const received = await until(`${peer.kind} ${phase} native reply`, () => notifications.find((message) => message.message.includes(`PONG ${token}`)));
   assert.equal(received.session, session, "reply returns to the originating Hermes conversation");
@@ -171,15 +172,16 @@ async function roundtrip(peer, session, phase, busyTurn) {
     const native = await until("Codex send_peer completed", () => codexEvents.find((event) =>
       event.method === "item/completed" && event.params.threadId === peer.id &&
       event.params.item.tool === "send_peer" && event.params.item.arguments?.message?.includes(token)));
-    assert.equal(native.params.item.arguments.to, sent.address, "Codex replies to the unlisted private inbox");
-    assert.match(native.params.item.result?.content?.[0]?.text ?? "", /^Delivered to/);
+    assert.equal(native.params.item.arguments.to, sent.from, "Codex replies to the unlisted private inbox");
+    // This harness plays the plugin and reports no delivery_result, so the bridge stops at queued.
+    assert.equal(native.params.item.result?.structuredContent?.status, "queued");
     if (busyTurn) assert.equal(native.params.turnId, busyTurn, "Codex handled the reply inside the busy turn");
     await until("Codex turn settled", () => !active.has(peer.id));
   } else {
     const native = peer.events.flatMap((event) => event.type === "assistant" ? event.message?.content ?? [] : [])
       .find((block) => block.type === "tool_use" && block.name === "SendMessage" && block.input?.message?.includes(token));
     assert.ok(native, "Claude answered through native SendMessage");
-    assert.equal(native.input.to, sent.address, "Claude replies to the unlisted private inbox");
+    assert.equal(native.input.to, sent.from, "Claude replies to the unlisted private inbox");
     await until("Claude reply turn settled", () => peer.events.slice(peer.turnStart)
       .some((event) => event.type === "result"));
   }

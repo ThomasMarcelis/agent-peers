@@ -5,8 +5,8 @@
 | Command | Output |
 | --- | --- |
 | `agent-peers list` | Sessions with exact Claude `SendMessage` and Codex `send_peer` targets |
-| `agent-peers list --json` | `{ "peers": [...] }`; no status text mixed into stdout. Each peer socket gets a short (200 ms) connect probe with no data sent; a refusing socket is shown as `stale` and has `reachable: false`. Records are never deleted. `--no-probe` skips the probe and omits `reachable` |
-| `agent-peers whoami [--json]` | The calling session's name and `uds:` address, found by walking process ancestry to a PID with a Claude session record (or a Codex inbox record). Exits 1 outside a session; never guesses by working directory |
+| `agent-peers list --json` | `{ "peers": [...] }`; no status text mixed into stdout. Each row carries its [`generation`](#delivery-protocol). Records whose process is gone, or whose PID now belongs to another process, are not listed. Each peer socket gets a short (200 ms) connect probe with no data sent; a refusing socket is shown as `stale` and has `reachable: false`. Records are never deleted. `--no-probe` skips the probe and omits `reachable` |
+| `agent-peers whoami [--json]` | The calling session's name and `uds:` address (and `generation` in JSON), found by walking process ancestry to a PID with a Claude session record (or a Codex inbox record). Exits 1 outside a session; never guesses by working directory |
 | `agent-peers doctor [--json]` | Runtime, dependency, and local path checks, plus one read-only request to the Codex app-server to confirm it answers; does not modify configuration, start servers, or send messages |
 | `agent-peers logs [--json]` | Read-only summary of retained local diagnostic events |
 | `agent-peers --version` | Package version |
@@ -18,11 +18,58 @@ Exit codes: `0` success, `1` runtime/diagnostic failure, `2` invalid CLI usage. 
 
 ## Tools
 
-`list_peers()` takes no arguments. Codex's structured result contains `peers`, each with its name, kind, working directory, available activity status, and native/bridge route. Native reachability is caller-relative: another root is bridge-only even on the same daemon. Discovery does not load historical Codex threads.
+`list_peers()` takes no arguments. Codex's structured result contains `peers`, each with its name, kind, working directory, available activity status, native/bridge route and `generation`, and `self`, the caller: `{name, kind, address, addresses, generation, threadId, subagent}`. A subagent's address is its root's, and `self` is never in `peers`. The text opens with `You are <name>.` Native reachability is caller-relative: another root is bridge-only even on the same daemon. Discovery does not load historical Codex threads. Hermes's result is `{peers}` with each row's name, kind, working directory, status, address and `generation`; Hermes itself is unlisted.
 
-`send_peer({to, message})` accepts an exact peer name, unambiguous abbreviated name, or a valid inbox address. Prefer returned exact targets. Empty messages, ambiguous targets, self-sends, and invalid addresses fail clearly. Hermes host handlers return JSON text as required by its dispatcher; Codex uses MCP text content and error results.
+`send_peer({to, message, in_reply_to?})` sends one message:
 
-A successful socket write confirms only inbox acceptance. Claude delivery receipts can report held/rejected input; not every recipient sends a receipt. No receipt is not proof of model consumption. Timed-out delivery is not automatically retried because it may already have arrived.
+- `to` is an inbox address (`uds:…`), an exact peer name, or an exact name without its `claude:` or `codex:` prefix when only one kind has it. Nothing else matches: no fragments, most-recent guesses, defaults or broadcasts. An unknown name fails `not-found` and lists up to five exact names that contain it.
+- `in_reply_to` is the `id` of the message being answered (`[A-Za-z0-9_-]{1,128}`). It appears on the recipient's frame and is echoed in the result. It is advisory and never checked against received ids.
+
+Hermes handlers return JSON text, as its dispatcher requires; Codex returns MCP text content plus `structuredContent`.
+
+### send_peer result
+
+```json
+{ "status": "accepted", "reason": null, "message_id": "…", "in_reply_to": null,
+  "to": "uds:…", "name": "codex:api-ab12", "generation": "3f9a0c1b2d4e5f60", "from": "uds:…" }
+```
+
+`to`, `name` and `generation` describe the target. `from` is the reply address the recipient sees. Fields not known yet are `null`. Codex returns this object as `structuredContent`, with prose in the text content. Hermes returns it with `text` added, plus `error` (the same text) exactly when the status is an error. Codex sets `isError` by the same rule.
+
+| `status` | Meaning | Error |
+| --- | --- | --- |
+| `accepted` | The recipient's host took the input (agent-peers 1.0 recipients) | no |
+| `queued` | The recipient's inbox admitted it; its host had not answered when the window closed | no |
+| `held` | A Claude recipient holds it for its user's approval; a reply may still come if approved | no |
+| `delivered` | A held message was released | no |
+| `unconfirmed` | Written, but no receipt arrived. This is the normal success case for Claude recipients, which report only exceptions | no |
+| `dropped` | The recipient's inbox or host did not deliver it | yes |
+| `denied`, `expired`, `refused` | A Claude recipient's user declined it, it was never approved, or the recipient refuses peer input | yes |
+| `failed` | Nothing deliverable was written | yes |
+
+An error status means the message was definitely not delivered. Nothing is retried automatically, because a timed-out write or a lost bridge may already have delivered. No status proves that a model read the message.
+
+`reason` is a stable kebab-case code, or `null`. Clients must tolerate new codes.
+
+- `failed`: `invalid-request`, `not-found`, `ambiguous`, `reserved-name`, `invalid-address`, `self-send`, `native-route-required`, `not-running`, `too-large`, `write-timeout`, `write-failed`, `inbox-unavailable`, `too-many-pending`, `unsupported-host`, `conversation-closed`, `bridge-unavailable`.
+- `dropped`: Claude's `rate-limited`, `duplicate`, `queue-full`, `hop-loop`, `hop-runaway`; agent-peers' `too-large`, `host-rejected`, `inbox-closed`, `not-a-reply-target`; or `other`.
+- `unconfirmed`: `no-receipt`, `bridge-lost`.
+
+## Delivery protocol
+
+**Receipts.** agent-peers inboxes answer in Claude Code's receipt format, `{type:"control", action:"peer_message_status", orig_msg_id, status, …}`. Every sender, including Claude Code and agent-peers 0.x, gets `dropped` with a `drop_reason`. Only senders that opt in also get `queued` when the inbox admits a message and `accepted` when the host takes it. The sender waits up to 1.5 s after its write completes. A repeated `msg_id` from the same sender is discarded with no receipt, so the first copy's outcome stands. Identical bodies with different ids are both delivered.
+
+**Hermes reply inboxes.** A Hermes conversation's inboxes accept messages only from addresses that conversation has sent to, in any of its socket directories, until it closes. Any other sender gets `dropped`/`not-a-reply-target`. Hermes is never listed, so finding one of its inboxes in the socket directory and writing to it is unsupported; ask the Hermes conversation to send first.
+
+**Late outcomes.** A negative or `held` receipt that arrives after the result was returned reaches a Codex session as one short notice appended to its history, which never starts a turn. Hermes logs it only. Late positive receipts are silent.
+
+**Line extension.** agent-peers adds `agent_peers: {v: 1, receipts: ["queued", "accepted"], generation, in_reply_to}` to each message line it sends, and `agent_peers: {v: 1}` to each receipt. Claude Code and agent-peers 0.x ignore it, and the `<cross-session-message>` envelope is unchanged. Readers ignore unknown fields and accept higher versions. Claude recipients cannot see `in_reply_to`, so a reply to a Claude session ends with `(In reply to <id>.)` instead.
+
+**Generation.** `generation` is an opaque 16-hex-digit string that changes when a different process takes over a PID or an inbox path. Claude sessions keep theirs across `/clear` and `/resume`. A Codex session gets a new one when its MCP server restarts. A record counts as running only if its PID is alive and that process started when the record says. Each sender remembers the generation it saw behind every name and address, from listings, incoming messages and its first send. If a later send finds a different process there, it fails `not-running` instead of reaching the wrong session. Listing again refreshes this.
+
+**Names.** Automatic names are `<kind>:<label>`, where the label uses letters, digits and `_ . : -`. Other characters in Claude session names and Codex labels become `-`. Names of the form `<kind>:<scope>/<claim>` are reserved for explicit claims in a later release, so any name containing `/` fails `reserved-name`. `@ * ? ,` and whitespace fail `invalid-request` and will never mean patterns or broadcast. The `names/` directory under `AGENT_PEERS_HOME` is reserved; nothing reads or writes it yet.
+
+**Codex app-server requests.** The app-server sends some requests to every connected client, and the first answer wins. agent-peers answers only requests it can never be the target of: dynamic tool calls, ChatGPT token refresh and attestation, each with "method not supported". It never answers approval or user-input requests, which wait for a human client as they would without agent-peers.
 
 ## Environment
 
@@ -54,22 +101,25 @@ An **inbox write** means the local socket write completed. A **receipt** records
 
 ## Hermes subprocess protocol
 
-Requests are newline-delimited JSON objects `{id, method, params}`. Responses are `{id, result}` or `{id, error}`. Methods:
+Requests are newline-delimited JSON objects `{id, method, params}`. Responses are `{id, result}` or `{id, error}`. The bridge handles requests concurrently, up to 128 at once, keeping order per conversation, so responses can arrive out of order. Methods:
 
 - `list_peers`: no parameters.
-- `send_peer`: `session`, `name` (a `hermes:` identity), `to`, `message`.
+- `send_peer`: `session`, `name` (a `hermes:` identity), `to`, `message`, optional `in_reply_to`. The result is the [send_peer result](#send_peer-result) plus `text`.
 - `close_session`: `session`.
-- `shutdown`: close owned state and exit.
+- `shutdown`: finish in-flight requests, close owned state and exit.
 
-`peer_message` notifications identify the private session, message ID, sender, reply address, and body. Hermes creates no public registry entry. EOF and termination remove owned sockets. Standard output carries protocol data only; diagnostics go to standard error.
+The plugin sends one notification, an id-less line with no response: `delivery_result {session, message_id, accepted, reason?}`, reporting what the host did with a `peer_message`. `reason` is `queue-full` or `inbox-closed` when the plugin never offered it to the host.
 
-Messages use Claude's `<cross-session-message>` envelope. Incoming agent input is reframed with sender identity, a reply address, and a reminder that it carries no user approval. Closing tags in message bodies are escaped. A frame is bounded to 1,000,000 bytes. Resource bounds, token buckets, and duplicate suppression limit accidental floods; see the source constants for precise limits.
+`peer_message` notifications identify the private session, message ID, sender name, reply address (`from`), body and optional `in_reply_to`. Hermes creates no public registry entry. EOF and termination remove owned sockets. Standard output carries protocol data only; diagnostics go to standard error.
+
+Messages use Claude's `<cross-session-message>` envelope. Incoming agent input is reframed as `<peer_message from="…" reply_to="…" id="…" in_reply_to="…">`, with a reminder that it carries no user approval. Closing tags in message bodies are escaped. A frame is bounded to 1,000,000 bytes. Resource bounds, per-sender token buckets and duplicate-id suppression limit accidental floods; see the source constants for precise limits.
 
 ## Troubleshooting
 
 - **No Codex inbox:** it should open within seconds of the session starting. Run `agent-peers doctor`: the Codex app-server must answer. Check that the server is registered as `agent-peers` and that the session runs on the app-server agent-peers uses, not an embedded one (`codex exec`, `-c`, `--no-daemon`). A `list_peers` call in that session also opens it. Without a reachable thread, startup binding retries quickly, then every few minutes, and logs each failure reason once.
 - **Wrong native target:** rediscover from the sending Codex session. A thread UUID alone does not establish native reachability.
 - **Held Claude delivery:** review its inbound-message policy; agent-peers does not bypass it.
+- **`not-running` for a listed peer:** the session exited, or a different process now owns its PID or inbox. Call `list_peers` and send to the session it shows.
 - **Hermes unsupported route:** use the documented host revision. Upstream `inject_message` is not an equivalent fallback.
 - **Missing plugin dependencies:** run the exact install command in the plugin error, then reload through the host's supported lifecycle.
 - **Permission failure:** inspect directory ownership and modes. Do not make the socket directory globally writable.

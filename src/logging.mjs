@@ -21,12 +21,19 @@ const reasons = new Set(["not_found", "ambiguous_target", "native_route_required
   "connection_closed", "permission_denied", "invalid_input", "rate_limit", "unknown", "malformed", "duplicate", "queue_full",
   "closed", "receipt_rejected", "self_send", "no_reply_route", "unloaded_thread", "unsafe_path", "replaced", "unsupported", "message_too_large",
   "connection_limit", "sender_limit", "queue_limit", "queue_bytes_limit", "malformed_envelope", "inbox_replaced", "app_server_unavailable", "held", "delivered",
-  "rejected", "other_status", "unconfirmed", "idle_timeout", "frame_too_large", "invalid_json", "incomplete_frame"]);
+  "rejected", "other_status", "unconfirmed", "idle_timeout", "frame_too_large", "invalid_json", "incomplete_frame",
+  // Public delivery statuses and reason codes (status.mjs), with "-" written as "_".
+  "accepted", "queued", "denied", "expired", "refused", "dropped", "failed", "invalid_request", "ambiguous", "reserved_name",
+  "invalid_address", "not_running", "too_large", "write_timeout", "write_failed", "inbox_unavailable", "too_many_pending",
+  "unsupported_host", "conversation_closed", "bridge_unavailable", "rate_limited", "hop_loop", "hop_runaway", "host_rejected",
+  "inbox_closed", "not_a_reply_target", "other", "no_receipt", "bridge_lost"]);
 const outcomes = new Set(["started", "succeeded", "failed", "success", "error", "warning", "held", "receipt_delivered",
   "rejected", "inbox_written", "emitted_to_host", "receipt_received", "queued", "dropped", "app_server_input_accepted",
-  "skipped", "closed", "accepted", "bound", "unbound", "native_only", "degraded", "receipt_unavailable", "unreachable"]);
+  "skipped", "closed", "accepted", "bound", "unbound", "native_only", "degraded", "receipt_unavailable", "unreachable",
+  "delivered", "denied", "expired", "refused", "unconfirmed"]);
 const methods = new Set(["list_peers", "send_peer", "close_session", "shutdown", "initialize", "initialized", "thread/loaded/list",
-  "thread/read", "thread/resume", "turn/start", "turn/steer", "mcpServerStatus/list", "unknown"]);
+  "thread/read", "thread/resume", "turn/start", "turn/steer", "thread/inject_items", "mcpServerStatus/list",
+  "item/tool/call", "account/chatgptAuthTokens/refresh", "attestation/generate", "unknown"]);
 const codes = new Set(["ENOENT", "EACCES", "EPERM", "ELOOP", "ENOTDIR", "EISDIR", "ENOSPC", "EDQUOT", "EROFS", "EMFILE",
   "ENFILE", "EPIPE", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ERR_SOCKET_CLOSED", "ERR_INVALID_ARG_TYPE",
   "-32700", "-32600", "-32601", "-32602", "-32603", "-32000", "NATIVE_ROUTE_REQUIRED"]);

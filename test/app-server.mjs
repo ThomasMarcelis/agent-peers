@@ -112,9 +112,27 @@ test("a JSON-RPC request from the server reaches the notification callback and c
   }, (message) => seen.push(message));
   assert.equal(await f.app.request("slow", {}), "answer");
   assert.deepEqual(seen, [request]);
-  // Current behaviour: the client never answers server requests; it sent only its own calls.
+  // User input and approvals wait for a human's client: agent-peers never answers them.
   assert.deepEqual(f.calls.map((m) => m.method), ["initialize", "initialized", "slow"]);
   assert.equal(await f.app.request("next", {}), "ok", "the connection stays usable");
+});
+
+test("approvals are left to a human client; capabilities agent-peers never set up are refused at once", async (t) => {
+  const answers = [];
+  const f = await fixture(t, (ws, message) => {
+    if (message.method === "initialize") reply(ws, message, {});
+    else if (message.method === "go") {
+      for (const [id, method] of [[901, "item/commandExecution/requestApproval"], [902, "item/fileChange/requestApproval"],
+        [903, "mcpServer/elicitation/request"], [904, "item/tool/call"], [905, "account/chatgptAuthTokens/refresh"],
+        [906, "attestation/generate"], [907, "execCommandApproval"]]) {
+        ws.send(JSON.stringify({ id, method, params: { threadId: "t", turnId: "u" } }));
+      }
+      setTimeout(() => reply(ws, message, "done"), 30);
+    } else if (!message.method) answers.push(message);
+  });
+  assert.equal(await f.app.request("go", {}), "done");
+  assert.deepEqual(answers.map((m) => [m.id, m.error?.code]), [[904, -32601], [905, -32601], [906, -32601]]);
+  assert.ok(answers.every((m) => !Object.hasOwn(m, "result")), "never a decision or token");
 });
 
 test("a frame over the 4 MiB maxPayload fails pending work promptly and a later call reconnects", async (t) => {

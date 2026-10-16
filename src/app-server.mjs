@@ -8,6 +8,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
 
+// Requests the app-server sends only to the client that registered dynamic tools, supplied
+// login tokens or attestation. agent-peers does none of these, so nobody else will answer them.
+const UNSUPPORTED_REQUESTS = new Set(["item/tool/call", "account/chatgptAuthTokens/refresh", "attestation/generate"]);
+
 export const daemonSocket = () =>
   process.env.AGENT_PEERS_CODEX_APP_SERVER ||
   join(process.env.CODEX_HOME || join(homedir(), ".codex"), "app-server-control", "app-server-control.sock");
@@ -105,6 +109,7 @@ export class AppServer {
           if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error();
         } catch { connection.fail(new Error("invalid app-server JSON response")); return; }
         if (typeof message.method === "string") {
+          if (Object.hasOwn(message, "id")) this.#answer(connection, message);
           try { this.#onNotification?.(message); } catch { /* Consumer callbacks cannot break RPC cleanup. */ }
           return;
         }
@@ -119,6 +124,22 @@ export class AppServer {
       ws.on("close", () => connection.fail(new Error("app-server connection closed")));
     } catch (error) { connection.fail(error); }
     return connection;
+  }
+
+  // Server-to-client requests fan out to every client subscribed to a thread, and the first
+  // answer wins (the server then sends serverRequest/resolved). Approvals and user input are
+  // therefore never answered here: a turn that needs approval waits for a human's client, and
+  // a fast refusal from us would override them. Only requests for capabilities this client
+  // never sets up (dynamic tools, login tokens, attestation) are answered, as unsupported.
+  #answer(connection, message) {
+    const unsupported = UNSUPPORTED_REQUESTS.has(message.method);
+    this.#options.log("app-server", "server_request", { method: unsupported ? message.method : "unknown",
+      outcome: unsupported ? "rejected" : "skipped" });
+    if (!unsupported) return;
+    try {
+      connection.ws.send(JSON.stringify({ id: message.id, error: { code: -32601, message: `agent-peers does not provide ${message.method}` } }),
+        (error) => { if (error) connection.fail(error); });
+    } catch (error) { connection.fail(error); }
   }
 
   close() {

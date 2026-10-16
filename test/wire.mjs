@@ -7,7 +7,8 @@ import { connect, createServer } from "node:net";
 import { once } from "node:events";
 import { join } from "node:path";
 import { test } from "node:test";
-import { MAX_LINE, address, alive, ancestorPids, inDiscoveryScope, whoami, claudeSessions, codexPeers, ensurePrivateDir, peerSocket, post, readLines, socketDir, socketPath } from "../src/wire.mjs";
+import { MAX_LINE, address, alive, ancestorPids, inDiscoveryScope, whoami, claudeSessions, codexPeers, ensurePrivateDir, generation,
+  messageLine, nameLabel, peerSocket, post, processStart, readLines, recordRunning, socketDir, socketPath, stalePeers } from "../src/wire.mjs";
 import { closeServer, listen } from "./listeners.mjs";
 
 function fixture(t) {
@@ -363,4 +364,40 @@ test("ancestorPids walks real process ancestry and whoami matches only an ancest
   assert.equal(whoami([]), undefined);
   assert.equal(whoami([process.pid + 1_000_000]), undefined);
   assert.ok(sockets);
+});
+
+test("a record whose PID now belongs to another process is stale, never live", (t) => {
+  const { claude, peers, sockets } = fixture(t);
+  const start = processStart(process.pid), socket = join(sockets, "claude.sock");
+  assert.match(start, /\S/);
+  assert.equal(processStart(process.pid), start, "stable for one process");
+  const record = (procStart) => writeFileSync(join(claude, "sessions", `${process.pid}.json`),
+    JSON.stringify({ pid: process.pid, name: "fixture", messagingSocketPath: socket, procStart }));
+  record(start);
+  assert.deepEqual(claudeSessions().map((p) => [p.name, p.generation]), [["claude:fixture", generation("claude", process.pid, start, socket)]]);
+  assert.deepEqual(stalePeers(), []);
+  record("a-different-start");
+  assert.deepEqual(claudeSessions(), [], "the PID was reused: not this session any more");
+  assert.deepEqual(stalePeers().map((p) => p.name), ["claude:fixture"]);
+  record(undefined);
+  assert.equal(claudeSessions().length, 1, "records without a start token fall back to the PID");
+  const codex = (procStart) => writeFileSync(join(peers, "codex-t.json"), JSON.stringify({ pid: process.pid, name: "codex:t",
+    address: address(join(sockets, "codex-t.sock")), threadId: "t", procStart }));
+  codex(start);
+  assert.deepEqual(codexPeers().map((p) => p.generation), [generation("codex", "t", start)]);
+  codex("a-different-start");
+  assert.deepEqual(codexPeers(), []);
+  assert.ok(stalePeers().some((p) => p.name === "codex:t"));
+  assert.equal(recordRunning({ pid: process.pid, procStart: start }), true);
+  assert.equal(recordRunning({ pid: process.pid, procStart: "other" }), false);
+});
+
+test("automatic Claude names drop characters reserved for claims and patterns; lines carry the extension", (t) => {
+  const { claude, sockets } = fixture(t);
+  writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "api/v2 lead@home",
+    messagingSocketPath: join(sockets, "claude.sock") }));
+  assert.equal(claudeSessions()[0].name, "claude:api-v2-lead-home");
+  assert.equal(nameLabel("Überprüfung_1.x:y"), "Überprüfung_1.x:y");
+  assert.equal(messageLine({ from: "uds:/a.sock", body: "x" }).agent_peers, undefined);
+  assert.deepEqual(messageLine({ from: "uds:/a.sock", body: "x", ext: { v: 1 } }).agent_peers, { v: 1 });
 });
