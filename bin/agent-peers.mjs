@@ -76,8 +76,8 @@ async function main() {
   if (cmd === "whoami") {
     const me = whoami();
     if (!me) throw new Error("no Claude Code or Codex session found in this process's ancestry; run whoami from inside a session");
-    const { name, address, kind, cwd, pid } = me;
-    if (args.includes("--json")) console.log(JSON.stringify({ name, address, kind, cwd, pid }, null, 2));
+    const { name, address, kind, cwd, pid, generation } = me;
+    if (args.includes("--json")) console.log(JSON.stringify({ name, address, kind, cwd, pid, generation }, null, 2));
     else console.log(`${name}\n${address}`);
     return;
   }
