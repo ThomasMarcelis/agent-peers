@@ -660,7 +660,8 @@ test("exact routing: kind-elided exact names, never fragments; reserved names; s
   const claimed = await peer.call("send_peer", { to: "claude:project/lead", message: "a claim" });
   assert.equal(claimed.structuredContent.reason, "reserved-name");
   assert.equal((await peer.call("send_peer", { to: "claude:*", message: "a pattern" })).structuredContent.reason, "invalid-request");
-  assert.equal((await peer.call("send_peer", { to: "claude:test", message: "x", in_reply_to: "not an id" })).structuredContent.reason, "invalid-request");
+  const invalid = (await peer.call("send_peer", { to: "claude:test", message: "x", in_reply_to: "not an id" })).structuredContent;
+  assert.deepEqual([invalid.reason, invalid.in_reply_to], ["invalid-request", null], "an invalid id is never echoed");
   // A registered Codex session whose process exited: not running, never "not found".
   writeFileSync(join(f.peers, "codex-gone.json"), JSON.stringify({ pid: 0x7ffffffe, name: "codex:gone-1234",
     address: address(join(f.sockets, "codex-gone.sock")), threadId: "gone" }));
