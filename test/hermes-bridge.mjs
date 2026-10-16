@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { HermesBridge } from "../src/hermes-bridge.mjs";
 import { MAX_LINE, address, allPeers, messageLine, parseEnvelope, peerSocket, post, readLines } from "../src/wire.mjs";
+import { closeServer, listen } from "./listeners.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -34,6 +35,17 @@ async function fixture(t, options = {}) {
   const logPath = join(dir, "diagnostics.jsonl");
   process.env.AGENT_PEERS_LOG = logPath;
   const messages = [], servers = [];
+  let bridge;
+  // Registered before anything listens, so a failure below cannot leave a handle open.
+  t.after(async () => {
+    await bridge?.close();
+    await Promise.all(servers.map(closeServer));
+    for (const [key, value] of Object.entries(before)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
   for (const kind of ["claude", "codex"]) {
     const socket = join(sockets, `${kind}-test.sock`);
     const server = createServer((conn) => readLines(conn, (line) => {
@@ -44,9 +56,8 @@ async function fixture(t, options = {}) {
           status: options.status ?? "delivered" }).catch(() => {});
       }
     }));
-    server.listen(socket);
-    await once(server, "listening");
     servers.push(server);
+    await listen(server, socket);
     if (kind === "claude") writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({
       pid: process.pid, name: "test", cwd: dir, status: "busy", messagingSocketPath: socket,
     }));
@@ -59,16 +70,7 @@ async function fixture(t, options = {}) {
     loadedThreads: async () => ["live-thread"],
     readThread: async (id) => { reads.push(id); return { id, status: { type: "idle" } }; },
   };
-  const bridge = new HermesBridge({ app, emit: options.emit ?? (async (event) => { events.push(event); }), log: (message) => diagnostics.push(message) });
-  t.after(async () => {
-    await bridge.close();
-    await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
-    for (const [key, value] of Object.entries(before)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-    rmSync(dir, { recursive: true, force: true });
-  });
+  bridge = new HermesBridge({ app, emit: options.emit ?? (async (event) => { events.push(event); }), log: (message) => diagnostics.push(message) });
   const send = (session, to = "codex:test", message = "hello", name = "hermes:JD") =>
     bridge.request("send_peer", { session, name, to, message });
   return { bridge, dir, peers, sockets, claude, events, reads, messages, send, logPath, diagnostics };
@@ -164,8 +166,7 @@ test("one conversation keeps reply inboxes in each peer directory and closes the
     assert.equal(dirname(sender), otherDir, "Claude can reply only within its own directory");
     void post(sender, { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id, status: "delivered" });
   }));
-  other.listen(otherSocket); await once(other, "listening");
-  t.after(() => new Promise((resolve) => other.close(resolve)));
+  await listen(other, otherSocket, t);
   const first = await f.send("mixed", "claude:test");
   // A registry change must not invalidate the existing conversation's first endpoint.
   writeFileSync(join(f.claude, "sessions", `${process.pid}.json`), JSON.stringify({
@@ -263,6 +264,7 @@ test("per-inbox flood limits preserve the other conversation", async (t) => {
   assert.equal(f.events.filter((e) => e.params.session === "one").length, 30);
   assert.equal(f.events.filter((e) => e.params.session === "two").length, 1);
   const conn = connect(peerSocket(one.address));
+  t.after(() => conn.destroy());
   conn.on("error", () => {});
   await once(conn, "connect");
   conn.write("x".repeat(MAX_LINE + 1));
