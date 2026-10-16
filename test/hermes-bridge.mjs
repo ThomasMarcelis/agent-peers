@@ -687,3 +687,11 @@ test("a parent that stops reading notifications cannot keep the bridge alive", {
   const records = readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse);
   assert.ok(records.some((record) => record.event === "bridge.error" && record.reason === "timeout"));
 });
+
+test("a Claude introduction dropped by the recipient is sent again with the next message", async (t) => {
+  const f = await fixture(t, { status: "dropped" });
+  await f.send("intro", "claude:test", "first");
+  await f.send("intro", "claude:test", "second");
+  const bodies = f.messages.filter((m) => m.kind === "claude").map((m) => parseEnvelope(m.line.message.content).body);
+  assert.deepEqual(bodies.map((b) => b.endsWith("(Hermes profile; notify_when_idle unavailable.)")), [true, true]);
+});

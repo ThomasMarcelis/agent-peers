@@ -101,7 +101,8 @@ async function send(caller, to, message, inReplyTo) {
       return `(Codex CLI ${caller.subagent ? "subagent; replies reach root" : "peer"}; notify_when_idle unavailable.)`;
     },
   });
-  if (introducing && out.result.status !== "failed") introduce(introducing);
+  // Claude saw the introduction only if the message was not refused or dropped.
+  if (introducing && !isError(out.result.status)) introduce(introducing);
   if (out.result.reason === "not-found") {
     const hint = nativeRouteError(to, (await listPeers(caller)).peers);
     if (hint) Object.assign(out, { text: hint, result: { ...out.result, reason: "native-route-required" } });

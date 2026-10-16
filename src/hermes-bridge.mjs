@@ -60,11 +60,12 @@ export class HermesBridge {
     let state = this.#conversations.get(session);
     if (state) return state;
     if (this.#conversations.size >= CONVERSATIONS_MAX) {
-      // Only conversations without an inbox are evicted; those with one are bounded by SESSIONS_MAX.
+      // Only conversations without an inbox or a send in flight are evicted; those with an inbox
+      // are bounded by SESSIONS_MAX, and a send keeps the pins it resolved against.
       const open = new Set([...this.#routes.values()].map((route) => route.session));
-      for (const key of this.#conversations.keys()) if (!open.has(key)) { this.#conversations.delete(key); break; }
+      for (const [key, value] of this.#conversations) if (!open.has(key) && !value.sending) { this.#conversations.delete(key); break; }
     }
-    state = { pins: new Pins(), contacts: new Set(), admission: new Admission({ senders: SOURCES_MAX }) };
+    state = { pins: new Pins(), contacts: new Set(), admission: new Admission({ senders: SOURCES_MAX }), sending: 0 };
     this.#conversations.set(session, state);
     return state;
   }
@@ -210,8 +211,10 @@ export class HermesBridge {
     };
     event("send.started", fields);
     let added = false, introducing;
+    const conversation = this.#conversation(session);
+    conversation.sending++;
     const { result, text } = await sendPeer({
-      to: params.to, message: params.message, inReplyTo: params.in_reply_to ?? undefined, pins: this.#conversation(session).pins, fromName: name,
+      to: params.to, message: params.message, inReplyTo: params.in_reply_to ?? undefined, pins: conversation.pins, fromName: name,
       generation: generation("hermes", session),
       route: async (target) => {
         let route;
@@ -231,8 +234,9 @@ export class HermesBridge {
         introducing = key;
         return "(Hermes profile; notify_when_idle unavailable.)";
       },
-    });
-    if (introducing && result.status !== "failed") this.#introduce(introducing);
+    }).finally(() => { conversation.sending--; });
+    // Claude saw the introduction only if the message was not refused or dropped.
+    if (introducing && !isError(result.status)) this.#introduce(introducing);
     if (added && result.status === "failed") this.#conversations.get(session)?.contacts.delete(result.to);
     if (result.message_id) {
       if (result.status !== "failed") event("message.send", { ...fields, messageId: logIdentity(result.message_id), outcome: "inbox_written" });
