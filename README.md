@@ -25,7 +25,7 @@ Backed by [live Claude/Codex round trips, Hermes routing tests, and Linux/macOS 
 Requires **Node.js 22+**, Linux or macOS, and [compatible agent versions](docs/compatibility.md#tested-agent-builds).
 
 ```sh
-npm install -g agent-peers@0.1.1
+npm install -g agent-peers@0.2.0
 ```
 
 ### Codex (MCP server)

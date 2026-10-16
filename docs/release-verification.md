@@ -1,10 +1,22 @@
 # Release verification
 
-Verified on 2026-10-03 for 0.1.0. Raw live transcripts are excluded from the repository and package.
+Raw live transcripts are excluded from the repository and package.
+
+## 0.2.0
+
+Verified on 2026-10-16 with Node 22.23.1 and Codex CLI 0.162.1 on Linux, plus CI on Linux and macOS:
+
+- Deterministic suites: 101 JavaScript transport, MCP, discovery, CLI and retry tests; 27 Python plugin and subprocess tests; the packed npm artifact installed and completed an MCP handshake.
+- Live, on a private `codex app-server` running `codex-peer` from the 0.2.0 branch with gpt-6.1-sol: the worker's inbox opened in about 7 seconds; peer messages steered a running turn and woke an idle one; `thread/resume` restored the thread on a fresh server after its process group was killed.
+- `agent-peers doctor` reported Codex's restarted shared daemon as answering. Its stale-link and non-answering reports are covered by the deterministic suite.
+
+The four-session live matrix was not re-run for 0.2.0. The model in the live run declined to reply to a peer when its brief did not authorize replies; see [compatibility](compatibility.md#headless-codex-on-a-private-app-server).
+
+## 0.1.0 and 0.1.1
 
 Version 0.1.1 changes documentation, package metadata, and diagnostic wording only. Its transport is unchanged from the live-verified 0.1.0 release.
 
-## Automated checks
+## 0.1.0 automated checks (2026-10-03)
 
 | Check | Result |
 | --- | --- |

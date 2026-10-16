@@ -1,6 +1,6 @@
 {
   "name": "agent-peers",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Local agent-to-agent messaging for Claude Code and Codex, with a Codex MCP server and Hermes plugin",
   "mcpName": "io.github.ThomasMarcelis/agent-peers",
   "license": "MIT",
