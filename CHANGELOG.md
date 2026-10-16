@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `agent-peers whoami [--json]` reports the calling Claude Code (or Codex) session's name and address through process ancestry. Adding the caller to Codex `list_peers` is still to do.
+- `agent-peers list` probes each peer socket and marks refusing sockets `stale` / `reachable: false` without deleting records; `--no-probe` skips this.
+- Peer discovery scans Claude session records once per listing instead of once per peer (about 105 ms to 5 ms for 120 peers).
+
 ## 0.2.0 — 2026-10-16
 
 First npm release since 0.1.0: 0.1.1 was tagged on GitHub but never published to npm, and its changes are included here.

@@ -7,7 +7,7 @@ import { createServer } from "node:net";
 import { once } from "node:events";
 import { join } from "node:path";
 import { test } from "node:test";
-import { MAX_LINE, address, alive, claudeSessions, codexPeers, ensurePrivateDir, peerSocket, post, readLines, socketDir, socketPath } from "../src/wire.mjs";
+import { MAX_LINE, address, alive, ancestorPids, inDiscoveryScope, whoami, claudeSessions, codexPeers, ensurePrivateDir, peerSocket, post, readLines, socketDir, socketPath } from "../src/wire.mjs";
 
 function fixture(t) {
   const dir = mkdtempSync(join(tmpdir(), "ap-wire-"));
@@ -237,4 +237,36 @@ test("both configured runtime and temp socket directories allow unregistered rep
     const path = join(directory, "h.sock");
     assert.equal(peerSocket(address(path)), path);
   }
+});
+
+test("one discovery scope scans the registry once but rechecks directory safety on every call", async (t) => {
+  const { sockets, claude } = fixture(t);
+  const dir = realpathSync(sockets);
+  writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "fixture", messagingSocketPath: join(dir, "claude.sock") }));
+  const server = createServer();
+  server.listen(join(dir, "claude.sock"));
+  t.after(() => server.close());
+  await once(server, "listening");
+  const addr = address(join(dir, "claude.sock"));
+  inDiscoveryScope(() => {
+    assert.equal(socketDir({ create: false }), dir);
+    rmSync(join(claude, "sessions"), { recursive: true });
+    assert.equal(socketDir({ create: false }), dir, "registry was not reread inside the scope");
+    assert.ok(peerSocket(addr));
+    chmodSync(dir, 0o777);
+    assert.equal(peerSocket(addr), undefined, "directory mode is never cached");
+    chmodSync(dir, 0o700);
+  });
+  assert.notEqual(socketDir({ create: false }), dir, "nothing is cached after the scope ends");
+});
+
+test("ancestorPids walks real process ancestry and whoami matches only an ancestor", (t) => {
+  const { sockets } = fixture(t);
+  const chain = ancestorPids();
+  assert.equal(chain[0], process.ppid);
+  assert.ok(new Set(chain).size === chain.length);
+  assert.equal(whoami([process.pid])?.name, "claude:fixture");
+  assert.equal(whoami([]), undefined);
+  assert.equal(whoami([process.pid + 1_000_000]), undefined);
+  assert.ok(sockets);
 });

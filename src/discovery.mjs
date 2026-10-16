@@ -79,7 +79,8 @@ export function formatCodexPeer(p) {
 // The CLI is also used outside Codex, where there is no caller thread to compare.
 // Name the platform explicitly rather than implying Claude's SendMessage is a Codex tool.
 export function formatSessionPeer(p) {
-  return `${p.name}  ${p.status ?? ""}  cwd=${p.cwd}\n` +
+  return `${p.name}  ${p.status ?? ""}${p.reachable === false ? "  stale" : ""}  cwd=${p.cwd}\n` +
+    (p.reachable === false ? "  stale: the socket refused a connection; the record is kept\n" : "") +
     `  Claude native: SendMessage ${JSON.stringify({ to: p.address })}\n` +
     `  Codex bridge: send_peer ${JSON.stringify({ to: p.address })}`;
 }
