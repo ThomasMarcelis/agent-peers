@@ -62,8 +62,7 @@ async function listPeers(caller) {
   const self = inDiscoveryScope(() => selfRow(caller));
   const rows = peers.map(formatCodexPeer);
   return {
-    // The address stays in structuredContent.self: with it in this text, live Codex runs more
-    // often ignored a peer message steered into a busy turn.
+    // Worded as in 0.3.0; the caller's address is in structuredContent.self.
     text: [`You are ${caller?.name ?? "codex (not bound yet)"}.`,
       ...(rows.length ? rows : ["No other agents found."]),
       ...(peers.some((p) => p.native.reachable) ? ["Native send_message does not start an idle turn; followup_task can wake non-root agents."] : []),
