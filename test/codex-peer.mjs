@@ -141,6 +141,8 @@ test("MCP binds privately, discovers peers, sends and receives framed messages, 
 
 test("compatibility footers are short and only added for known Claude recipients", async (t) => {
   const f = await fixture(t), peer = await f.start();
+  // A failed first send does not use up the introduction.
+  assert.equal((await peer.call("send_peer", { to: "claude:test", message: "x".repeat(1_000_000) })).structuredContent.reason, "too-large");
   await peer.call("send_peer", { to: "claude:test", message: "hello" });
   assert.equal(parseEnvelope(f.messages.at(-1).message.content).body,
     "hello\n\n(Codex CLI peer; notify_when_idle unavailable.)");

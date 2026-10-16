@@ -51,11 +51,9 @@ export class HermesBridge {
     this.#log = log;
   }
 
-  #firstContact(key) {
-    if (this.#introduced.has(key)) return false;
+  #introduce(key) {
     if (this.#introduced.size >= 4096) this.#introduced.clear();
     this.#introduced.add(key);
-    return true;
   }
 
   #conversation(session) {
@@ -211,7 +209,7 @@ export class HermesBridge {
       ...(typeof params.message === "string" ? { bytes: Buffer.byteLength(params.message) } : {}),
     };
     event("send.started", fields);
-    let added = false;
+    let added = false, introducing;
     const { result, text } = await sendPeer({
       to: params.to, message: params.message, inReplyTo: params.in_reply_to ?? undefined, pins: this.#conversation(session).pins, fromName: name,
       generation: generation("hermes", session),
@@ -225,9 +223,16 @@ export class HermesBridge {
         return { from: route.address, outbox: route.outbox };
       },
       // Claude labels every external envelope as another Claude session. Correct that frame once
-      // per conversation and recipient: the recipient keeps it in context.
-      introduction: (target) => (this.#firstContact(`${session}\0${target.address}`) ? "(Hermes profile; notify_when_idle unavailable.)" : undefined),
+      // per conversation and recipient (the recipient keeps it in context), counted only once a
+      // send wrote something.
+      introduction: (target) => {
+        const key = `${session}\0${target.address}`;
+        if (this.#introduced.has(key)) return undefined;
+        introducing = key;
+        return "(Hermes profile; notify_when_idle unavailable.)";
+      },
     });
+    if (introducing && result.status !== "failed") this.#introduce(introducing);
     if (added && result.status === "failed") this.#conversations.get(session)?.contacts.delete(result.to);
     if (result.message_id) {
       if (result.status !== "failed") event("message.send", { ...fields, messageId: logIdentity(result.message_id), outcome: "inbox_written" });

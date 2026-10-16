@@ -124,6 +124,8 @@ test("closing releases the app-server once and rejects further bridge requests",
 
 test("private sessions send, receive replies, and remain absent from every registry", async (t) => {
   const f = await fixture(t);
+  // A failed first send does not use up the introduction.
+  assert.equal((await f.send("conversation-a", "claude:test", "x".repeat(MAX_LINE))).reason, "too-large");
   const first = await f.send("conversation-a", "claude:test", "hello Claude");
   const second = await f.send("conversation-b", "codex:test", "hello Codex");
   assert.notEqual(first.from, second.from);

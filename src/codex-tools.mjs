@@ -19,13 +19,12 @@ const code = (reason) => reason?.replaceAll("-", "_");
 const detached = new Outbox({ log });
 
 // Claude Code frames every peer as "another Claude session", so tell Claude what this is, once
-// per sending thread and recipient: the recipient keeps it in context.
+// per sending thread and recipient: the recipient keeps it in context. Recorded only once a send
+// wrote something, so a failed first send does not use up the introduction.
 const introduced = new Set();
-const firstContact = (key) => {
-  if (introduced.has(key)) return false;
+const introduce = (key) => {
   if (introduced.size >= 4096) introduced.clear();
   introduced.add(key);
-  return true;
 };
 
 // The caller as peers see it: a subagent's address is its root's, where replies land.
@@ -78,6 +77,7 @@ async function send(caller, to, message, inReplyTo) {
     return { result: sendResult({ reason: "inbox-unavailable" }), text: "this inbox was replaced; restart this MCP connection" };
   }
   const rootRecord = () => codexPeers().find((peer) => peer.threadId === caller.rootId);
+  let introducing;
   const out = await sendPeer({
     to, message, inReplyTo, pins: pinsOf(root, caller.rootId), fromName: caller.name, generation: root?.generation ?? rootRecord()?.generation,
     route: async (target) => {
@@ -94,9 +94,14 @@ async function send(caller, to, message, inReplyTo) {
       try { return { from: (await inboxFor(caller, directory)).address, outbox: outboxOf(caller) }; }
       catch (error) { throw new SendFailure("inbox-unavailable", error.message); }
     },
-    introduction: (target) => firstContact(`${caller.threadId}\0${target.address}`)
-      ? `(Codex CLI ${caller.subagent ? "subagent; replies reach root" : "peer"}; notify_when_idle unavailable.)` : undefined,
+    introduction: (target) => {
+      const key = `${caller.threadId}\0${target.address}`;
+      if (introduced.has(key)) return undefined;
+      introducing = key;
+      return `(Codex CLI ${caller.subagent ? "subagent; replies reach root" : "peer"}; notify_when_idle unavailable.)`;
+    },
   });
+  if (introducing && out.result.status !== "failed") introduce(introducing);
   if (out.result.reason === "not-found") {
     const hint = nativeRouteError(to, (await listPeers(caller)).peers);
     if (hint) Object.assign(out, { text: hint, result: { ...out.result, reason: "native-route-required" } });
