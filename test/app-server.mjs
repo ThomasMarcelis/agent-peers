@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -7,8 +6,9 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
 import { AppServer } from "../src/app-server.mjs";
+import { closeServer, listen } from "./listeners.mjs";
 
-async function fixture(t, handler) {
+async function fixture(t, handler, onNotification) {
   const dir = mkdtempSync(join(tmpdir(), "ap-app-")), path = join(dir, "daemon.sock");
   const http = createServer(), wss = new WebSocketServer({ server: http });
   const before = process.env.AGENT_PEERS_CODEX_APP_SERVER;
@@ -23,16 +23,17 @@ async function fixture(t, handler) {
       handler?.(ws, message, connections);
     });
   });
-  http.listen(path); await once(http, "listening");
-  const app = new AppServer(undefined, { handshakeTimeoutMs: 60 });
+  const app = new AppServer(onNotification, { handshakeTimeoutMs: 60 });
+  // Registered before listening, so a failed assertion cannot leave the daemon open.
   t.after(async () => {
     app.close();
     for (const ws of wss.clients) ws.terminate();
     await new Promise((resolve) => wss.close(resolve));
-    await new Promise((resolve) => http.close(resolve));
+    await closeServer(http);
     before === undefined ? delete process.env.AGENT_PEERS_CODEX_APP_SERVER : process.env.AGENT_PEERS_CODEX_APP_SERVER = before;
     rmSync(dir, { recursive: true, force: true });
   });
+  await listen(http, path);
   return { app, calls, wss };
 }
 const reply = (ws, message, result) => ws.send(JSON.stringify({ id: message.id, result }));
@@ -95,4 +96,36 @@ test("discovery rejects malformed data and repeated pagination cursors", async (
   });
   await assert.rejects(f.app.loadedThreads(), /pagination/);
   await assert.rejects(f.app.readThread("a"), /invalid app-server thread/);
+});
+
+test("a JSON-RPC request from the server reaches the notification callback and cannot settle a pending call", async (t) => {
+  const seen = [];
+  let request;
+  const f = await fixture(t, (ws, message) => {
+    if (message.method === "initialize") reply(ws, message, {});
+    else if (message.method === "slow") {
+      // A server-initiated request that reuses the pending call's id, sent before the real answer.
+      request = { id: message.id, method: "item/tool/requestUserInput", params: { prompt: "approve?" } };
+      ws.send(JSON.stringify(request));
+      setTimeout(() => reply(ws, message, "answer"), 20);
+    } else if (message.id) reply(ws, message, "ok");
+  }, (message) => seen.push(message));
+  assert.equal(await f.app.request("slow", {}), "answer");
+  assert.deepEqual(seen, [request]);
+  // Current behaviour: the client never answers server requests; it sent only its own calls.
+  assert.deepEqual(f.calls.map((m) => m.method), ["initialize", "initialized", "slow"]);
+  assert.equal(await f.app.request("next", {}), "ok", "the connection stays usable");
+});
+
+test("a frame over the 4 MiB maxPayload fails pending work promptly and a later call reconnects", async (t) => {
+  const f = await fixture(t, (ws, message, connection) => {
+    if (message.method === "initialize") reply(ws, message, {});
+    else if (message.id && connection === 1) reply(ws, message, "x".repeat(4 * 1024 * 1024));
+    else if (message.id) reply(ws, message, "ok");
+  });
+  const started = performance.now();
+  await assert.rejects(f.app.request("huge", {}, 10_000), /Max payload size exceeded/);
+  assert.ok(performance.now() - started < 5000, "failed on the frame, not on the request timeout");
+  assert.equal(await f.app.request("small", {}), "ok");
+  assert.equal(f.calls.filter((m) => m.method === "huge").length, 1, "the failed request is not replayed");
 });

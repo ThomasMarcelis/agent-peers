@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { createServer } from "node:net";
+import { connect, createServer } from "node:net";
 import { once } from "node:events";
 import { join } from "node:path";
 import { test } from "node:test";
 import { MAX_LINE, address, alive, ancestorPids, inDiscoveryScope, whoami, claudeSessions, codexPeers, ensurePrivateDir, peerSocket, post, readLines, socketDir, socketPath } from "../src/wire.mjs";
+import { closeServer, listen } from "./listeners.mjs";
 
 function fixture(t) {
   const dir = mkdtempSync(join(tmpdir(), "ap-wire-"));
@@ -124,6 +125,100 @@ test("posting validates paths and size before opening a connection", async (t) =
   await assert.rejects(post(join(f.sockets, "missing.sock"), {}), /ENOENT/);
 });
 
+// Larger than any Unix socket send buffer, so the write can only complete if the peer reads.
+const unreadable = () => ({ text: "x".repeat(MAX_LINE - 100) });
+
+test("posting times out when the peer accepts but never reads, and closes its connection", { timeout: 20_000 }, async (t) => {
+  const f = fixture(t), socket = join(f.sockets, "stalled.sock");
+  let accepted;
+  const connection = new Promise((resolve) => { accepted = resolve; });
+  // pauseOnConnect: the listener accepts the connection but never reads from it.
+  await listen(createServer({ pauseOnConnect: true }, accepted), socket, t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let settled = false;
+  const sending = post(socket, unreadable());
+  sending.then(() => { settled = true; }, () => { settled = true; });
+  const conn = await connection;
+  for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "the write is still pending on the unread connection");
+  t.mock.timers.tick(4999);
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "no rejection before the 5 s deadline");
+  t.mock.timers.tick(1);
+  await assert.rejects(sending, /peer inbox did not accept the message within 5 s/);
+  // The sender destroyed its end: once the peer reads, it sees the end of the stream, not a line.
+  const lines = [];
+  readLines(conn, (line) => lines.push(line));
+  conn.resume();
+  await once(conn, "close");
+  assert.deepEqual(lines, []);
+});
+
+test("posting rejects promptly when the peer closes before accepting the message", {
+  timeout: 20_000,
+  todo: "post() resolves instead: src/wire.mjs:276 passes `() => finish()` to c.end(), and Node calls that " +
+    "callback with the EPIPE error before the 'error' event fires, so the write failure is reported as success",
+}, async (t) => {
+  const f = fixture(t), socket = join(f.sockets, "closing.sock");
+  await listen(createServer({ pauseOnConnect: true }, (conn) => conn.destroy()), socket, t);
+  // With setTimeout mocked and never advanced, the 5 s timeout cannot be what rejects.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await assert.rejects(post(socket, unreadable()), /EPIPE|ECONNRESET|closed before accepting/);
+});
+
+test("posting to an inbox whose listener is gone is refused at once", { timeout: 20_000 }, async (t) => {
+  const f = fixture(t), stale = join(f.sockets, "stale.sock");
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  // A peer that exited without unlinking its inbox leaves a socket nobody listens on.
+  const child = spawnSync(process.execPath, ["-e",
+    `require("node:net").createServer().listen(${JSON.stringify(stale)}, () => process.exit(0))`]);
+  assert.equal(child.status, 0);
+  assert.equal(lstatSync(stale).isSocket(), true);
+  await assert.rejects(post(stale, {}), /ECONNREFUSED/);
+});
+
+test("an idle connection is dropped after 30 s, discarding its incomplete frame", (t) => {
+  const f = fixture(t), logfile = join(realpathSync(f.dir), "idle.jsonl");
+  const before = { AGENT_PEERS_DEBUG: process.env.AGENT_PEERS_DEBUG, AGENT_PEERS_LOG: process.env.AGENT_PEERS_LOG };
+  Object.assign(process.env, { AGENT_PEERS_DEBUG: "1", AGENT_PEERS_LOG: logfile });
+  t.after(() => {
+    for (const [key, value] of Object.entries(before)) value === undefined ? delete process.env[key] : process.env[key] = value;
+  });
+  // readLines arms the idle timeout through the connection it is given, so a stand-in
+  // connection captures it; node:test mock timers do not reach socket timeouts.
+  const conn = new Connection(), lines = [], armed = [];
+  conn.setTimeout = (ms, callback) => armed.push({ ms, callback });
+  readLines(conn, (line) => lines.push(line));
+  assert.deepEqual(armed.map(({ ms }) => ms), [30_000]);
+  conn.emit("data", Buffer.from('{"complete":true}\n{"partial":'));
+  assert.equal(conn.destroyed, false);
+  armed[0].callback();
+  assert.equal(conn.destroyed, true);
+  assert.deepEqual(lines, [{ complete: true }]);
+  const drop = readFileSync(logfile, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+    .find((e) => e.event === "frame.drop");
+  assert.equal(drop.reason, "idle_timeout");
+  assert.equal(drop.bytes, Buffer.byteLength('{"partial":'));
+});
+
+test("the idle timeout is armed on the real socket and closes a silent peer's connection", { timeout: 20_000 }, async (t) => {
+  const f = fixture(t), socket = join(f.sockets, "idle.sock"), lines = [], armed = [];
+  // Scale the 30 s timeout on the real server-side socket so the test does not wait for it.
+  await listen(createServer((conn) => {
+    const setTimeout = conn.setTimeout.bind(conn);
+    conn.setTimeout = (ms, callback) => { armed.push(ms); return setTimeout(ms / 1000, callback); };
+    readLines(conn, (line) => lines.push(line));
+  }), socket, t);
+  const client = connect(socket);
+  t.after(() => client.destroy());
+  client.on("error", () => {});
+  await once(client, "connect");
+  client.write('{"before":"idle"}\n{"never":');
+  await once(client, "close");
+  assert.deepEqual(armed, [30_000]);
+  assert.deepEqual(lines, [{ before: "idle" }]);
+});
+
 
 test("peers started before Claude retain their inbox when Claude publishes its first registry record", async (t) => {
   const f = fixture(t);
@@ -134,8 +229,8 @@ test("peers started before Claude retain their inbox when Claude publishes its f
   assert.equal(before, join(f.dir, "cc-socks"));
   const socket = join(before, "codex-early.sock"), messages = [];
   const server = createServer((connection) => readLines(connection, (line) => messages.push(line)));
-  server.listen(socket); await once(server, "listening");
   try {
+    await listen(server, socket);
     writeFileSync(join(f.peers, "codex-early.json"), JSON.stringify({
       pid: process.pid, name: "codex:early", threadId: "early", address: address(socket),
     }));
@@ -151,7 +246,7 @@ test("peers started before Claude retain their inbox when Claude publishes its f
     await post(socket, { text: "after Claude" });
     for (let i = 0; messages.length < 2 && i < 100; i++) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.deepEqual(messages, [{ text: "before Claude" }, { text: "after Claude" }]);
-  } finally { await new Promise((resolve) => server.close(resolve)); }
+  } finally { await closeServer(server); }
 });
 
 test("Claude's runtime-directory preference and long-path fallback apply before it starts", (t) => {
@@ -179,11 +274,12 @@ test("mixed Claude directories preserve old Codex and unregistered Hermes reply 
   record(oldPid, f.sockets);
   const codex = join(f.sockets, "codex-existing.sock"), hermes = join(f.sockets, "hermes-hidden.sock");
   const messages = [], servers = [];
-  for (const path of [codex, hermes]) {
-    const server = createServer((connection) => readLines(connection, (line) => messages.push(line)));
-    server.listen(path); await once(server, "listening"); servers.push(server);
-  }
   try {
+    for (const path of [codex, hermes]) {
+      const server = createServer((connection) => readLines(connection, (line) => messages.push(line)));
+      servers.push(server);
+      await listen(server, path);
+    }
     writeFileSync(join(f.peers, "codex-existing.json"), JSON.stringify({
       pid: process.pid, name: "codex:existing", threadId: "existing", address: address(codex),
     }));
@@ -206,7 +302,7 @@ test("mixed Claude directories preserve old Codex and unregistered Hermes reply 
     assert.equal(peerSocket(address(hermes)), undefined);
     chmodSync(f.sockets, 0o700);
     assert.equal(peerSocket(address(hermes)), hermes);
-  } finally { await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve)))); }
+  } finally { await Promise.all(servers.map(closeServer)); }
 });
 
 test("remembered directories require the same owned inode and are scoped to the configured registries", (t) => {
