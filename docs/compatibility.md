@@ -19,7 +19,9 @@ Windows is not supported. WSL must run all participating agents inside the same 
 
 - Codex CLI **0.160.0**; startup binding verified on **0.162.1**.
 - Claude Code **2.1.288**.
-- Hermes fork [ThomasMarcelis/hermes-agent](https://github.com/ThomasMarcelis/hermes-agent) at [`1afb5d16d2d25e1d8e13703c1ce946e3ca0adc0d`](https://github.com/ThomasMarcelis/hermes-agent/commit/1afb5d16d2d25e1d8e13703c1ce946e3ca0adc0d).
+- Hermes fork [ThomasMarcelis/hermes-agent](https://github.com/ThomasMarcelis/hermes-agent), two builds:
+  - **CI-tested:** [`1afb5d16d2d25e1d8e13703c1ce946e3ca0adc0d`](https://github.com/ThomasMarcelis/hermes-agent/commit/1afb5d16d2d25e1d8e13703c1ce946e3ca0adc0d), the build the "Hermes pinned host" job runs the integration tests against.
+  - **Live-verified:** [`0d7c749cff42cd4791e0342da226c6d499de5aeb`](https://github.com/ThomasMarcelis/hermes-agent/commit/0d7c749cff42cd4791e0342da226c6d499de5aeb) (branch `jd/thin-v0.22.2`, Hermes v0.22.2 plus a minimal owned host patch), the build the maintainer's gateways run. agent-peers 0.2.0 was verified end to end on it with a Hermes to Claude round trip through the plugin, and the same Hermes integration tests as CI pass against it (run manually, not in CI). That build requires Python 3.14 for its core dependencies. The two builds are different lines of history, not parent and child.
 
 The pinned Hermes host is reproducible in CI. It is a fork dependency, not a claim that any upstream version with the same version number includes these APIs.
 
@@ -31,7 +33,7 @@ A Codex inbox opens when the session starts: the MCP server finds its own thread
 
 Claude's inbox protocol is undocumented. Inbound messages may be held for approval or rejected according to Claude settings. In particular, `bypassPermissions` does not imply accepting external messages. The package does not change that policy.
 
-Hermes support is experimental. Tests verify plugin loading, profile isolation, and busy/idle replies to the originating Discord thread on the pinned fork. CLI and Desktop/TUI reset/compression behavior is not covered by this release's compatibility guarantee: the current fork has a Desktop idle-dispatch/reset race that requires a separate host fix. No upstream submission or host upgrade is part of installing this package.
+Hermes support is experimental. Tests verify plugin loading, profile isolation, and busy/idle replies to the originating Discord thread on the pinned fork. CLI and Desktop/TUI reset/compression behavior is not covered by this release's compatibility guarantee: the current fork has a Desktop idle-dispatch/reset race that requires a separate host fix. Known host limitation: on the idle and queued paths in shared threads (for example a Discord thread), Hermes labels the injected peer text with the owner's display name, so the transcript attributes it to the human; the frame inside the message names the real peer ([#24](https://github.com/ThomasMarcelis/agent-peers/issues/24)). No upstream submission or host upgrade is part of installing this package.
 
 Claude sessions may use different private socket directories on the same machine. Codex maintains a reply inbox in each verified directory; Hermes selects a private reply inbox in the destination's directory. Existing owned inboxes survive discovery changes, and a missing Codex inbox can be repaired on the next tool call without resetting the conversation.
 
