@@ -39,6 +39,7 @@
     "scripts/install-hermes-plugin.py",
     "docs/",
     "!docs/observatory-design.md",
+    "!docs/design/",
     "CLAUDE-snippet.md",
     "CHANGELOG.md",
     "LICENSE",
