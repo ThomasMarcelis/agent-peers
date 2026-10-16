@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { allPeers } from "../src/wire.mjs";
+import { allPeers, probePeers, whoami } from "../src/wire.mjs";
 import { formatSessionPeer } from "../src/discovery.mjs";
 import { VERSION } from "../src/version.mjs";
 
@@ -7,7 +7,8 @@ const usage = `agent-peers ${VERSION} — local agent messaging
 
 Usage: agent-peers <command> [options]
 
-  list [--json]     Discover running Claude Code and Codex inboxes
+  list [--json] [--no-probe]  Discover running Claude Code and Codex inboxes; rows that refuse connections are marked stale
+  whoami [--json]   Print the calling session's name and address (found through process ancestry)
   doctor [--json]   Check local prerequisites and whether the Codex app-server answers
   logs [--json]     Summarize retained local diagnostic events
   hermes-bridge    Start the plugin-managed JSON-lines subprocess
@@ -34,8 +35,9 @@ async function main() {
     console.log(VERSION);
     return;
   }
-  if (!["list", "doctor", "logs", "hermes-bridge"].includes(cmd) || args.length > 1 ||
-      (args.length && (args[0] !== "--json" || cmd === "hermes-bridge"))) {
+  const allowed = cmd === "list" ? ["--json", "--no-probe"] : ["doctor", "logs", "whoami"].includes(cmd) ? ["--json"] : [];
+  if (!["list", "doctor", "logs", "whoami", "hermes-bridge"].includes(cmd) || args.length > allowed.length ||
+      new Set(args).size !== args.length || args.some((a) => !allowed.includes(a))) {
     throw new SyntaxError("unknown command or option; run agent-peers --help");
   }
   if (cmd === "hermes-bridge") {
@@ -71,7 +73,16 @@ async function main() {
     }
     return;
   }
-  const peers = allPeers();
+  if (cmd === "whoami") {
+    const me = whoami();
+    if (!me) throw new Error("no Claude Code or Codex session found in this process's ancestry; run whoami from inside a session");
+    const { name, address, kind, cwd, pid } = me;
+    if (args.includes("--json")) console.log(JSON.stringify({ name, address, kind, cwd, pid }, null, 2));
+    else console.log(`${name}\n${address}`);
+    return;
+  }
+  const found = allPeers();
+  const peers = args.includes("--no-probe") ? found : await probePeers(found);
   if (args.includes("--json")) console.log(JSON.stringify({ peers }, null, 2));
   else {
     if (!peers.length) console.log("No peer inboxes found. A Codex session opens its inbox a few seconds after it starts; if one is missing, call list_peers in it.");
