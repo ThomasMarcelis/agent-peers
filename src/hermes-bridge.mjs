@@ -11,7 +11,7 @@ import { SendFailure, isError } from "./status.mjs";
 import { MAX_LINE, address, allPeers, generation, inDiscoveryScope, peerSocket } from "./wire.mjs";
 
 const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256, HANDOFFS_MAX = 256, CONTACTS_MAX = 256,
-  CONVERSATIONS_MAX = 2 * SESSIONS_MAX;
+  CONVERSATIONS_MAX = 2 * SESSIONS_MAX, RETIRED_HANDOFF_MS = 60_000;
 const IPC_QUEUE_MAX = 128, IPC_WRITE_TIMEOUT_MS = 5000;
 const logger = (message) => console.error(`[hermes-bridge ${process.pid}] ${message}`);
 const event = (name, fields) => logEvent("hermes-bridge", name, fields);
@@ -43,6 +43,7 @@ export class HermesBridge {
   // (pins), the addresses it has written to (the only senders its inboxes accept; anyone else
   // guessed the address), and its dedup and token buckets. Cleared when it closes.
   #conversations = new Map();
+  #retiredHandoffs = new Map();
 
   constructor({ app = new AppServer(), emit = async () => {}, log = logger } = {}) {
     this.#app = app;
@@ -287,6 +288,7 @@ export class HermesBridge {
     const started = performance.now();
     route.chain = route.chain.then(async () => {
       if (route.closed) {
+        if (message.id) this.#takeHandoff(route.session, message.id);
         reply("dropped", "inbox-closed");
         return drop("closed", fields);
       }
@@ -299,18 +301,30 @@ export class HermesBridge {
       .finally(() => { route.queued--; this.#queued--; });
   }
 
+  // The receipt callback for a message handed to the plugin, removed so it answers once. A
+  // retired route's handoffs stay a minute, so the plugin's late inbox-closed still reaches them.
+  #takeHandoff(session, id) {
+    for (const route of this.#routes.values()) {
+      const reply = route.session === session && route.handoffs.get(id);
+      if (reply) {
+        route.handoffs.delete(id);
+        return reply;
+      }
+    }
+    const key = `${session}\0${id}`, kept = this.#retiredHandoffs.get(key);
+    this.#retiredHandoffs.delete(key);
+    return kept && kept.expires > Date.now() ? kept.reply : undefined;
+  }
+
   // The plugin's report of what the host did with a peer_message: accepted, or why not.
   deliveryResult(params) {
     if (!params || typeof params.session !== "string" || typeof params.message_id !== "string") return;
-    for (const route of this.#routes.values()) {
-      const reply = route.session === params.session && route.handoffs.get(params.message_id);
-      if (!reply) continue;
-      route.handoffs.delete(params.message_id);
-      const reason = ["queue-full", "inbox-closed"].includes(params.reason) ? params.reason : "host-rejected";
-      event("delivery.host", { sessionId: logIdentity(params.session), messageId: logIdentity(params.message_id),
-        outcome: params.accepted === true ? "accepted" : "rejected" });
-      return params.accepted === true ? reply("accepted") : reply("dropped", reason);
-    }
+    const reply = this.#takeHandoff(params.session, params.message_id);
+    if (!reply) return;
+    const reason = ["queue-full", "inbox-closed"].includes(params.reason) ? params.reason : "host-rejected";
+    event("delivery.host", { sessionId: logIdentity(params.session), messageId: logIdentity(params.message_id),
+      outcome: params.accepted === true ? "accepted" : "rejected" });
+    return params.accepted === true ? reply("accepted") : reply("dropped", reason);
   }
 
   async #retire(route) {
@@ -319,6 +333,12 @@ export class HermesBridge {
     // listenInbox bound a private temporary name, so closing never unlinks a replacement at the
     // public path, and the socket is removed only while this route still owns it.
     await closeInbox(route.inbox);
+    for (const [id, reply] of route.handoffs) {
+      const key = `${route.session}\0${id}`;
+      this.#retiredHandoffs.delete(key);
+      this.#retiredHandoffs.set(key, { reply, expires: Date.now() + RETIRED_HANDOFF_MS });
+      if (this.#retiredHandoffs.size > HANDOFFS_MAX) this.#retiredHandoffs.delete(this.#retiredHandoffs.keys().next().value);
+    }
     route.handoffs.clear();
     event("inbox.closed", { sessionId: logIdentity(route.session), targetId: logIdentity(route.address), queueDepth: route.queued });
   }

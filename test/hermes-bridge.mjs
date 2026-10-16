@@ -354,6 +354,21 @@ test("receipts back to senders: opted-in senders hear queued, then the host's an
   assert.ok(f.controls.every(({ line }) => line.from === sent.from));
 });
 
+test("a conversation that closes while the plugin holds a message still reports dropped/inbox-closed to its sender", async (t) => {
+  const f = await fixture(t);
+  const sent = await f.send("closing");
+  const line = { ...messageLine({ from: address(join(f.sockets, "codex-test.sock")), body: "reply" }), agent_peers: { v: 1, receipts: ["queued", "accepted"] } };
+  await post(peerSocket(sent.from), line);
+  await until(() => f.events.length === 1 && f.controls.length === 1, "the handoff");
+  await f.bridge.request("close_session", { session: "closing" });
+  f.bridge.deliveryResult({ session: "closing", message_id: line.msg_id, accepted: false, reason: "inbox-closed" });
+  f.bridge.deliveryResult({ session: "closing", message_id: line.msg_id, accepted: true });
+  await until(() => f.controls.length === 2, "the drop receipt");
+  await delay(30);
+  assert.deepEqual(f.controls.map(({ line: receipt }) => [receipt.orig_msg_id, receipt.status, receipt.drop_reason ?? null]),
+    [[line.msg_id, "queued", null], [line.msg_id, "dropped", "inbox-closed"]], "answered once");
+});
+
 test("an inbox frame that would exceed the host's line limit once re-encoded is dropped, not emitted", async (t) => {
   const f = await fixture(t);
   // Hermes route IDs are opaque and may be long; the notification repeats them.
