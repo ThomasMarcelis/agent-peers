@@ -10,7 +10,7 @@ export function codexDiscovery(peers, threads, self) {
     const sameTree = self && (p.threadId === self.rootId || t?.sessionId === self.rootId);
     rows.set(p.threadId || p.address, {
       name: p.name, kind: p.kind, cwd: p.cwd, status: t?.status?.type ?? p.status,
-      threadId: p.threadId,
+      threadId: p.threadId, generation: p.generation ?? null,
       native: { reachable: !self || sameTree ? null : false, reason: !self ? "caller session unknown"
         : sameTree ? "native target unavailable; check list_agents"
         : p.kind === "claude" ? "Claude recipient" : "separate Codex session" },
@@ -30,7 +30,7 @@ export function codexDiscovery(peers, threads, self) {
     }
     rows.set(t.id, {
       name: old?.name ?? `codex:${t.agentNickname || target}`,
-      kind: "codex", cwd: t.cwd, status: t.status?.type, threadId: t.id,
+      kind: "codex", cwd: t.cwd, status: t.status?.type, threadId: t.id, generation: old?.generation ?? null,
       native: { reachable: true, tool: "send_message", target },
       // Inbox addresses belong to roots; do not present the root's inbox as a way to
       // deliver directly to one of its subagents.
