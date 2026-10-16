@@ -62,11 +62,11 @@
   "scripts": {
     "check": "node scripts/check.mjs",
     "test": "node --test test/bind-retry.mjs test/discovery.mjs test/hermes-bridge.mjs test/wire.mjs test/app-server.mjs test/codex-peer.mjs test/cli.mjs test/logging.mjs",
-    "test:python": "python3 -m pytest -q",
+    "test:python": "node scripts/test-python.mjs",
     "test:package": "node scripts/test-package.mjs",
     "test:live": "node test/live-matrix.mjs",
     "test:live:hermes": "node test/hermes-live.mjs",
-    "prepublishOnly": "npm run check && npm test"
+    "prepublishOnly": "npm run check && npm test && npm run test:python && npm run test:package"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1",
