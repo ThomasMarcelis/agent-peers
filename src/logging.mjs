@@ -26,7 +26,8 @@ const outcomes = new Set(["started", "succeeded", "failed", "success", "error", 
   "rejected", "inbox_written", "emitted_to_host", "receipt_received", "queued", "dropped", "app_server_input_accepted",
   "skipped", "closed", "accepted", "bound", "unbound", "native_only", "degraded", "receipt_unavailable", "unreachable"]);
 const methods = new Set(["list_peers", "send_peer", "close_session", "shutdown", "initialize", "initialized", "thread/loaded/list",
-  "thread/read", "thread/resume", "turn/start", "turn/steer", "mcpServerStatus/list", "unknown"]);
+  "thread/read", "thread/resume", "turn/start", "turn/steer", "thread/inject_items", "mcpServerStatus/list",
+  "item/tool/call", "account/chatgptAuthTokens/refresh", "attestation/generate", "unknown"]);
 const codes = new Set(["ENOENT", "EACCES", "EPERM", "ELOOP", "ENOTDIR", "EISDIR", "ENOSPC", "EDQUOT", "EROFS", "EMFILE",
   "ENFILE", "EPIPE", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ERR_SOCKET_CLOSED", "ERR_INVALID_ARG_TYPE",
   "-32700", "-32600", "-32601", "-32602", "-32603", "-32000", "NATIVE_ROUTE_REQUIRED"]);
