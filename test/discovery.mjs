@@ -76,13 +76,14 @@ test("display provides usable arguments and labels Claude's native tool by platf
 test("native-only route errors explain the exact native target and idle wake route", () => {
   const threads = [{ ...child("zeno-thread", "root-a", "/root/accepted_content"), agentNickname: "Zeno" }];
   const rows = codexDiscovery([], threads, self);
-  for (const to of ["codex:Zeno", "Zeno", "Zen", "/root/accepted_content", "zeno-thread"]) {
+  for (const to of ["codex:Zeno", "Zeno", "/root/accepted_content", "zeno-thread"]) {
     const error = nativeRouteError(to, rows);
     assert.match(error, /native Codex subagent without a bridge route; send_peer cannot address it/);
     assert.match(error, /send_message \{"target":"\/root\/accepted_content"\}/);
     assert.match(error, /followup_task \{"target":"\/root\/accepted_content"\}/);
     assert.match(error, /codex_tui\.send_message_to_thread, is unsupported for subagents/);
   }
+  assert.equal(nativeRouteError("Zen", rows), null, "exact names only, never a fragment");
   const display = formatCodexPeer(rows[0]);
   assert.match(display, /send_peer and direct app-server input cannot target this subagent/);
   assert.match(display, /start idle turn: followup_task \{"target":"\/root\/accepted_content"\}/);
