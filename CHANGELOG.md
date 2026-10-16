@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-10-16
+
+First npm release since 0.1.0: 0.1.1 was tagged on GitHub but never published to npm, and its changes are included here.
+
+- `agent-peers doctor` asks the Codex app-server one read-only question instead of trusting socket presence, and reports a stale daemon link or a server that does not answer, with the start command.
+- Startup binding backs off to every 10 minutes after its quick retries and logs each failure reason once, plus one `unreachable` event and stderr line, instead of every minute forever.
+- Documented headless Codex workers on a private app-server; the unreachable-thread error now names the app-server in use and the alternatives.
+- Hermes frames carry the message `id` like Codex frames; Hermes sender names are sanitized for any route ID; the dependency recovery command uses `npm install` when the package has no lockfile.
+- The Hermes bridge drops an inbound message whose re-encoded notification would exceed the host's line limit instead of restarting the bridge.
+- The Claude compatibility footer is sent once per sender and recipient instead of on every message.
+- `send_peer` results carry a message ID that matches the `id` on the recipient's frame.
+- `@modelcontextprotocol/sdk` 1.32.1.
+- Startup-binding scans log `mcpServerStatus/list` instead of an unknown method. The internal observatory design draft is no longer packaged.
 
 - Shorter coordination guidance, incoming peer frames, Claude-only compatibility footers and delivery receipts. Message bodies, permission boundaries, reply routing and receipt metadata remain intact; private reply inboxes no longer receive Claude-specific footers.
 - Codex sessions open their inbox when they start instead of on their first agent-peers tool call, and are named after their working folder (`codex:<folder>-<id>`); `AGENT_PEERS_NAME` overrides the folder. A subagent's tool call no longer closes its root's inbox.

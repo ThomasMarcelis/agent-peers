@@ -130,6 +130,9 @@ test("compatibility footers are short and only added for known Claude recipients
   await peer.call("send_peer", { to: "claude:test", message: "hello" });
   assert.equal(parseEnvelope(f.messages.at(-1).message.content).body,
     "hello\n\n(Codex CLI peer; notify_when_idle unavailable.)");
+  // Once per recipient: later messages carry only their body.
+  await peer.call("send_peer", { to: "claude:test", message: "again" });
+  assert.equal(parseEnvelope(f.messages.at(-1).message.content).body, "again");
   rmSync(join(f.dir, "claude", "sessions", `${process.pid}.json`));
   // A private reply address need not appear in discovery; do not guess it is Claude.
   await peer.call("send_peer", { to: address(f.inbox), message: "private reply" });
@@ -195,7 +198,9 @@ test("a subagent served by its root's process keeps the root inbox open", async 
   const socket = peerSocket(JSON.parse(readFileSync(f.registry, "utf8")).address);
   const sent = await peer.call("send_peer", { to: "claude:test", message: "from the child" }, child);
   assert.match(sent.content[0].text, /Delivered/);
-  assert.equal(parseEnvelope(f.messages[0].message.content).from, address(socket));
+  // A subagent's send has no receipt to wait for, so the reply can beat the receiver's read.
+  const [line] = await until(() => f.messages.length && f.messages);
+  assert.equal(parseEnvelope(line.message.content).from, address(socket));
   assert.equal(existsSync(socket), true);
   assert.equal(existsSync(f.registry), true);
   await post(socket, messageLine({ from: address(f.inbox), body: "root still reachable" }));

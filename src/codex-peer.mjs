@@ -13,7 +13,8 @@ import { basename, dirname, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { AppServer } from "./app-server.mjs";
+import { AppServer, daemonSocket } from "./app-server.mjs";
+import { bindDelayMs, bindReporter } from "./bind-retry.mjs";
 import { codexDiscovery, formatCodexPeer, nativeRouteError } from "./discovery.mjs";
 import { coordinationGuidance } from "./guidance.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
@@ -101,13 +102,14 @@ async function bindNow(meta) {
 }
 
 async function resolveThread(threadId) {
-  // Delivery goes through the shared app-server daemon. A Codex started with -c overrides or
-  // --no-daemon hosts its thread in its own embedded server, which peers cannot reach.
-  // thread/read would load a thread from disk, so check the daemon has it live.
+  // Delivery goes through the app-server at daemonSocket(). codex exec, and a Codex started with -c
+  // overrides or --no-daemon, hosts its thread in its own embedded server, which peers cannot
+  // reach. thread/read would load a thread from disk, so check the server has it live.
   const loaded = new Set(await app.loadedThreads());
   if (!loaded.has(threadId)) {
-    throw new Error("this Codex session runs its own embedded app-server (started with -c or --no-daemon), " +
-      "so peers cannot reach it; start codex without config overrides to use agent-peers");
+    throw new Error(`this Codex thread is not loaded on the app-server agent-peers uses (${daemonSocket()}). ` +
+      "codex exec and sessions started with -c or --no-daemon run their own embedded app-server, which peers cannot reach. " +
+      "Start codex on the shared daemon, or run it on a private app-server and point AGENT_PEERS_CODEX_APP_SERVER at its socket");
   }
   const t = await app.readThread(threadId);
   let rootId = threadId, parentId = t.parentThreadId;
@@ -138,31 +140,60 @@ async function resolveThread(threadId) {
 // reachable before its first tool call. A thread in an embedded app-server, or a server
 // configured under another name, is never found here and binds on its first call as before.
 const serverInfo = { name: "agent-peers", version: VERSION, description: `agent-peers inbox ${randomUUID()}` };
-const START_RETRY_MS = [0, 250, 500, 1000, 2000, 4000, 8000, 15000, 30000], RETRY_MS = 60_000, SCAN_MS = 20_000;
+const SCAN_MS = 20_000;
+const introduced = new Set();
+const firstContact = (key) => {
+  if (introduced.has(key)) return false;
+  if (introduced.size >= 4096) introduced.clear();
+  introduced.add(key);
+  return true;
+};
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms).unref());
 const ownedBy = async (id) => (await app.mcpServers(id, "agent-peers")).some((s) => s?.serverInfo?.description === serverInfo.description);
 
-// Retries quickly, then once a minute, until this process is bound, by a scan or a tool call.
+// An app-server that refuses, closes or times out is unavailable; a scan that completes without
+// this process's thread means the thread is hosted elsewhere, such as an embedded server.
+const unavailable = (error) => ["ENOENT", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"].includes(error?.code) ||
+  /app-server .*(?:closed|timed out)|socket hang up/.test(String(error?.message));
+
+// Retries quickly, then backs off to every 10 minutes, until this process is bound by a scan or a
+// tool call. Each failure reason is logged once, plus one "unreachable" event and stderr line.
 async function bindAtStart() {
+  const report = bindReporter();
   for (let attempt = 0; !self; attempt++) {
-    await delay((START_RETRY_MS[attempt] ?? RETRY_MS) * (0.8 + Math.random() * 0.4));
+    await delay(bindDelayMs(attempt) * (0.8 + Math.random() * 0.4));
     if (self) return;
+    let failure;
     try {
       const found = await findOwnThread();
       if (found === "subagent" || found === "ambiguous") {
         // A sub-agent's own process never gets an inbox; two roots on one process cannot be told apart.
         return log("inbox.bind", { outcome: "skipped", reason: found === "ambiguous" ? "ambiguous_target" : "unsupported" });
       }
-      if (!found) continue;
-      const bindFound = async () => {
-        // Recheck inside the binding chain: a tool call may have bound this process meanwhile, or
-        // a replacement process may now serve the thread and own its inbox.
-        if (self || !(await ownedBy(found)) || otherLiveOwner(found)) return;
-        return bindNow({ threadId: found });
-      };
-      await (binding = binding.then(bindFound, bindFound));
+      if (found === null) failure = { reason: "unloaded_thread" };
+      if (found) {
+        const bindFound = async () => {
+          // Recheck inside the binding chain: a tool call may have bound this process meanwhile, or
+          // a replacement process may now serve the thread and own its inbox.
+          if (self || !(await ownedBy(found)) || otherLiveOwner(found)) return;
+          return bindNow({ threadId: found });
+        };
+        await (binding = binding.then(bindFound, bindFound));
+      }
     } catch (e) {
-      log("inbox.bind", { outcome: "failed", ...errorFields(e) });
+      failure = unavailable(e) ? { reason: "app_server_unavailable", errorCode: errorFields(e).errorCode } : errorFields(e);
+    }
+    if (self) return;
+    const event = report(attempt, failure?.reason);
+    if (!event) continue;
+    log("inbox.bind", { ...event, errorCode: failure.errorCode });
+    if (event.outcome === "unreachable") {
+      try {
+        process.stderr.write(`agent-peers: no inbox yet; ${event.reason === "app_server_unavailable"
+          ? `the Codex app-server at ${daemonSocket()} is not answering`
+          : "this thread is not on the app-server agent-peers uses (codex exec, -c and --no-daemon sessions run their own)"}. ` +
+          "Retrying every few minutes; a list_peers or send_peer call also opens it.\n");
+      } catch {}
     }
   }
 }
@@ -492,8 +523,9 @@ async function send(to, message, meta, trace) {
     if (!from) throw new Error("your root Codex session has no inbox in this peer's directory; ask your root agent to call list_peers or send_peer first");
   } else from = (await inboxFor(caller, directory)).address;
   if (target.address === from) throw new Error("that address is this session's own inbox");
-  // Claude Code frames every peer as "another Claude session", so tell Claude what this is.
-  const body = target.kind === "claude"
+  // Claude Code frames every peer as "another Claude session", so tell Claude what this is, once
+  // per sending thread and recipient: the recipient keeps it in context.
+  const body = target.kind === "claude" && firstContact(`${caller.threadId}\0${target.address}`)
     ? `${message}\n\n(Codex CLI ${caller.subagent ? "subagent; replies reach root" : "peer"}; notify_when_idle unavailable.)`
     : message;
   const line = messageLine({ from, fromName: caller.name, body });

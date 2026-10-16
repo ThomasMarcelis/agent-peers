@@ -8,7 +8,7 @@ const usage = `agent-peers ${VERSION} — local agent messaging
 Usage: agent-peers <command> [options]
 
   list [--json]     Discover running Claude Code and Codex inboxes
-  doctor [--json]   Check local prerequisites without changing configuration
+  doctor [--json]   Check local prerequisites and whether the Codex app-server answers
   logs [--json]     Summarize retained local diagnostic events
   hermes-bridge    Start the plugin-managed JSON-lines subprocess
   --version       Print the installed version
@@ -45,7 +45,7 @@ async function main() {
   }
   if (cmd === "doctor") {
     const { diagnose } = await import("../src/diagnostics.mjs");
-    const result = diagnose();
+    const result = await diagnose();
     if (args.includes("--json")) console.log(JSON.stringify(result, null, 2));
     else {
       console.log(`agent-peers ${VERSION}`);

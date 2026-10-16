@@ -25,7 +25,7 @@ Backed by [live Claude/Codex round trips, Hermes routing tests, and Linux/macOS 
 Requires **Node.js 22+**, Linux or macOS, and [compatible agent versions](docs/compatibility.md#tested-agent-builds).
 
 ```sh
-npm install -g agent-peers@0.1.1
+npm install -g agent-peers@0.2.0
 ```
 
 ### Codex (MCP server)
@@ -36,7 +36,7 @@ codex mcp add agent-peers -- codex-peer
 
 Start a new Codex session; its inbox opens within seconds, without a tool call, and it is listed as `codex:<folder>-<id>`. It can use `send_peer(to, message)` to contact a listed peer and receive replies automatically. Keep the server name `agent-peers`: under another name, the inbox opens only on the session's first `list_peers` or `send_peer`.
 
-Codex must use its shared app-server. Sessions started with `-c` overrides or `--no-daemon` are unsupported.
+A Codex session is reachable on the app-server agent-peers uses: Codex's shared daemon by default, or a [private app-server](docs/compatibility.md#headless-codex-on-a-private-app-server) for headless workers. `codex exec`, `-c` overrides and `--no-daemon` run an embedded server that peers cannot reach.
 
 ### Claude Code
 

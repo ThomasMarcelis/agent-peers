@@ -21,14 +21,14 @@ export class AppServer {
 
   constructor(onNotification, options = {}) {
     this.#onNotification = onNotification;
-    this.#options = { handshakeTimeoutMs: 10_000, connectTimeoutMs: 5000, ...options };
+    this.#options = { handshakeTimeoutMs: 10_000, connectTimeoutMs: 5000, log: logEvent, ...options };
   }
 
   async request(method, params, timeoutMs = 15_000, context = {}) {
     const started = performance.now();
     const trace = { operationId: context.operationId ?? randomUUID(), method,
       threadId: logIdentity(params?.threadId) };
-    logEvent("app-server", "rpc.request", { ...trace, outcome: "started" });
+    this.#options.log("app-server", "rpc.request", { ...trace, outcome: "started" });
     try {
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("invalid app-server request timeout");
       const connection = this.#connect();
@@ -36,10 +36,10 @@ export class AppServer {
       if (connection.failed || this.#closed) throw new Error("app-server connection closed");
       if (connection.pending.size >= 256) throw new Error("too many pending app-server requests");
       const result = await this.#request(connection, method, params, timeoutMs);
-      logEvent("app-server", "rpc.request", { ...trace, outcome: "succeeded", durationMs: performance.now() - started });
+      this.#options.log("app-server", "rpc.request", { ...trace, outcome: "succeeded", durationMs: performance.now() - started });
       return result;
     } catch (error) {
-      logEvent("app-server", "rpc.request", { ...trace, outcome: "failed", durationMs: performance.now() - started, ...errorFields(error) });
+      this.#options.log("app-server", "rpc.request", { ...trace, outcome: "failed", durationMs: performance.now() - started, ...errorFields(error) });
       throw error;
     }
   }
@@ -72,7 +72,7 @@ export class AppServer {
     connection.fail = (error) => {
       if (connection.failed) return;
       connection.failed = true;
-      logEvent("app-server", "connection.closed", { outcome: this.#closed ? "closed" : "failed", ...errorFields(error) });
+      this.#options.log("app-server", "connection.closed", { outcome: this.#closed ? "closed" : "failed", ...errorFields(error) });
       if (this.#connection === connection) this.#connection = undefined;
       for (const pending of connection.pending.values()) pending.reject(error);
       connection.pending.clear();
@@ -92,7 +92,7 @@ export class AppServer {
           ws.send(JSON.stringify({ method: "initialized" }), (error) => {
             if (error) connection.fail(error);
             else {
-              logEvent("app-server", "connection.ready", { outcome: "succeeded" });
+              this.#options.log("app-server", "connection.ready", { outcome: "succeeded" });
               resolveReady();
             }
           });

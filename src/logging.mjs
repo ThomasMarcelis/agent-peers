@@ -20,13 +20,13 @@ const lastPruned = new Map();
 const reasons = new Set(["not_found", "ambiguous_target", "native_route_required", "subagent_input_forbidden", "timeout",
   "connection_closed", "permission_denied", "invalid_input", "rate_limit", "unknown", "malformed", "duplicate", "queue_full",
   "closed", "receipt_rejected", "self_send", "no_reply_route", "unloaded_thread", "unsafe_path", "replaced", "unsupported", "message_too_large",
-  "connection_limit", "sender_limit", "queue_limit", "queue_bytes_limit", "malformed_envelope", "inbox_replaced", "held", "delivered",
+  "connection_limit", "sender_limit", "queue_limit", "queue_bytes_limit", "malformed_envelope", "inbox_replaced", "app_server_unavailable", "held", "delivered",
   "rejected", "other_status", "unconfirmed", "idle_timeout", "frame_too_large", "invalid_json", "incomplete_frame"]);
 const outcomes = new Set(["started", "succeeded", "failed", "success", "error", "warning", "held", "receipt_delivered",
   "rejected", "inbox_written", "emitted_to_host", "receipt_received", "queued", "dropped", "app_server_input_accepted",
-  "skipped", "closed", "accepted", "bound", "unbound", "native_only", "degraded", "receipt_unavailable"]);
+  "skipped", "closed", "accepted", "bound", "unbound", "native_only", "degraded", "receipt_unavailable", "unreachable"]);
 const methods = new Set(["list_peers", "send_peer", "close_session", "shutdown", "initialize", "initialized", "thread/loaded/list",
-  "thread/read", "thread/resume", "turn/start", "turn/steer", "unknown"]);
+  "thread/read", "thread/resume", "turn/start", "turn/steer", "mcpServerStatus/list", "unknown"]);
 const codes = new Set(["ENOENT", "EACCES", "EPERM", "ELOOP", "ENOTDIR", "EISDIR", "ENOSPC", "EDQUOT", "EROFS", "EMFILE",
   "ENFILE", "EPIPE", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ERR_SOCKET_CLOSED", "ERR_INVALID_ARG_TYPE",
   "-32700", "-32600", "-32601", "-32602", "-32603", "-32000", "NATIVE_ROUTE_REQUIRED"]);

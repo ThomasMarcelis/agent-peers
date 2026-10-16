@@ -6,14 +6,14 @@
 | --- | --- |
 | `agent-peers list` | Sessions with exact Claude `SendMessage` and Codex `send_peer` targets |
 | `agent-peers list --json` | `{ "peers": [...] }`; no status text mixed into stdout |
-| `agent-peers doctor [--json]` | Runtime, dependency, and local path checks; does not modify configuration or send messages |
+| `agent-peers doctor [--json]` | Runtime, dependency, and local path checks, plus one read-only request to the Codex app-server to confirm it answers; does not modify configuration, start servers, or send messages |
 | `agent-peers logs [--json]` | Read-only summary of retained local diagnostic events |
 | `agent-peers --version` | Package version |
 | `agent-peers --help` | Usage |
 | `codex-peer` | Codex MCP server over stdio |
 | `agent-peers hermes-bridge` | Plugin-managed JSON-lines subprocess |
 
-Exit codes: `0` success, `1` runtime/diagnostic failure, `2` invalid CLI usage. Missing agent state is a diagnostic warning because running only one integration is valid. A present socket does not prove compatibility or model readiness.
+Exit codes: `0` success, `1` runtime/diagnostic failure, `2` invalid CLI usage. Missing agent state is a diagnostic warning because running only one integration is valid, and so is a Codex app-server that does not answer, such as a stale socket left after a reboot. An answering app-server does not prove compatibility or model readiness.
 
 ## Tools
 
@@ -30,7 +30,7 @@ A successful socket write confirms only inbox acceptance. Claude delivery receip
 | `CLAUDE_CONFIG_DIR` | Claude configuration directory used to locate session registry metadata |
 | `CODEX_HOME` | Codex home used to locate its shared daemon |
 | `AGENT_PEERS_HOME` | agent-peers registry directory |
-| `AGENT_PEERS_CODEX_APP_SERVER` | Explicit absolute path to an app-server Unix socket |
+| `AGENT_PEERS_CODEX_APP_SERVER` | Absolute path to the Unix socket of the app-server hosting this Codex thread, such as a [private app-server](compatibility.md#headless-codex-on-a-private-app-server); defaults to Codex's shared daemon |
 | `AGENT_PEERS_NAME` | Codex only: replaces the folder or title in the session's peer name, which keeps its `-<id>` suffix. Codex passes MCP servers only a few variables, so set it in `[mcp_servers.agent-peers.env]` |
 | `AGENT_PEERS_DEBUG` | Set to `1` to record structured local diagnostics; `0` disables recording, including an explicit log file |
 | `AGENT_PEERS_LOG` | Optional absolute private JSONL log file; enables diagnostics unless `AGENT_PEERS_DEBUG=0` |
@@ -66,7 +66,7 @@ Messages use Claude's `<cross-session-message>` envelope. Incoming agent input i
 
 ## Troubleshooting
 
-- **No Codex inbox:** it should open within seconds of the session starting. Check that the server is registered as `agent-peers` and the session uses the shared daemon; a `list_peers` call in that session also opens it.
+- **No Codex inbox:** it should open within seconds of the session starting. Run `agent-peers doctor`: the Codex app-server must answer. Check that the server is registered as `agent-peers` and that the session runs on the app-server agent-peers uses, not an embedded one (`codex exec`, `-c`, `--no-daemon`). A `list_peers` call in that session also opens it. Without a reachable thread, startup binding retries quickly, then every few minutes, and logs each failure reason once.
 - **Wrong native target:** rediscover from the sending Codex session. A thread UUID alone does not establish native reachability.
 - **Held Claude delivery:** review its inbound-message policy; agent-peers does not bypass it.
 - **Hermes unsupported route:** use the documented host revision. Upstream `inject_message` is not an equivalent fallback.
