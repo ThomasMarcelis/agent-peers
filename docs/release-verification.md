@@ -2,6 +2,15 @@
 
 Raw live transcripts are excluded from the repository and package.
 
+## 1.0.0-rc.4
+
+Verified on 2026-10-17 on Linux with Node 22.23.1. Documentation-only candidate: no runtime, wire or package-layout change since 1.0.0-rc.3, so the rc.3 live evidence below applies to this tree. The live suites were not rerun for this candidate; they create real sessions and were not required for a documentation-only delta.
+
+- Deterministic suites: 183 JavaScript tests and 35 Python tests passed (5 host-only Python tests deselected); `npm run check` reported syntax, versions and lockfile consistent.
+- Package: `npm run test:package` packed the artifact, installed it in a temporary directory, and verified the CLI, MCP handshake and 39-file contents.
+- Real use on rc.3, from the retained diagnostics only (counts and outcomes; message bodies are not logged). Between 09:25 and 10:38 UTC on 2026-10-17, a Claude Code session sent 41 messages to Codex, all queued and accepted into their turns, and 12 to a Hermes conversation, all accepted by the host; the Claude sender was admitted by 2 `name_resolved` checks. The Hermes bridge sent 10 messages to the claimed name `claude:marketsimulator/lead`, all written, and refreshed its own name once. Codex bound 18 root inboxes and made 50 sends to the Claude session, all written; Claude sends no receipt, so these were `unconfirmed`. No completed rc.3 send failed at the inbox or host stage; one Codex tool call started without a completion event.
+- Release-plan audit: #23 and real use are closed; #32 is documented in [Hermes](hermes.md#stable-names) and [compatibility](compatibility.md#what-to-expect); the remaining #30 items are documented and deferred beyond 1.0. The steering watch is deferred to the final 1.0.0: the new frame answered 15 of 16 busy and 16 of 16 idle contract peers, but the diagnostics do not record whether a real busy turn acted on a message.
+
 ## 1.0.0-rc.3
 
 Verified on 2026-10-17 on Linux with Node 22.23.1, Claude Code 2.1.302 and Codex CLI 0.162.1.
