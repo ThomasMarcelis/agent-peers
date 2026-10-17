@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.0-rc.4 — 2026-10-17
+
+Fourth release candidate for 1.0.0, on the npm `next` tag. Documentation only: no runtime, wire or package-layout change since 1.0.0-rc.3, whose live results stand. Closes the 1.0 release-plan audit; the final 1.0.0 remains gated on real-use steering reports.
+
+### Documented
+
+- A Hermes conversation must make one agent-peers call after a gateway restart before its claimed names are reachable again. Until then they read `not-running` and peers cannot start contact; the bridge has no offline mailbox and there is no host route-restore hook yet, so avoid restarts during active work ([Hermes](docs/hermes.md#stable-names), [compatibility](docs/compatibility.md#what-to-expect), #32).
+- 1.0 release-plan audit: the brief sentence that authorises replies (#23) is covered by the recorded steering runs, and real use by Claude, Codex and Hermes sessions on rc.3 is recorded. The steering watch's wording defect is closed by 15 of 16 busy and 16 of 16 idle answers with the new frame, against 0 of 16 and 0 of 16 with the old one; real-use reports of whether a busy turn acted remain the gate for the final 1.0.0. The remaining stable-name follow-ups are documented and deferred beyond 1.0 (#30).
+
 ## 1.0.0-rc.3 — 2026-10-17
 
 Third release candidate for 1.0.0, on the npm `next` tag. Claimed names are now [experimental](docs/stability.md#experimental) and hardened after an independent review, and peer frames are reworded so Codex workers answer peers. To let a lead steer a headless Codex worker, put the [brief sentence](docs/compatibility.md#headless-codex-on-a-private-app-server) in the worker's brief. Changes since 1.0.0-rc.2:
