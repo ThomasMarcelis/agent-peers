@@ -42,6 +42,11 @@ export function parseName(text, kind) {
     name: resolved ? `${resolved}:${parts[0]}/${parts[1]}` : undefined };
 }
 
+// The record version this agent-peers writes. A later version that changes what a record means
+// raises it, and this version then never replaces or removes such a record (slot).
+const RECORD_V = 1;
+const newer = (value) => Number.isInteger(value?.v) && value.v > RECORD_V;
+
 const directory = () => join(resolve(peersHome()), "names");
 const fileName = (name) => `n-${createHash("sha256").update(name).digest("hex").slice(0, 32)}.json`;
 
@@ -144,8 +149,9 @@ function holderOf(record) {
 
 // The record in a name's file and that file's identity. `record` is undefined for a file that is
 // not a valid record (unsafe, a symlink, not JSON, or wrong fields), which a claim may replace. A
-// file that could not be read now (`unreadable`) or a record a newer agent-peers wrote (`newer`)
-// is never replaced or removed: its holder may be running.
+// file that could not be read now (`unreadable`) or a record with a higher `v` than this version
+// writes (`newer`, even one it can read) is never replaced or removed: its holder may be running,
+// by rules this version does not know.
 function slot(file) {
   let st, read;
   try { st = lstatSync(file); } catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
@@ -156,8 +162,7 @@ function slot(file) {
     if (error.code && error.code !== "ELOOP") return { unreadable: error.code };
     return { dev: st.dev, ino: st.ino, record: undefined };
   }
-  const record = validRecord(read.record, file);
-  return { dev: read.dev, ino: read.ino, record, newer: !record && Number.isInteger(read.record.v) && read.record.v > 1 };
+  return { dev: read.dev, ino: read.ino, record: validRecord(read.record, file), newer: newer(read.record) };
 }
 const untouchable = (name, { newer, unreadable }) => newer ? `${name} was claimed with a newer agent-peers; only that version can change it.`
   : `Could not read the record for ${name} (${unreadable}); nothing changed. Try again.`;
@@ -260,7 +265,7 @@ export function claim(text, claimant) {
     ensurePrivateDir(peersHome());
     const file = join(ensurePrivateDir(directory()), fileName(parsed.name));
     sweep(dirname(file));
-    const next = { v: 1, name: parsed.name, kind: parsed.kind, owner: claimant.owner, generation: claimant.generation,
+    const next = { v: RECORD_V, name: parsed.name, kind: parsed.kind, owner: claimant.owner, generation: claimant.generation,
       claimedAt: Date.now(), holder: holderFields(parsed.kind, claimant.holder) };
     const mine = { ...fields, generation: claimant.generation, address: claimant.address };
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {

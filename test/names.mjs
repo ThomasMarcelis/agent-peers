@@ -400,6 +400,25 @@ test("a dead name is released only by a releaser of its own kind, and a Hermes o
   assert.equal(release("hermes:gaming/relay", gaming).status, "released");
 });
 
+test("a record with a higher version is read when it validates, and never replaced or removed", async (t) => {
+  const f = fixture(t), live = await f.session("live"), gone = await f.session("gone");
+  claim(NAME, live.claimant());
+  claim("claude:proj/gone", gone.claimant());
+  await gone.stop();
+  for (const name of [NAME, "claude:proj/gone"]) {
+    const file = fileOf(f.dir, name);
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), v: 2, future: { meaning: "unknown here" } }), { mode: 0o600 });
+  }
+  assert.equal(resolveClaim(NAME).holder, "claude:live", "a v2 record this version can read still resolves");
+  assert.throws(() => resolveClaim("claude:proj/gone"), (error) => error.reason === "not-running");
+  for (const name of [NAME, "claude:proj/gone"]) {
+    const before = readFileSync(fileOf(f.dir, name), "utf8");
+    assert.deepEqual([claim(name, f.me()).reason, release(name, undefined, "claude").reason], ["name-held", "not-holder"], name);
+    assert.equal(readFileSync(fileOf(f.dir, name), "utf8"), before, `${name} is untouched`);
+  }
+  assert.deepEqual([claim(NAME, live.claimant()).reason, release(NAME, live.claimant()).reason], ["name-held", "not-holder"], "not even by its holder");
+});
+
 test("file safety: unsafe, foreign or mismatched files are never read as claims; the directory is private", async (t) => {
   const f = fixture(t), other = await f.session("other");
   claim(NAME, other.claimant());
