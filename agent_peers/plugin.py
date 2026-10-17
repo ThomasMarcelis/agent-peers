@@ -352,7 +352,7 @@ def register(ctx):
     ctx.register_tool(
         name="release_name", toolset="agent-peers", handler=release_name,
         schema={"name": "release_name", "description": (
-            "Release a name this conversation holds, or one whose holder is no longer running."
+            "Release a name of this profile that this conversation holds, or one whose holder is no longer running."
         ), "parameters": name_schema},
     )
     if peers._supports_replies():
