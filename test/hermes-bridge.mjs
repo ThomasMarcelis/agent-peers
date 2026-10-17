@@ -819,25 +819,33 @@ test("a claimed name admits senders that used the name, never one that found the
   assert.deepEqual([f.events[2].params.session, f.events[2].params.message], ["named", "from another conversation"]);
 });
 
-test("senders admitted by name are bounded, apart from the peers the conversation wrote to", { timeout: 30_000 }, async (t) => {
+test("senders admitted by name are bounded and have their own buckets, apart from the peers the conversation wrote to", { timeout: 30_000 }, async (t) => {
   const f = await fixture(t, { profile: "jd" });
   const inbox = peerSocket((await named(f.bridge, "claim_name", "named", "conversation", "jd/relay")).address);
   const codex = address(join(f.sockets, "codex-test.sock")), claude = address(join(f.sockets, "claude-test.sock"));
   const byName = (from, body) => ({ ...messageLine({ from, body }), agent_peers: { v: 1, to_name: "hermes:jd/relay" } });
-  // A peer this conversation wrote to, which has answered once.
+  // A peer this conversation wrote to, which has not answered yet.
   await f.send("named", "codex:test", "hello");
-  await post(inbox, messageLine({ from: codex, body: "reply" }));
-  await until(() => f.events.length === 1, "the reply");
-  // The first sender admitted by name, then more than either bound (64 by name, 256 written to).
+  // An address nobody listens at proves no sender, so it is never admitted by name.
+  for (let i = 0; i < 300; i++) await post(inbox, byName(address(join(f.sockets, `ghost-${i}.sock`)), `ghost ${i}`));
+  // The first sender admitted by name, then more than the 64 by name, each a live socket.
   await post(inbox, byName(claude, "first by name"));
-  await until(() => f.events.length === 2, "the first message by name");
-  for (let i = 0; i < 300; i++) await post(inbox, byName(address(join(f.sockets, `named-${i}.sock`)), `by name ${i}`));
-  await until(() => f.events.length >= 2 + 64, "the later messages by name");
-  await delay(300);
+  await until(() => f.events.length === 1, "the first message by name");
+  const drops = [];
+  for (let i = 0; i < 70; i++) {
+    const socket = join(f.sockets, `named-${i}.sock`);
+    await listen(createServer((conn) => readLines(conn, (line) => { if (line.type === "control") drops.push(line.drop_reason); })), socket, t);
+    await post(inbox, byName(address(socket), `by name ${i}`));
+  }
+  // 64 sets of buckets for senders by name: the first sender and 63 more are admitted, the rest wait.
+  await until(() => f.events.length === 64 && drops.filter((reason) => reason === "queue-full").length === 7, "the bound on senders by name");
+  // The reply target's first reply still has buckets of its own.
+  await post(inbox, messageLine({ from: codex, body: "the answer" }));
+  await until(() => f.events.some((e) => e.params.message === "the answer"), "the reply target's message");
+  assert.ok(!f.events.some((e) => /^ghost/.test(e.params.message)));
+  // The latest 64 senders by name are remembered; the first one now needs the name again.
   const forgotten = messageLine({ from: claude, body: "forgotten" });
   await post(inbox, forgotten);
-  await post(inbox, messageLine({ from: codex, body: "still a reply target" }));
-  await until(() => f.events.some((e) => e.params.message === "still a reply target"), "the reply target's message");
   await until(() => f.controls.some(({ kind, line }) => kind === "claude" && line.drop_reason === "not-a-reply-target" &&
     line.dropped_msg_ids.includes(forgotten.msg_id)), "the oldest sender by name forgotten");
 });

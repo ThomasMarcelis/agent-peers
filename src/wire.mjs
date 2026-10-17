@@ -268,6 +268,17 @@ export function socketPath(addr) {
   try { return decodeURIComponent(addr.slice(4)); } catch { return undefined; }
 }
 
+// The path behind a peer address when a socket of this user exists there now. peerSocket also
+// accepts a missing path, which is a valid reply address but proves no sender is there.
+export function existingSocket(addr) {
+  const path = peerSocket(addr);
+  if (!path) return undefined;
+  try {
+    const st = lstatSync(path);
+    return st.isSocket() && st.uid === uid ? path : undefined;
+  } catch { return undefined; }
+}
+
 // Automatic names never contain the characters reserved for explicit claims (`/`) or patterns.
 export const nameLabel = (s) => String(s).replace(/[^\p{L}\p{N}_.:-]/gu, "-").slice(0, 128);
 

@@ -10,7 +10,8 @@ import { SCOPE, claim, claimAt, claimRefusal, claimRows, claimsOf, heldBy, holds
 import { Outbox, Pins, sendPeer } from "./outbox.mjs";
 import { SendFailure, isError, readNameResolved } from "./status.mjs";
 import {
-  MAX_LINE, address, allPeers, claudeSessions, generation, inDiscoveryScope, peerSocket, processStart, socketDir, socketDirectories,
+  MAX_LINE, address, allPeers, claudeSessions, existingSocket, generation, inDiscoveryScope, peerSocket, processStart, socketDir,
+  socketDirectories,
 } from "./wire.mjs";
 
 const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256, HANDOFFS_MAX = 256, CONTACTS_MAX = 256,
@@ -46,7 +47,8 @@ export class HermesBridge {
   #introduced = new Set();
   // Per conversation, shared by its inboxes in every socket directory: the generations it saw
   // (pins), the addresses it has written to (the only senders its inboxes accept; anyone else
-  // guessed the address), and its dedup and token buckets. Cleared when it closes.
+  // guessed the address), the senders that used a name it holds, and the dedup and token buckets
+  // of each of those two groups. Cleared when it closes.
   #conversations = new Map();
   #retiredHandoffs = new Map();
   // The Hermes profile every name this bridge claims is scoped to; without one it claims none.
@@ -73,7 +75,10 @@ export class HermesBridge {
       const open = new Set([...this.#routes.values()].map((route) => route.session));
       for (const [key, value] of this.#conversations) if (!open.has(key) && !value.sending) { this.#conversations.delete(key); break; }
     }
-    state = { pins: new Pins(), contacts: new Set(), named: new Set(), admission: new Admission({ senders: SOURCES_MAX }), sending: 0 };
+    // Senders admitted by name get buckets of their own, so however many there are, they never take
+    // the buckets of the peers this conversation wrote to.
+    state = { pins: new Pins(), contacts: new Set(), named: new Set(), admission: new Admission({ senders: SOURCES_MAX }),
+      namedAdmission: new Admission({ senders: NAMED_MAX }), sending: 0 };
     this.#conversations.set(session, state);
     return state;
   }
@@ -392,10 +397,14 @@ export class HermesBridge {
     const fields = { sessionId, messageId: logIdentity(id), targetId: logIdentity(message.from), bytes: Buffer.byteLength(message.body) };
     const reply = (status, reason) => this.#receipts.send({ to: message.from, from: route.address, id: message.id, status, reason, optIn: message.ext.receipts });
     // Only peers this conversation wrote to may write to it (issue #28), and senders that used a name
-    // it holds, which are remembered apart. Anyone else found the inbox in the socket directory.
+    // it holds, which are remembered apart. Anyone else found the inbox in the socket directory. A
+    // sender is admitted by name only from a socket of this user that exists, never from an address
+    // nobody listens at.
     const conversation = this.#conversations.get(route.session);
-    if (!conversation?.contacts.has(message.from) && !conversation?.named.has(message.from)) {
-      if (!conversation || !message.ext.toName || !holds(message.ext.toName, generation("hermes", route.session))) {
+    const contact = Boolean(conversation?.contacts.has(message.from));
+    if (!contact && !conversation?.named.has(message.from)) {
+      if (!conversation || !message.ext.toName || !holds(message.ext.toName, generation("hermes", route.session)) ||
+          !inDiscoveryScope(() => existingSocket(message.from))) {
         reply("dropped", "not-a-reply-target");
         return drop("not_a_reply_target", fields);
       }
@@ -415,7 +424,8 @@ export class HermesBridge {
       reply("dropped", "too-large");
       return drop("message_too_large", fields);
     }
-    const reason = conversation.admission.admit(message.from, message.id, { full: route.queued >= QUEUE_MAX || this.#queued >= TOTAL_QUEUE_MAX });
+    const admission = contact ? conversation.admission : conversation.namedAdmission;
+    const reason = admission.admit(message.from, message.id, { full: route.queued >= QUEUE_MAX || this.#queued >= TOTAL_QUEUE_MAX });
     // A repeated id gets no receipt: the first copy's outcome stands.
     if (reason === "duplicate") return drop(reason, fields);
     if (reason) {
@@ -452,7 +462,7 @@ export class HermesBridge {
   // that session may write first, as a send_peer to the name may. Nothing answers it.
   #nameResolved(route, { from, name }) {
     const sessionId = logIdentity(route.session), conversation = this.#conversations.get(route.session);
-    const valid = conversation && inDiscoveryScope(() => from !== route.address && peerSocket(from) &&
+    const valid = conversation && inDiscoveryScope(() => from !== route.address && existingSocket(from) &&
       claudeSessions().some((session) => session.address === from) && holds(name, generation("hermes", route.session)));
     if (!valid) return event("receive.dropped", { sessionId, reason: "malformed" });
     this.#admitNamed(route.session, from);
