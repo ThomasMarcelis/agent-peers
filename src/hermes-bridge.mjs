@@ -15,7 +15,8 @@ import {
 } from "./wire.mjs";
 
 const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256, HANDOFFS_MAX = 256, CONTACTS_MAX = 256,
-  CONVERSATIONS_MAX = 2 * SESSIONS_MAX, RETIRED_HANDOFF_MS = 60_000, NAME_INBOXES_MAX = 16, NAMED_MAX = 64;
+  CONVERSATIONS_MAX = 2 * SESSIONS_MAX, RETIRED_HANDOFF_MS = 60_000, NAME_INBOXES_MAX = 16, NAMED_MAX = 64,
+  RECLAIM_BACKOFF_MS = 60_000, RECLAIM_REFUSED_MAX = 64;
 const IDENTITY = /^hermes:[A-Za-z0-9:_-]+$/;
 const START = processStart(process.pid);
 const IPC_QUEUE_MAX = 128, IPC_WRITE_TIMEOUT_MS = 5000;
@@ -173,34 +174,51 @@ export class HermesBridge {
   // survive a gateway restart; the generation is its route, which does not. Its inboxes are
   // whichever this route has open.
   #claimant(session, owner, identity) {
-    const addresses = [...this.#routes.values()].filter((route) => route.session === session).map((route) => route.address).slice(0, NAME_INBOXES_MAX);
+    const addresses = this.#inboxes(session).slice(0, NAME_INBOXES_MAX);
     return { kind: "hermes", scope: this.#profile, owner: generation("hermes", this.#profile, owner), generation: generation("hermes", session),
       address: addresses[0] ?? null, holder: { pid: process.pid, procStart: START, autoName: identity, addresses } };
   }
 
+  #inboxes(session) {
+    return [...this.#routes.values()].filter((route) => route.session === session).map((route) => route.address);
+  }
+
+  // Whether a conversation's names may need taking back or refreshing: it has not touched them
+  // under this conversation id, or its inboxes changed since (a send opened one in a new directory),
+  // so its records would name inboxes it no longer has, or miss ones it has.
   #untouched(session, { owner, identity } = {}) {
-    return Boolean(this.#profile) && typeof owner === "string" && owner.length > 0 && owner.length <= 512 && typeof identity === "string" &&
-      IDENTITY.test(identity) && identity.length <= 80 && this.#conversations.get(session)?.touched !== owner;
+    if (!this.#profile || typeof owner !== "string" || !owner.length || owner.length > 512 || typeof identity !== "string" ||
+        !IDENTITY.test(identity) || identity.length > 80) return false;
+    const state = this.#conversations.get(session);
+    return state?.touched !== owner || state.touchedInboxes !== this.#inboxes(session).sort().join("\n");
   }
 
   // The lazy re-claim. Route ids change at every gateway restart, so a conversation's next
   // agent-peers call takes back the names its conversation claimed (the same owner); and while a
   // route lives, its names follow the conversation id it now has, so compression cannot orphan
-  // them. Once per route and conversation id.
+  // them, and its records follow its inboxes. Once per route, conversation id and set of inboxes.
+  // A name whose refresh was refused is tried again at most once a minute, so a call does not
+  // open and close inboxes each time.
   async #touch(session, params) {
     if (!this.#untouched(session, params)) return;
     const { owner, identity } = params, claimant = this.#claimant(session, owner, identity);
+    const refused = this.#conversation(session).refused ??= new Map();
     let settled = true;
     for (const name of claimsOf({ owner: claimant.owner, generation: claimant.generation })) {
+      if (Date.now() - (refused.get(name) ?? -Infinity) < RECLAIM_BACKOFF_MS) { settled = false; continue; }
       // A name that cannot be refreshed now must never fail the call that triggered it.
       let result;
       try { result = await this.#claimName(session, owner, identity, name); }
       catch (error) { result = claimRefusal("conflict", safeError(error)); }
-      if (result.status === "refused") settled = false;
+      if (result.status === "refused") {
+        settled = false;
+        refused.set(name, Date.now());
+        if (refused.size > RECLAIM_REFUSED_MAX) refused.delete(refused.keys().next().value);
+      } else refused.delete(name);
       event("names.refresh", { sessionId: logIdentity(session), targetId: logIdentity(name),
         outcome: result.status === "refused" ? "failed" : "succeeded", ...(result.reason ? { reason: code(result.reason) } : {}) });
     }
-    if (settled) this.#conversation(session).touched = owner;
+    if (settled) Object.assign(this.#conversation(session), { touched: owner, touchedInboxes: this.#inboxes(session).sort().join("\n") });
   }
 
   // Claiming opens this route's inboxes in every verified socket directory first and records them,

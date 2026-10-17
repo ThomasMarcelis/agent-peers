@@ -796,6 +796,58 @@ test("after a restart the conversation's next call takes its names back, they fo
   assert.equal(resolveClaim(name).generation, generation("hermes", "route-5"));
 });
 
+test("a Hermes holder runs while any recorded inbox exists, and its record follows the inboxes it opens", async (t) => {
+  const f = await fixture(t, { profile: "jd" }), name = "hermes:jd/relay", otherDir = join(f.dir, "other");
+  mkdirSync(otherDir, { mode: 0o700 });
+  const touch = () => f.bridge.request("list_peers", { session: "route-1", owner: "conversation-1", identity: "hermes:JD" });
+  assert.equal((await named(f.bridge, "claim_name", "route-1", "conversation-1", name)).status, "claimed");
+  assert.deepEqual(JSON.parse(readFileSync(nameFile(f, name), "utf8")).holder.addresses.map((addr) => dirname(peerSocket(addr))), [f.sockets]);
+  // A Claude session in a second directory appears, and the conversation writes to it.
+  const other = spawn("sleep", ["60"], { stdio: "ignore" });
+  t.after(() => other.kill());
+  await once(other, "spawn");
+  const otherSocket = join(otherDir, "c.sock");
+  await listen(createServer((conn) => readLines(conn, () => {})), otherSocket, t);
+  writeFileSync(join(f.claude, "sessions", `${other.pid}.json`), JSON.stringify({ pid: other.pid, name: "other", messagingSocketPath: otherSocket,
+    procStart: processStart(other.pid) }));
+  assert.equal((await f.bridge.request("send_peer", { session: "route-1", name: "hermes:JD", to: "claude:other", message: "hi" })).status, "unconfirmed");
+  // Its next call records the inbox that send opened, so a sender in that directory gets it.
+  await touch();
+  const addresses = JSON.parse(readFileSync(nameFile(f, name), "utf8")).holder.addresses;
+  assert.deepEqual(addresses.map((addr) => dirname(peerSocket(addr))).sort(), [f.sockets, otherDir].sort());
+  assert.equal(dirname(resolveClaim(name, { directory: otherDir }).socket), otherDir);
+  // One inbox gone (its directory was cleaned) leaves the holder running at the other.
+  unlinkSync(peerSocket(addresses.find((addr) => dirname(peerSocket(addr)) === f.sockets)));
+  assert.equal(dirname(resolveClaim(name).socket), otherDir);
+  assert.equal((await named(f.bridge, "claim_name", "route-2", "conversation-2", name)).reason, "name-held");
+  await f.bridge.request("close_session", { session: "route-1" });
+  assert.throws(() => resolveClaim(name), notRunning, "with none left it is not running");
+});
+
+test("a name whose refresh keeps being refused is tried again at most once a minute", async (t) => {
+  const f = await fixture(t, { profile: "jd", logging: true }), name = "hermes:jd/relay";
+  assert.equal((await named(f.bridge, "claim_name", "route-1", "conversation-1", name)).status, "claimed");
+  await f.bridge.close();
+  // A record this version will not replace (a newer agent-peers rewrote it), so every refresh is refused.
+  writeFileSync(nameFile(f, name), JSON.stringify({ ...JSON.parse(readFileSync(nameFile(f, name), "utf8")), v: 2 }), { mode: 0o600 });
+  const next = f.restart();
+  const events = (event) => readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse)
+    .filter((record) => record.component === "hermes-bridge" && record.event === event);
+  const before = { bound: events("inbox.bound").length, closed: events("inbox.closed").length };
+  // The conversation has no inbox after the restart: each refused refresh would open one and close it.
+  for (let i = 0; i < 4; i++) await next.request("list_peers", { session: "route-2", owner: "conversation-1", identity: "hermes:JD" });
+  assert.deepEqual([events("inbox.bound").length - before.bound, events("inbox.closed").length - before.closed], [1, 1]);
+  for (let i = 0; i < 2; i++) {
+    await next.request("send_peer", { session: "route-2", owner: "conversation-1", name: "hermes:JD", to: "codex:test", message: `m${i}` });
+  }
+  assert.equal(events("names.refresh").filter((record) => record.outcome === "failed").length, 1);
+  const now = Date.now;
+  Date.now = () => now() + 61_000;
+  t.after(() => { Date.now = now; });
+  await next.request("list_peers", { session: "route-2", owner: "conversation-1", identity: "hermes:JD" });
+  assert.equal(events("names.refresh").filter((record) => record.outcome === "failed").length, 2, "a minute later it is tried again");
+});
+
 // The reply-target allowlist (issue #28) with claims: a sender that addressed the conversation by
 // its claimed name may write first; one that found its inbox in the socket directory may not.
 test("a claimed name admits senders that used the name, never one that found the inbox", async (t) => {
