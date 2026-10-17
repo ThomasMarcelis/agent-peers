@@ -5,6 +5,13 @@
 ### Changed
 
 - Claimed names are [experimental](docs/stability.md#experimental) in 1.x. Their commands, fields and storage may change in a minor release. Their safety rules stay fixed: no misrouting, no displacing a running holder, profile scoping, and the Hermes first-message rule. Sessions that do not claim names depend on covered surfaces only.
+- A Claude session claims a name only if Claude's session registry records its process start time, as current Claude Code does. Older builds get `unsupported-host` instead of a claim owned by the PID alone, which a later session reusing the PID and socket path could inherit (#30).
+
+### Fixed
+
+- Senders admitted to a Hermes conversation by its claimed name are kept apart from the peers it wrote to, at most the latest 64, so they can no longer push those reply targets out (#30).
+- A refused Hermes claim closes the inboxes it opened (#30).
+- A claim or release removes `.reap-*` and `.t-*` files that a claim or release that died midway left in `$AGENT_PEERS_HOME/names/` more than a minute ago (#30).
 
 ## 1.0.0-rc.2 — 2026-10-17
 

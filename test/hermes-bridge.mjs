@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { HermesBridge } from "../src/hermes-bridge.mjs";
 import { claim, claudeClaimant, resolveClaim } from "../src/names.mjs";
-import { MAX_LINE, address, allPeers, claudeSessionAt, generation, messageLine, parseEnvelope, peerSocket, post, readLines } from "../src/wire.mjs";
+import { MAX_LINE, address, allPeers, claudeSessionAt, generation, messageLine, parseEnvelope, peerSocket, post, processStart, readLines } from "../src/wire.mjs";
 import { closeServer, listen } from "./listeners.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -62,7 +62,7 @@ async function fixture(t, options = {}) {
     servers.push(server);
     await listen(server, socket);
     if (kind === "claude") writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({
-      pid: process.pid, name: "test", cwd: dir, status: "busy", messagingSocketPath: socket,
+      pid: process.pid, name: "test", cwd: dir, status: "busy", messagingSocketPath: socket, procStart: processStart(process.pid),
     }));
     else writeFileSync(join(peers, "codex-test.json"), JSON.stringify({
       pid: process.pid, name: "codex:test", address: address(socket), cwd: dir, threadId: "live-thread",
@@ -140,7 +140,7 @@ test("private sessions send, receive replies, and remain absent from every regis
   assert.notEqual(first.from, second.from);
   assert.deepEqual(first, { status: "accepted", reason: null, message_id: f.messages[0].line.msg_id, in_reply_to: null,
     to: address(join(f.sockets, "claude-test.sock")), name: "claude:test",
-    generation: generation("claude", process.pid, undefined, join(f.sockets, "claude-test.sock")), from: first.from, text: "Accepted by claude:test." });
+    generation: generation("claude", process.pid, processStart(process.pid), join(f.sockets, "claude-test.sock")), from: first.from, text: "Accepted by claude:test." });
   assert.equal(second.text, "Accepted by codex:test.");
   assert.deepEqual(f.messages[0].line.agent_peers, { v: 1, receipts: ["queued", "accepted"], generation: generation("hermes", "conversation-a") });
   const outbound = f.messages.map((entry) => parseEnvelope(entry.line.message.content));
@@ -747,6 +747,32 @@ test("a claim is scoped to the bridge's Hermes profile and opens an inbox in eve
   assert.equal((await f.bridge.request("list_peers")).names[0].running, false);
 });
 
+test("a refused claim closes the inboxes it opened and keeps those the conversation already had", async (t) => {
+  const f = await fixture(t, { profile: "jd" }), otherDir = join(f.dir, "other");
+  mkdirSync(otherDir, { mode: 0o700 });
+  // A second live Claude session makes its socket directory a verified one.
+  const other = spawn("sleep", ["60"], { stdio: "ignore" });
+  t.after(() => other.kill());
+  await once(other, "spawn");
+  writeFileSync(join(f.claude, "sessions", `${other.pid}.json`), JSON.stringify({ pid: other.pid, name: "other", messagingSocketPath: join(otherDir, "c.sock") }));
+  const inboxes = () => [f.sockets, otherDir].flatMap((dir) => readdirSync(dir).filter((name) => name.startsWith("hermes-")).map((name) => join(dir, name))).sort();
+  assert.equal((await named(f.bridge, "claim_name", "holder", "conversation-1", "jd/relay")).status, "claimed");
+  const held = inboxes();
+  assert.equal(held.length, 2);
+  // A conversation with no inbox yet: everything its claim opened is closed again.
+  const fresh = await named(f.bridge, "claim_name", "fresh", "conversation-2", "jd/relay");
+  assert.deepEqual([fresh.status, fresh.reason], ["refused", "name-held"]);
+  assert.deepEqual(inboxes(), held);
+  // A conversation that wrote to a peer keeps that inbox; the one its claim added is closed.
+  const sent = await f.send("writer", "codex:test", "hello");
+  const written = inboxes();
+  assert.equal(written.length, 3);
+  assert.equal((await named(f.bridge, "claim_name", "writer", "conversation-3", "jd/relay")).reason, "name-held");
+  assert.deepEqual(inboxes(), written);
+  await post(peerSocket(sent.from), messageLine({ from: address(join(f.sockets, "codex-test.sock")), body: "reply" }));
+  await until(() => f.events.some((e) => e.params.session === "writer" && e.params.message === "reply"), "the reply on the kept inbox");
+});
+
 test("after a restart the conversation's next call takes its names back, they follow compression, and nobody else takes a live one", async (t) => {
   const f = await fixture(t, { profile: "jd" }), name = "hermes:jd/relay";
   assert.equal((await named(f.bridge, "claim_name", "route-1", "conversation-1", name)).status, "claimed");
@@ -791,6 +817,29 @@ test("a claimed name admits senders that used the name, never one that found the
   assert.deepEqual([sent.status, sent.name, sent.generation], ["queued", "hermes:jd/relay", generation("hermes", "named")]);
   await until(() => f.events.length === 3);
   assert.deepEqual([f.events[2].params.session, f.events[2].params.message], ["named", "from another conversation"]);
+});
+
+test("senders admitted by name are bounded, apart from the peers the conversation wrote to", { timeout: 30_000 }, async (t) => {
+  const f = await fixture(t, { profile: "jd" });
+  const inbox = peerSocket((await named(f.bridge, "claim_name", "named", "conversation", "jd/relay")).address);
+  const codex = address(join(f.sockets, "codex-test.sock")), claude = address(join(f.sockets, "claude-test.sock"));
+  const byName = (from, body) => ({ ...messageLine({ from, body }), agent_peers: { v: 1, to_name: "hermes:jd/relay" } });
+  // A peer this conversation wrote to, which has answered once.
+  await f.send("named", "codex:test", "hello");
+  await post(inbox, messageLine({ from: codex, body: "reply" }));
+  await until(() => f.events.length === 1, "the reply");
+  // The first sender admitted by name, then more than either bound (64 by name, 256 written to).
+  await post(inbox, byName(claude, "first by name"));
+  await until(() => f.events.length === 2, "the first message by name");
+  for (let i = 0; i < 300; i++) await post(inbox, byName(address(join(f.sockets, `named-${i}.sock`)), `by name ${i}`));
+  await until(() => f.events.length >= 2 + 64, "the later messages by name");
+  await delay(300);
+  const forgotten = messageLine({ from: claude, body: "forgotten" });
+  await post(inbox, forgotten);
+  await post(inbox, messageLine({ from: codex, body: "still a reply target" }));
+  await until(() => f.events.some((e) => e.params.message === "still a reply target"), "the reply target's message");
+  await until(() => f.controls.some(({ kind, line }) => kind === "claude" && line.drop_reason === "not-a-reply-target" &&
+    line.dropped_msg_ids.includes(forgotten.msg_id)), "the oldest sender by name forgotten");
 });
 
 test("a Claude session that ran agent-peers resolve may write first; another Claude session may not", async (t) => {

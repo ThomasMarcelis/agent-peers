@@ -14,7 +14,7 @@ import {
 } from "./wire.mjs";
 
 const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256, HANDOFFS_MAX = 256, CONTACTS_MAX = 256,
-  CONVERSATIONS_MAX = 2 * SESSIONS_MAX, RETIRED_HANDOFF_MS = 60_000, NAME_INBOXES_MAX = 16;
+  CONVERSATIONS_MAX = 2 * SESSIONS_MAX, RETIRED_HANDOFF_MS = 60_000, NAME_INBOXES_MAX = 16, NAMED_MAX = 64;
 const IDENTITY = /^hermes:[A-Za-z0-9:_-]+$/;
 const START = processStart(process.pid);
 const IPC_QUEUE_MAX = 128, IPC_WRITE_TIMEOUT_MS = 5000;
@@ -73,7 +73,7 @@ export class HermesBridge {
       const open = new Set([...this.#routes.values()].map((route) => route.session));
       for (const [key, value] of this.#conversations) if (!open.has(key) && !value.sending) { this.#conversations.delete(key); break; }
     }
-    state = { pins: new Pins(), contacts: new Set(), admission: new Admission({ senders: SOURCES_MAX }), sending: 0 };
+    state = { pins: new Pins(), contacts: new Set(), named: new Set(), admission: new Admission({ senders: SOURCES_MAX }), sending: 0 };
     this.#conversations.set(session, state);
     return state;
   }
@@ -84,6 +84,15 @@ export class HermesBridge {
     contacts.add(to);
     if (contacts.size > CONTACTS_MAX) contacts.delete(contacts.values().next().value);
     return added;
+  }
+
+  // Senders admitted because they used a name this conversation holds. They are kept apart from
+  // the peers it wrote to, so however many there are, they never push one of those out.
+  #admitNamed(session, from) {
+    const { named } = this.#conversation(session);
+    named.delete(from);
+    named.add(from);
+    if (named.size > NAMED_MAX) named.delete(named.values().next().value);
   }
 
   async request(method, params = {}) {
@@ -191,22 +200,30 @@ export class HermesBridge {
 
   // Claiming opens this route's inboxes in every verified socket directory first and records them,
   // because a Hermes conversation has no registry: the claim is the only way it is ever listed. A
-  // directory that refuses an inbox is left out; with none at all, the claim is refused.
+  // directory that refuses an inbox is left out; with none at all, the claim is refused. A refused
+  // claim closes the inboxes it opened; those the conversation had before stay open.
   async #claimName(session, owner, identity, name) {
     const refused = (text) => claimRefusal("inbox-unavailable", text, { name, kind: "hermes" });
-    if ([...this.#routes.values()].some((route) => route.session === session && route.name !== identity)) {
-      return refused("this conversation already belongs to a different Hermes identity");
-    }
+    const own = () => [...this.#routes.values()].filter((route) => route.session === session);
+    if (own().some((route) => route.name !== identity)) return refused("this conversation already belongs to a different Hermes identity");
     this.#conversation(session);
-    let failure;
-    const directories = socketDirectories().slice(0, NAME_INBOXES_MAX);
-    for (const directory of directories.length ? directories : [socketDir()]) {
-      try { await this.#bind(session, identity, directory); }
-      catch (error) { failure ??= error; }
+    const before = new Set(own());
+    let failure, result;
+    try {
+      const directories = socketDirectories().slice(0, NAME_INBOXES_MAX);
+      for (const directory of directories.length ? directories : [socketDir()]) {
+        try { await this.#bind(session, identity, directory); }
+        catch (error) { failure ??= error; }
+      }
+      const claimant = this.#claimant(session, owner, identity);
+      result = claimant.holder.addresses.length ? claim(name, claimant) : refused(failure?.message ?? "no socket directory is available for an inbox");
+      return result;
+    } finally {
+      // Also when the claim threw.
+      if (!result || result.status === "refused") {
+        await Promise.all(own().filter((route) => !before.has(route)).map((route) => this.#retire(route)));
+      }
     }
-    const claimant = this.#claimant(session, owner, identity);
-    if (!claimant.holder.addresses.length) return refused(failure?.message ?? "no socket directory is available for an inbox");
-    return claim(name, claimant);
   }
 
   async #claimRequest(method, session, params) {
@@ -375,14 +392,14 @@ export class HermesBridge {
     const fields = { sessionId, messageId: logIdentity(id), targetId: logIdentity(message.from), bytes: Buffer.byteLength(message.body) };
     const reply = (status, reason) => this.#receipts.send({ to: message.from, from: route.address, id: message.id, status, reason, optIn: message.ext.receipts });
     // Only peers this conversation wrote to may write to it (issue #28), and senders that used a name
-    // it holds: they join its reply targets. Anyone else found the inbox in the socket directory.
+    // it holds, which are remembered apart. Anyone else found the inbox in the socket directory.
     const conversation = this.#conversations.get(route.session);
-    if (!conversation?.contacts.has(message.from)) {
+    if (!conversation?.contacts.has(message.from) && !conversation?.named.has(message.from)) {
       if (!conversation || !message.ext.toName || !holds(message.ext.toName, generation("hermes", route.session))) {
         reply("dropped", "not-a-reply-target");
         return drop("not_a_reply_target", fields);
       }
-      this.#contact(route.session, message.from);
+      this.#admitNamed(route.session, message.from);
     }
     // Only a claim this bridge verifies names the sender; a name the sender asserts is never shown.
     // Read only for a sender this conversation accepts.
@@ -438,7 +455,7 @@ export class HermesBridge {
     const valid = conversation && inDiscoveryScope(() => from !== route.address && peerSocket(from) &&
       claudeSessions().some((session) => session.address === from) && holds(name, generation("hermes", route.session)));
     if (!valid) return event("receive.dropped", { sessionId, reason: "malformed" });
-    this.#contact(route.session, from);
+    this.#admitNamed(route.session, from);
     event("receive.name_resolved", { sessionId, targetId: logIdentity(from) });
   }
 

@@ -2,13 +2,13 @@
 // conflict table, release, file safety, send-time resolution and pins.
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import fs, { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync,
   writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { claim, claimRows, claudeClaimant, parseName, release, resolveClaim, withClaims } from "../src/names.mjs";
@@ -35,12 +35,13 @@ function fixture(t) {
     writeFileSync(join(claude, "sessions", `${pid}.json`), JSON.stringify({ pid, name, messagingSocketPath: socket, ...extra }));
   // This process is a Claude session that records its start, so a PID reuse is detectable.
   record(process.pid, "me", join(sockets, "me.sock"), { procStart: processStart(process.pid) });
-  // Another live Claude session: a process of its own with a registry record.
+  // Another live Claude session: a process of its own with a registry record, which records its
+  // start as current Claude Code does.
   const session = async (name, socket) => {
     const child = spawn("sleep", ["60"], { stdio: "ignore" });
     children.push(child);
     await once(child, "spawn");
-    record(child.pid, name, socket);
+    record(child.pid, name, socket, { procStart: processStart(child.pid) });
     return { child, claimant: () => claudeClaimant(claudeSessionAt(child.pid)),
       stop: async () => { const exited = once(child, "exit"); child.kill(); await exited; } };
   };
@@ -84,7 +85,7 @@ async function shells(f, count, args) {
     let out = "", err = "";
     shell.stdout.on("data", (data) => { out += data; });
     shell.stderr.on("data", (data) => { err += data; });
-    f.record(shell.pid, `racer-${i}`);
+    f.record(shell.pid, `racer-${i}`, undefined, { procStart: processStart(shell.pid) });
     runs.push({ shell, output: () => out, errors: () => err });
   }
   const finish = async () => { for (const run of runs) { const closed = once(run.shell, "close"); run.shell.stdin.end(); await closed; } };
@@ -160,6 +161,54 @@ test("compare-and-swap: a record replaced between read and rename is restored, a
   assert.equal(resolveClaim(NAME).generation, next.claimant().generation);
 });
 
+// The documented worst case (reference, "Races"): B takes a dead name over between A's read and
+// A's rename, and C claims while A holds B's record aside, so A cannot put it back.
+test("a three-way race can lose a claim, but never leaves two holders", async (t) => {
+  const f = fixture(t), old = await f.session("old"), b = await f.session("b"), c = await f.session("c");
+  claim(NAME, old.claimant());
+  await old.stop();
+  const file = fileOf(f.dir, NAME);
+  interleave(t, file, { ...JSON.parse(readFileSync(file, "utf8")), owner: b.claimant().owner, generation: b.claimant().generation,
+    holder: b.claimant().holder });
+  const link = fs.linkSync;
+  let during;
+  fs.linkSync = (source, destination) => {
+    if (!during && String(source).includes(".reap-")) during = claim(NAME, c.claimant());
+    return link(source, destination);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.linkSync = link; syncBuiltinESMExports(); });
+  const a = claim(NAME, f.me());
+  assert.deepEqual([a.status, a.reason, during?.status], ["refused", "conflict", "claimed"]);
+  // B's takeover is lost; C is the one holder, on disk and for every reader.
+  assert.deepEqual(readdirSync(join(f.peers, "names")), [basename(file)], "one record and nothing left aside");
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).generation, c.claimant().generation);
+  assert.deepEqual(claimRows().map((row) => [row.name, row.generation, row.running]), [[NAME, c.claimant().generation, true]]);
+  assert.equal(resolveClaim(NAME).holder, "claude:c");
+});
+
+test("a claim or release sweeps what a dead claim left aside a minute ago, and nothing else", (t) => {
+  const f = fixture(t), names = join(f.peers, "names");
+  claim(NAME, f.me());
+  const leftover = (prefix) => { const path = join(names, `${prefix}-${randomUUID()}.json`); writeFileSync(path, "{}", { mode: 0o600 }); return basename(path); };
+  const reaped = leftover(".reap"), temporary = leftover(".t"), linked = `.reap-${randomUUID()}.json`, folder = `.t-${randomUUID()}.json`;
+  symlinkSync(join(f.dir, "elsewhere.json"), join(names, linked));
+  mkdirSync(join(names, folder));
+  writeFileSync(join(names, ".reap-not-a-uuid.json"), "{}", { mode: 0o600 });
+  const kept = [basename(fileOf(f.dir, NAME)), linked, folder, ".reap-not-a-uuid.json"].sort();
+  // A fresh one may belong to a claim or release still running.
+  claim(NAME, f.me());
+  assert.deepEqual(readdirSync(names).sort(), [...kept, reaped, temporary].sort());
+  const now = Date.now;
+  Date.now = () => now() + 61_000;
+  t.after(() => { Date.now = now; });
+  claim(NAME, f.me());
+  assert.deepEqual(readdirSync(names).sort(), kept, "only this user's regular leftovers, by their exact names");
+  const another = leftover(".reap");
+  assert.equal(release("proj/missing", f.me()).reason, "not-found");
+  assert.equal(readdirSync(names).includes(another), false, "a release sweeps too");
+});
+
 test("a running holder's refresh never leaves its name free for another claimant", async (t) => {
   const f = fixture(t), other = await f.session("other");
   assert.equal(claim(NAME, f.me()).status, "claimed");
@@ -213,7 +262,7 @@ test("the conflict table: dead and reused holders are taken over, the same owner
   const live = await f.session("live");
   assert.equal(claim(name, live.claimant()).status, "taken-over");
   // The same owner in a new generation (here a new socket) refreshes, with no flag.
-  f.record(live.child.pid, "live", join(f.sockets, "moved.sock"));
+  f.record(live.child.pid, "live", join(f.sockets, "moved.sock"), { procStart: processStart(live.child.pid) });
   const refreshed = claim(name, live.claimant());
   assert.deepEqual([refreshed.status, refreshed.previous.running], ["refreshed", false]);
   assert.equal(claim(name, live.claimant()).text, `${name} already names this session.`, "an unchanged refresh writes nothing");

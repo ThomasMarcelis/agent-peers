@@ -19,7 +19,8 @@ const KINDS = ["claude", "codex", "hermes"];
 export const SCOPE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const CLAIM = /^[a-z0-9][a-z0-9_.-]{0,63}$/, HEX16 = /^[a-f0-9]{16}$/, FILE = /^n-[a-f0-9]{32}\.json$/;
 const HERMES_SOCKET = /^hermes-[a-f0-9]{32}\.sock$/;
-const NAMES_PER_OWNER = 8, SCAN_MAX = 1024, ATTEMPTS = 3;
+const LEFTOVER = /^\.(?:reap|t)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
+const NAMES_PER_OWNER = 8, SCAN_MAX = 1024, ATTEMPTS = 3, LEFTOVER_MS = 60_000;
 const GRAMMAR = "<kind>:<scope>/<claim>, with kind claude, codex or hermes, scope [a-z0-9][a-z0-9_-]{0,63} and claim [a-z0-9][a-z0-9_.-]{0,63}";
 const HOLDER = { claude: "a Claude session", codex: "a Codex session", hermes: "a Hermes conversation" };
 
@@ -142,6 +143,21 @@ function temporaryRecord(dir, record) {
   return path;
 }
 
+// Remove what a claim or release that died midway left behind: a record moved aside (.reap-) or
+// one never published (.t-), unchanged for a minute since. Renaming a file aside sets its ctime,
+// so a swap still in progress is never swept. Only this user's regular files are removed.
+function sweep(dir) {
+  let files;
+  try { files = readdirSync(dir).filter((f) => LEFTOVER.test(f)).slice(0, SCAN_MAX); } catch { return; }
+  const before = Date.now() - LEFTOVER_MS;
+  for (const f of files) {
+    try {
+      const st = lstatSync(join(dir, f));
+      if (st.isFile() && st.uid === process.getuid() && st.ctimeMs < before) rmSync(join(dir, f));
+    } catch {}
+  }
+}
+
 // Publish a new file; "retry" when a name file appeared meanwhile.
 function create(file, record) {
   const temporary = temporaryRecord(dirname(file), record);
@@ -209,8 +225,15 @@ export function claim(text, claimant) {
     if (claimant.scope !== undefined && parsed.scope !== claimant.scope) {
       return claimRefusal("scope-denied", `Names claimed in this Hermes profile are hermes:${claimant.scope}/<claim>, not ${parsed.name}.`, fields);
     }
+    // Without a start time the owner is a PID alone, and a later session that reuses the PID and
+    // socket path would inherit the name. Older Claude Code builds record none.
+    if (claimant.kind === "claude" && claimant.holder.procStart === undefined) {
+      return claimRefusal("unsupported-host", "This Claude Code build records no process start time in its session registry, so a later " +
+        `session that reuses this PID could inherit ${parsed.name}. Update Claude Code to claim names. Nothing changed.`, fields);
+    }
     ensurePrivateDir(peersHome());
     const file = join(ensurePrivateDir(directory()), fileName(parsed.name));
+    sweep(dirname(file));
     const next = { v: 1, name: parsed.name, kind: parsed.kind, owner: claimant.owner, generation: claimant.generation,
       claimedAt: Date.now(), holder: holderFields(parsed.kind, claimant.holder) };
     const mine = { ...fields, generation: claimant.generation, address: claimant.address };
@@ -250,6 +273,7 @@ export function release(text, claimant, kind = claimant?.kind) {
   return inDiscoveryScope(() => {
     const parsed = parseName(text, kind), fields = { name: parsed.name, kind: parsed.kind };
     const dir = existingDirectory(), file = dir && join(dir, fileName(parsed.name));
+    if (dir) sweep(dir);
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       const current = file && slot(file), record = current?.record;
       if (!current) return claimRefusal("not-found", `No session has claimed ${parsed.name}.`, fields);
