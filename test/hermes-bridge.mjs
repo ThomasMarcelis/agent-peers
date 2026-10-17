@@ -15,8 +15,8 @@ import { closeServer, listen } from "./listeners.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function until(check, description = "condition") {
-  for (let i = 0; i < 200; i++) {
+async function until(check, description = "condition", tries = 200) {
+  for (let i = 0; i < tries; i++) {
     const value = check();
     if (value) return value;
     await delay(10);
@@ -999,7 +999,8 @@ test("a sender that floods name_resolved and reads no answer cannot make the bri
   flood.pause();
   await once(flood, "connect");
   flood.write(line.repeat(20_000));
-  await until(() => flood.writableLength === 0, "the bridge reading every line");
+  // Each line costs the bridge a registry scan, which takes seconds for 20,000 lines on macOS CI.
+  await until(() => flood.writableLength === 0, "the bridge reading every line", 2000);
   await delay(200);
   assert.ok(peak > 0 && peak <= 64 * 1024 + 1024, `peak ${peak} bytes`);
 });
