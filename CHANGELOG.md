@@ -12,6 +12,8 @@
 - Experimental names: a claim that would add a new name once 1024 exist on the machine is refused with `too-many-names`; refreshes and takeovers still work.
 - Experimental names: `agent-peers resolve` waits up to a second for a Hermes holder's answer to its `name_resolved` line, and exits 1 when the holder will not admit the calling session (`not-holder`, `unknown-sender`, `inbox-closed`). A bridge that does not answer, as before this release, counts as admitting.
 - Experimental names: a Codex recipient drops a line sent to a claimed name it does not hold now with `not-a-reply-target`, as a Hermes conversation does, and a Hermes conversation now drops such a line from its reply targets too.
+- Experimental names: a Codex root's names count as not running once its MCP process no longer serves the thread (its `codex-<threadId>.json` is gone or names another process), so a root that process unbound, or one `/new` left behind and later dropped, frees its names without waiting for the process to exit.
+- Experimental names: the `too-many-names` text lists the names the caller may release itself, with the command, or tells it to ask its user.
 
 ### Fixed
 
@@ -23,6 +25,9 @@
 - Experimental names: a Hermes holder runs while any of its recorded inboxes exists, and its records follow the inboxes its later sends open, so senders in a new socket directory get an inbox there.
 - Experimental names: a record that a claim which died midway left aside is put back while its name is free, instead of being deleted with the other leftovers.
 - Experimental names: a Hermes conversation whose names cannot be taken back retries at most once a minute, instead of opening and closing inboxes on every call.
+- Experimental names: a holder whose PID now belongs to another user's process (EPERM) counts as not running.
+- Experimental names: a Hermes bridge stops answering `name_resolved` on a connection once 64 KiB of answers wait unread there, so a sender that floods the line cannot grow the bridge's memory; `resolve` is unaffected.
+- Experimental names: a release that died midway can no longer be undone by the leftover sweep: it moves its record aside as `.rel-`, which the sweep only removes.
 - Senders admitted to a Hermes conversation by its claimed name are kept apart from the peers it wrote to, at most the latest 64, so they can no longer push those reply targets out (#30).
 - A refused Hermes claim closes the inboxes it opened (#30).
 - A claim or release removes `.reap-*` and `.t-*` files that a claim or release that died midway left in `$AGENT_PEERS_HOME/names/` more than a minute ago (#30).
@@ -30,7 +35,8 @@
 ### Documented
 
 - To let a lead steer a headless Codex worker, the worker's brief needs one sentence that names the lead ([compatibility](docs/compatibility.md#headless-codex-on-a-private-app-server), #23). With it, a correction sent mid-turn was applied before the turn ended every time; without it, never. The difference between 0.3.0 and 1.0 that the contract seemed to show was not reproduced in a controlled run.
-- Experimental names: a Hermes conversation that is compressed and then loses its gateway before its next agent-peers call does not take its names back automatically, because their owner is still its old conversation id ([Hermes](docs/hermes.md#stable-names)). A Codex root that `/new` left behind keeps its names until its MCP process exits. A sender admitted by `name_resolved` stays admitted for the conversation's lifetime.
+- Experimental names: a Hermes conversation that is compressed and then loses its gateway before its next agent-peers call does not take its names back automatically, because their owner is still its old conversation id ([Hermes](docs/hermes.md#stable-names)). A Codex root that `/new` left behind keeps its names while its MCP process still serves it. A sender admitted by `name_resolved` stays admitted for the conversation's lifetime.
+- Experimental names: only Claude, Codex and Hermes processes are recognised as nested agents; another agent run from a Claude session's shell (gemini, opencode, aider, goose) claims for that session. A name whose live holder will never release it can be freed by deleting its file under `$AGENT_PEERS_HOME/names/` ([names](docs/reference.md#names)).
 
 ## 1.0.0-rc.2 — 2026-10-17
 
