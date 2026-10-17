@@ -11,19 +11,19 @@ import { linkSync, lstatSync, readdirSync, renameSync, rmSync, writeFileSync } f
 import { basename, dirname, join, resolve } from "node:path";
 import { CLAIMED_NAME, SendFailure } from "./status.mjs";
 import {
-  address, claudeSessions, codexPeers, ensurePrivateDir, generation, inDiscoveryScope, peerSocket, peersHome, processStarts,
+  address, claudeSessions, codexPeers, ensurePrivateDir, generation, inDiscoveryScope, opencodePeers, peerSocket, peersHome, processStarts,
   readPeerFile, readPeerRecord, safeDirectory, safeText, scoped, socketPath, validPid, validSocketPath, validThreadId,
 } from "./wire.mjs";
 
-const KINDS = ["claude", "codex", "hermes"];
+const KINDS = ["claude", "codex", "hermes", "opencode"];
 export const SCOPE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const CLAIM = /^[a-z0-9][a-z0-9_.-]{0,63}$/, HEX16 = /^[a-f0-9]{16}$/, FILE = /^n-[a-f0-9]{32}\.json$/;
 const HERMES_SOCKET = /^hermes-[a-f0-9]{32}\.sock$/;
 const LEFTOVER = /^\.(?:reap|rel|t)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
 // NAMES_MAX bounds the directory, so a scan reads every record: a new record is refused past it.
 const NAMES_PER_OWNER = 8, NAMES_MAX = 1024, SWEEP_MAX = 1024, ATTEMPTS = 3, LEFTOVER_MS = 60_000;
-const GRAMMAR = "<kind>:<scope>/<claim>, with kind claude, codex or hermes, scope [a-z0-9][a-z0-9_-]{0,63} and claim [a-z0-9][a-z0-9_.-]{0,63}";
-const HOLDER = { claude: "a Claude session", codex: "a Codex session", hermes: "a Hermes conversation" };
+const GRAMMAR = "<kind>:<scope>/<claim>, with kind claude, codex, hermes or opencode, scope [a-z0-9][a-z0-9_-]{0,63} and claim [a-z0-9][a-z0-9_.-]{0,63}";
+const HOLDER = { claude: "a Claude session", codex: "a Codex session", hermes: "a Hermes conversation", opencode: "an opencode session" };
 
 // A `to` that names a claim rather than an inbox address or an automatic name.
 export const isClaimedTarget = (to) => typeof to === "string" && !to.startsWith("uds:") && to.includes("/");
@@ -54,7 +54,8 @@ const fileName = (name) => `n-${createHash("sha256").update(name).digest("hex").
 // The fields agent-peers keeps about a holder, in one order, so two holders compare as text.
 const holderFields = (kind, h) => ({
   pid: h.pid, ...(h.procStart !== undefined ? { procStart: h.procStart } : {}), autoName: h.autoName,
-  ...(kind === "claude" ? { socket: h.socket } : {}), ...(kind === "codex" ? { threadId: h.threadId } : {}), addresses: h.addresses,
+  ...(kind === "claude" ? { socket: h.socket } : {}), ...(kind === "codex" || kind === "opencode" ? { threadId: h.threadId } : {}),
+  addresses: h.addresses,
 });
 
 // A record as written, or undefined when it does not belong in this file or has invalid fields.
@@ -67,7 +68,8 @@ function validRecord(value, file) {
       !h || typeof h !== "object" || Array.isArray(h) || !validPid(h.pid) || !safeText(h.autoName, 160) ||
       (h.procStart !== undefined && !safeText(h.procStart, 64)) || !Array.isArray(h.addresses) || h.addresses.length > 16 ||
       !h.addresses.every((addr) => typeof addr === "string" && addr.startsWith("uds:") && addr.length <= 1004) ||
-      (kind === "claude" && !validSocketPath(h.socket)) || (kind === "codex" && !validThreadId(h.threadId))) return undefined;
+      (kind === "claude" && !validSocketPath(h.socket)) || (kind === "codex" && !validThreadId(h.threadId)) ||
+      (kind === "opencode" && !validThreadId(h.threadId))) return undefined;
   return { name: value.name, kind, owner: value.owner, generation: value.generation, claimedAt: value.claimedAt, holder: holderFields(kind, h) };
 }
 
@@ -119,9 +121,10 @@ function ownProcess(pid) {
 // (its CLAUDE_CONFIG_DIR, its socket directories, a registry file Claude is rewriting) is never
 // evidence, or one process could take over a name another still routes to. A Claude record without
 // a start time (rc.2 wrote them for older Claude Code builds) cannot tell its holder from a later
-// session that reused the PID and socket, so it counts as stopped. A Codex holder has also stopped
-// when its process no longer serves the thread: codex-<threadId>.json is gone (the root was unbound,
-// or left behind by /new and dropped) or names another process.
+// session that reused the PID and socket, so it counts as stopped. A Codex or opencode holder has
+// also stopped when its process no longer serves the session/thread: codex-<threadId>.json or
+// opencode-<session>.json is gone (the root was unbound, or left behind by /new and dropped) or
+// names another process.
 function stopped(record) {
   const h = record.holder;
   if (!ownProcess(h.pid)) return true;
@@ -132,6 +135,7 @@ function stopped(record) {
     if (start !== undefined && start !== h.procStart) return true;
   }
   if (record.kind === "codex") return codexServerGone(h);
+  if (record.kind === "opencode") return opencodeServerGone(h);
   return record.kind === "hermes" && !hermesInboxes(h).length;
 }
 
@@ -146,6 +150,16 @@ function codexServerGone(h) {
   return entry.pid !== h.pid || start !== h.procStart;
 }
 
+// The opencode bridge's record is the only evidence that the bridge still serves the root. A
+// missing or replaced record frees the names, exactly as for Codex.
+function opencodeServerGone(h) {
+  let entry;
+  try { entry = readPeerRecord(join(resolve(peersHome()), `opencode-${h.threadId}.json`)); }
+  catch (error) { return error.code === "ENOENT"; }
+  const start = entry.procStart === undefined ? undefined : String(entry.procStart);
+  return entry.pid !== h.pid || start !== h.procStart || entry.threadId !== h.threadId;
+}
+
 // Where this process can reach a holder: its current name and the addresses it may send to, or
 // undefined when it cannot see the holder. Claude and Codex holders come from this process's view
 // of their registries, which knows their current addresses; Hermes keeps no registry.
@@ -157,6 +171,10 @@ function reach(record) {
   }
   if (record.kind === "codex") {
     const p = codexPeers().find((peer) => peer.threadId === h.threadId && peer.generation === record.generation);
+    return p && { name: p.name, addresses: [...new Set([p.address, ...p.addresses])] };
+  }
+  if (record.kind === "opencode") {
+    const p = opencodePeers().find((peer) => peer.threadId === h.threadId && peer.generation === record.generation);
     return p && { name: p.name, addresses: [...new Set([p.address, ...p.addresses])] };
   }
   return { name: h.autoName, addresses: hermesInboxes(h).filter((addr) => peerSocket(addr)) };
@@ -363,8 +381,9 @@ function fullDirectory(claimant) {
 // is undefined for the CLI outside a session, which releases claude: names; `kind` fills in an
 // elided kind.
 const RELEASES = {
-  claude: "agent-peers release removes only claude: names; a Codex session or Hermes conversation releases its own with release_name",
+  claude: "agent-peers release removes only claude: names; a Codex session, Hermes conversation or opencode session releases its own with release_name",
   codex: "A Codex session releases only codex: names", hermes: "A Hermes conversation releases only hermes: names",
+  opencode: "An opencode session releases only opencode: names",
 };
 export function release(text, claimant, kind = claimant?.kind) {
   return inDiscoveryScope(() => {

@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.0.0-rc.6 — 2026-10-17
+
+Sixth release candidate for 1.0.0. Adds **experimental opencode 2.x support** through a thin v2 plugin and one shared stdio bridge per opencode server. Also fixes a visible Codex label. Deterministic suites pass; live opencode model turns were **not** run for this candidate.
+
+### Added
+
+- opencode 2.x plugin, loaded from the package's `./server` export. It registers `list_peers`, `send_peer`, `claim_name` and `release_name` immediately with the Codex names and input schemas, forwards `instance`/`sessionID`/arguments, forwards prompt/deleted/moved/closed events, and serves only `host.session` and `host.synthetic`. Routing, names, delivery, receipts, dedup and pins stay in the bridge ([design](docs/design/opencode.md)).
+- One stdio bridge child per opencode server process, shared by every location plugin instance through a version-keyed `globalThis` handle. The child exits with its stdin, so a server restart or kill takes it down; there is no detached bridge or bridge socket.
+- The bridge binds root opencode sessions on their first prompt or tool call; child sessions send under their root and hold no names. At most 64 roots are served. At the cap an idle root that holds no claimed names is evicted; a busy root is never evicted, and with no candidate the bind is refused `inbox-unavailable`.
+- An exclusive bind record, `opencode-<root session>.json`: a missing path is created with `link`, a live owner refuses, a confirmed-dead predecessor is moved aside with `rename` and its inode rechecked before the new record is linked in, and the record is re-read before and after the deterministic inbox is created. A refused bind can never reach a claim or a send.
+- Inbound delivery through `session.synthetic` with `delivery: "steer"` and `resume: true`. The bridge checks `host.session` for a staged revert and drops `host-rejected` before handoff; synthetic never commits a revert and there is no prompt fallback. Late negative outcomes are appended with `resume: false`, batched and never retried. A lost or timed-out host call sends no receipt.
+- `opencode:` claimed names, opencode registry rows, `list`/`list --json` rows, discovery labels, and read-only `doctor` checks for the binary/version, the global plugin entry, live records and installed-plugin/CLI version skew.
+- `src/peer-tool-definitions.json` as the opencode/bridge tool copy, with **no output schema**. The plugin returns two text content blocks (human text and the structured JSON) plus `metadata: {structuredContent, isError}` and no `output`. A test compares Codex's `tools/list` input schemas with this file.
+- Package exports `./server`, `./package.json` and `./*` (no package-root export); `opencode/` and the tool definitions are in the package. opencode keywords and description.
+- `AGENT_PEERS_NODE` and the plugin option `bridge_command`; Node 22+ is resolved in the designed order, cached for the server lifetime, with a failed lookup retried at most every 30 s.
+
+### Changed
+
+- `list` and `doctor` include opencode rows and checks; the registry accepts `opencode-*.json`; `CLAIMED_NAME` accepts `opencode`; `agentProcess` recognizes an opencode process so a CLI claim inside an opencode shell returns `no-session`. `whoami` remains Claude/Codex-only.
+- Hermes `list_peers` includes opencode rows. A Codex or Hermes `send_peer` can reach an opencode claimed name; an opencode session can send to Claude, Codex and Hermes names.
+- A claimed `opencode:` name follows its bridge generation: a bridge restart refreshes the same owner's names on the next bind; after a server or bridge exit they read `not-running` until then.
+- The peer frame is shared with Codex (`src/frame.mjs`) so opencode receives the exact rc.3 wording.
+
+### Fixed
+
+- Codex `list_peers` now labels a Hermes row `Hermes recipient` instead of `separate Codex session`. Discovery chooses its native-route reason per kind (`claude`, `codex`, `hermes`, `opencode`, unknown), not by “every non-Codex peer”.
+
+### Documented
+
+- opencode is experimental and was not verified with live model turns for this candidate. The exact two-server risk is documented: A's synthetic `resume: true` wakes A's process-local runner while B may already be running the same session, starting a second runner; do not run one session in two servers. `--auto`, the 64-root cap and LRU rule, child sessions, restart behavior and the tested build 2.0.32 are in [compatibility](docs/compatibility.md#opencode-experimental).
+- `OPENCODE_SESSION_ID` is not an agent-peers identity. opencode identity is tool-only.
+- Install and reachability: `opencode plugin add agent-peers`; a session binds on its first prompt or tool call and rebinds after a restart ([reference](docs/reference.md#opencode-plugin-and-bridge)).
+
 ## 1.0.0-rc.4 — 2026-10-17
 
 Fourth release candidate for 1.0.0, on the npm `next` tag. Documentation only: no runtime, wire or package-layout change since 1.0.0-rc.3, whose live results stand. Closes the 1.0 release-plan audit; the final 1.0.0 remains gated on real-use steering reports.

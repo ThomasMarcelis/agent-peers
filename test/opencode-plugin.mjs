@@ -1,0 +1,230 @@
+// Plugin-adapter tests: the opencode/server.mjs module registers the four static tools
+// immediately, forwards instance/sessionID/args, executes only host.session/host.synthetic,
+// shares one stdio child per server, forwards events, and restarts lazily with hello for every
+// instance. The fake bridge isolates the adapter; test/opencode-e2e.mjs runs the real bridge.
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { test } from "node:test";
+import plugin, { cachedNode, findNode, nodeCandidates } from "../opencode/server.mjs";
+import { VERSION } from "../src/version.mjs";
+
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const fakeBridge = join(root, "test", "opencode-fake-bridge.mjs");
+const definitions = JSON.parse(readFileSync(join(root, "src", "peer-tool-definitions.json"), "utf8"));
+const KEY = Symbol.for("agent-peers.opencode.bridge.v1");
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function until(check, description = "condition", tries = 300) {
+  for (let i = 0; i < tries; i++) {
+    const value = check();
+    if (value) return value;
+    await delay(10);
+  }
+  assert.fail(`timed out waiting for ${description}`);
+}
+
+function context(dir, sessions) {
+  const ctx = {
+    location: { directory: join(dir, "repo") },
+    options: undefined,
+    tools: [], gets: [], synth: [], unsubscribed: false,
+    session: {
+      get: async (id) => { ctx.gets.push(id); if (!sessions.has(id)) throw new Error("session not found"); return sessions.get(id); },
+      synthetic: async (params) => { ctx.synth.push(params); return { admitted: true }; },
+    },
+    tool: { transform(fn) { const tools = []; fn({ add: (definition) => tools.push(definition) }); ctx.tools = tools; } },
+    event: { subscribe(fn) { ctx.emit = (event) => fn(event); return () => { ctx.unsubscribed = true; }; } },
+  };
+  return ctx;
+}
+
+function fixture(t, { mode = "echo", version = VERSION, command, sessions = new Map([["ses_root", { id: "ses_root", location: { directory: "/repo" } }]]) } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "ap-ocp-"));
+  const log = join(dir, "bridge.jsonl");
+  const ctx = context(dir, sessions);
+  ctx.options = { bridge_command: command ?? [process.execPath, fakeBridge, "--log", log, "--mode", mode, "--version", version] };
+  const cleanup = plugin.setup(ctx);
+  const messages = () => {
+    try { return readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)); }
+    catch { return []; }
+  };
+  const waitFor = (check, description) => until(() => check(messages()), description);
+  t.after(async () => { await cleanup(); delete globalThis[KEY]; rmSync(dir, { recursive: true, force: true }); });
+  return { dir, log, ctx, cleanup, messages, waitFor };
+}
+
+test("setup registers the four definitions immediately, before the bridge, and execute forwards instance/sessionID/args", async (t) => {
+  const f = fixture(t);
+  assert.deepEqual(f.ctx.tools.map((tool) => tool.name), ["list_peers", "send_peer", "claim_name", "release_name"]);
+  for (const tool of f.ctx.tools) {
+    assert.deepEqual({ name: tool.name, description: tool.description, input: tool.input }, definitions[tool.name]);
+    assert.equal(typeof tool.execute, "function");
+  }
+  const result = await f.ctx.tools.find((tool) => tool.name === "send_peer").execute(
+    { to: "uds:/tmp/x.sock", message: "hello", in_reply_to: "m-1" }, { sessionID: "ses_root" });
+  assert.equal("output" in result, false);
+  assert.equal(result.content.length, 2);
+  assert.equal(result.content[0].type, "text");
+  assert.equal(result.metadata.isError, true);
+  assert.deepEqual(result.metadata.structuredContent, { status: "failed", reason: "invalid-request" });
+  assert.deepEqual(JSON.parse(result.content[1].text), result.metadata.structuredContent);
+  const request = await f.waitFor((messages) => messages.find((message) => message.method === "tool"), "the tool request");
+  assert.equal(typeof request.params.instance, "string");
+  assert.equal(request.params.sessionID, "ses_root");
+  assert.deepEqual(request.params.args, { to: "uds:/tmp/x.sock", message: "hello", in_reply_to: "m-1" });
+});
+
+test("host.session is executed by the plugin and its Session.Info is returned to the bridge", async (t) => {
+  const f = fixture(t, { mode: "host-session" });
+  const result = await f.ctx.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.equal(result.content[0].text, "host:ses_root");
+  assert.deepEqual(result.metadata.structuredContent, { id: "ses_root", location: { directory: "/repo" } });
+});
+
+test("host.synthetic is executed by the plugin with the bridge's delivery fields", async (t) => {
+  const synthetic = fixture(t, { mode: "host-synthetic" });
+  const answered = await synthetic.ctx.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.match(answered.content[0].text, /"admitted":true/);
+  assert.deepEqual(synthetic.ctx.synth[0], {
+    sessionID: "ses_root", text: "synthetic from bridge", delivery: "steer", resume: true,
+    description: "agent-peers peer message", metadata: { source: "agent-peers" },
+  });
+});
+
+test("two plugin instances share one child; closing one unbinds only it; closing the last ends stdin", async (t) => {
+  const first = fixture(t);
+  const secondCtx = context(first.dir, new Map([["ses_b", { id: "ses_b", location: { directory: "/repo-b" } }]]));
+  secondCtx.options = first.ctx.options;
+  const secondCleanup = plugin.setup(secondCtx);
+  t.after(() => secondCleanup());
+  await first.waitFor((messages) => messages.filter((message) => message.method === "hello").length >= 2, "both hellos");
+  const hellos = first.messages().filter((message) => message.method === "hello");
+  assert.equal(new Set(hellos.map((message) => message._child)).size, 1, "one child serves both instances");
+  assert.equal(new Set(hellos.map((message) => message.params.instance)).size, 2);
+  const firstInstance = first.messages().find((message) => message.method === "hello").params.instance;
+  await first.cleanup();
+  await first.waitFor((messages) => messages.some((message) => message.method === "event" && message.params.type === "closed" &&
+    message.params.instance === firstInstance), "the closed event");
+  assert.equal(first.ctx.unsubscribed, true);
+  const result = await secondCtx.tools[0].execute({}, { sessionID: "ses_b" });
+  assert.equal(result.metadata.structuredContent.status, "failed", "the shared child is still alive");
+  await secondCleanup();
+  await until(() => globalThis[KEY]?.client === null, "the child to stop");
+});
+
+test("a bridge crash reports bridge-unavailable, the next call starts a child and hellos every instance again", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ap-ocp-"));
+  const log = join(dir, "bridge.jsonl"), crashFile = join(dir, "crashed");
+  const sessions = new Map([["ses_root", { id: "ses_root", location: { directory: "/repo" } }]]);
+  const a = context(dir, sessions), b = context(dir, sessions);
+  const options = { bridge_command: [process.execPath, fakeBridge, "--log", log, "--mode", "crash-once", "--crash-file", crashFile] };
+  a.options = b.options = options;
+  const cleanupA = plugin.setup(a);
+  const cleanupB = plugin.setup(b);
+  t.after(async () => { await cleanupA(); await cleanupB(); delete globalThis[KEY]; rmSync(dir, { recursive: true, force: true }); });
+  const messages = () => {
+    try { return readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)); }
+    catch { return []; }
+  };
+  await until(() => messages().filter((message) => message.method === "hello").length >= 2, "the first child's hellos");
+  const failed = await a.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.equal(failed.metadata.isError, true);
+  assert.equal(failed.metadata.structuredContent.status, "failed");
+  assert.equal(failed.metadata.structuredContent.reason, "bridge-unavailable");
+  assert.match(failed.content[0].text, /bridge_command|AGENT_PEERS_NODE/);
+  // The next call starts a new child, which hellos both instances before serving the tool.
+  const next = await b.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.equal(next.content[0].text, "echo");
+  await until(() => {
+    const children = new Map();
+    for (const message of messages()) {
+      if (message.method === "hello") children.set(message._child, (children.get(message._child) ?? 0) + 1);
+    }
+    return [...children.values()].some((count) => count === 2);
+  }, "the restarted child's hellos for both instances");
+  const groups = new Map();
+  for (const message of messages()) if (message.method === "hello") groups.set(message._child, (groups.get(message._child) ?? 0) + 1);
+  assert.deepEqual([...groups.values()].sort(), [2, 2], "each child hellos both instances");
+});
+
+test("Node lookup stops at the first working candidate, and a cached failure is not reprobed within 30 s", () => {
+  const env = { HOME: "/home/test", PATH: "/nonexistent-path", AGENT_PEERS_NODE: "/nvm/node" };
+  const candidates = nodeCandidates(env);
+  assert.equal(candidates[0], "/nvm/node");
+  assert.ok(candidates.length >= 2);
+  const second = candidates[1];
+  const seen = [];
+  const probe = (path) => { seen.push(path); return path === second ? path : undefined; };
+  assert.equal(findNode({ env, probe }), second);
+  assert.deepEqual(seen, ["/nvm/node", second], "it stops at the first working Node 22+");
+  const state = {};
+  let probes = 0;
+  const failing = () => { probes++; return undefined; };
+  const noNode = { HOME: "/none", PATH: "" };
+  const candidateCount = nodeCandidates(noNode).length;
+  assert.throws(() => cachedNode(state, { env: noNode, probe: failing, now: () => 1000 }), /no working Node 22/);
+  assert.equal(probes, candidateCount);
+  assert.throws(() => cachedNode(state, { env: noNode, probe: failing, now: () => 20_000 }));
+  assert.equal(probes, candidateCount, "a failure is cached for 30 s");
+  assert.throws(() => cachedNode(state, { env: noNode, probe: failing, now: () => 31_001 }));
+  assert.equal(probes, candidateCount * 2, "after 30 s it retries once");
+});
+
+test("bridge_command wins over AGENT_PEERS_NODE; a failed command is not silently replaced by Node", async (t) => {
+  const previous = process.env.AGENT_PEERS_NODE;
+  process.env.AGENT_PEERS_NODE = "/definitely/missing-node";
+  let first;
+  try {
+    first = fixture(t);
+    const result = await first.ctx.tools[0].execute({}, { sessionID: "ses_root" });
+    assert.equal(result.content[0].text, "echo", "the configured fake bridge served the request");
+  } finally {
+    await first?.cleanup();
+    delete globalThis[KEY];
+    if (previous === undefined) delete process.env.AGENT_PEERS_NODE; else process.env.AGENT_PEERS_NODE = previous;
+  }
+  const missing = fixture(t, { command: ["/definitely/missing-agent-peers-bridge"], mode: "echo" });
+  const failed = await missing.ctx.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.equal(failed.metadata.isError, true);
+  assert.equal(failed.metadata.structuredContent.status, "failed");
+  assert.equal(failed.metadata.structuredContent.reason, "bridge-unavailable");
+  assert.match(failed.content[0].text, /bridge_command/);
+  await missing.cleanup();
+});
+
+test("prompt, deleted and moved events are forwarded; closed is sent on cleanup", async (t) => {
+  const f = fixture(t);
+  // Wait for this instance's hello so its id is visible in the log.
+  const hello = await f.waitFor((messages) => messages.find((message) => message.method === "hello"), "the hello");
+  f.ctx.emit({ type: "session.inbox.enqueued", data: { sessionID: "ses_root", item: { type: "user" } } });
+  f.ctx.emit({ type: "session.deleted", data: { sessionID: "ses_root" } });
+  f.ctx.emit({ type: "session.moved", data: { sessionID: "ses_root" } });
+  f.ctx.emit({ type: "session.inbox.enqueued", data: { sessionID: "ses_root", item: { type: "synthetic" } } });
+  await f.waitFor((messages) => messages.filter((message) => message.method === "event").length >= 3, "the three forwarded events");
+  const events = f.messages().filter((message) => message.method === "event" && message.params.instance === hello.params.instance);
+  assert.deepEqual(events.map((message) => message.params.type), ["prompt", "deleted", "moved"]);
+  assert.ok(events.every((message) => message.params.sessionID === "ses_root"));
+  await f.cleanup();
+  await f.waitFor((messages) => messages.some((message) => message.method === "event" && message.params.type === "closed" &&
+    message.params.instance === hello.params.instance), "the closed event");
+});
+
+test("a send whose bridge is lost after the request was written is unconfirmed/bridge-lost, not a definite failure", async (t) => {
+  const f = fixture(t, { mode: "crash" });
+  await f.waitFor((messages) => messages.some((message) => message.method === "hello"), "the hello");
+  const result = await f.ctx.tools.find((tool) => tool.name === "send_peer").execute(
+    { to: "uds:/tmp/peer.sock", message: "lost" }, { sessionID: "ses_root" });
+  assert.equal(result.metadata.isError, false);
+  assert.equal(result.metadata.structuredContent.status, "unconfirmed");
+  assert.equal(result.metadata.structuredContent.reason, "bridge-lost");
+  assert.match(result.content[0].text, /Delivery is unknown/);
+});
+
+test("a mixed bridge version logs a warning but the tools still work", async (t) => {
+  const f = fixture(t, { version: "1.0.0-rc.5" });
+  const result = await f.ctx.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.equal(result.metadata.structuredContent.status, "failed");
+  assert.ok(f.messages().length > 0);
+});

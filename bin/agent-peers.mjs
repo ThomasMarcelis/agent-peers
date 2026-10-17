@@ -11,7 +11,7 @@ const usage = `agent-peers ${VERSION} — local agent messaging
 
 Usage: agent-peers <command> [options]
 
-  list [--json] [--no-probe]  Discover running Claude Code and Codex inboxes and claimed names; rows that refuse connections are marked stale
+  list [--json] [--no-probe]  Discover running Claude Code, Codex and opencode inboxes and claimed names; rows that refuse connections are marked stale
   whoami [--json]   Print the calling session's name and address (found through process ancestry)
   claim <name> [--json]     Claim a stable name, claude:<scope>/<claim>, for the calling Claude session
   release <name> [--json]   Release a name this session holds, or one whose holder is not running
@@ -46,9 +46,10 @@ const claudeCaller = () => inDiscoveryScope(() => {
   }
   return {};
 });
-const NO_SESSION = "Codex and Hermes sessions claim names with their claim_name tool.";
+const agentName = (agent) => `${agent === "opencode" ? "an" : "a"} ${agent}`;
+const NO_SESSION = "Codex, Hermes and opencode sessions claim names with their claim_name tool; opencode identity is tool-only.";
 const noSession = ({ nested }, fields) => claimRefusal("no-session", nested
-  ? `the nearest agent in this command's process ancestry is a ${nested.agent} process (pid ${nested.pid}) without a Claude session record, ` +
+  ? `the nearest agent in this command's process ancestry is ${agentName(nested.agent)} process (pid ${nested.pid}) without a Claude session record, ` +
     `so agent-peers does not act for a Claude session further up. ${NO_SESSION}`
   : `no Claude Code session found in this process's ancestry; run agent-peers claim from inside a Claude session. ${NO_SESSION}`, fields);
 
@@ -141,6 +142,13 @@ async function main() {
     runHermesBridge({ profile: args[1] });
     return;
   }
+  if (cmd === "opencode-bridge") {
+    // Internal: the opencode plugin starts this as a stdio child. It is not public CLI surface.
+    if (args.length) throw new SyntaxError("usage: agent-peers opencode-bridge");
+    const { runOpencodeBridge } = await import("../src/opencode-bridge.mjs");
+    runOpencodeBridge();
+    return;
+  }
   const allowed = cmd === "list" ? ["--json", "--no-probe"] : ["doctor", "logs", "whoami"].includes(cmd) ? ["--json"] : [];
   if (!["list", "doctor", "logs", "whoami"].includes(cmd) || args.length > allowed.length ||
       new Set(args).size !== args.length || args.some((a) => !allowed.includes(a))) {
@@ -176,7 +184,8 @@ async function main() {
   }
   if (cmd === "whoami") {
     const me = whoami();
-    if (!me) throw new Error("no Claude Code or Codex session found in this process's ancestry; run whoami from inside a session");
+    if (!me) throw new Error("no Claude Code or Codex session found in this process's ancestry; run whoami from inside a session. " +
+      "opencode identity is tool-only: use list_peers.self or its tools");
     const { name, address, kind, cwd, pid, generation } = me;
     if (args.includes("--json")) console.log(JSON.stringify({ name, address, kind, cwd, pid, generation, claims: heldBy(kind, generation) }, null, 2));
     else console.log(`${name}\n${address}`);

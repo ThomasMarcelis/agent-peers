@@ -275,7 +275,9 @@ export class HermesBridge {
   }
 
   async #listPeers(session) {
-    const peers = allPeers().filter((p) => p.kind === "claude" || p.kind === "codex");
+    // opencode rows are normal registry peers with an inbox, so a Hermes conversation reaches
+    // them with send_peer like Claude and Codex. Hermes conversations themselves stay unlisted.
+    const peers = allPeers().filter((p) => p.kind === "claude" || p.kind === "codex" || p.kind === "opencode");
     let note;
     const live = new Map();
     if (peers.some((p) => p.kind === "codex")) {

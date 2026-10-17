@@ -2,6 +2,16 @@
 
 Raw live transcripts are excluded from the repository and package.
 
+## 1.0.0-rc.6
+
+Verified on 2026-10-17 on Linux with Node 22.23.1. Unlike the previous candidate this adds a runtime surface (experimental opencode support), so the four local suites were run on this tree.
+
+- Deterministic suites: **223 JavaScript tests** and **35 Python tests** passed (5 host-only Python tests deselected). That is 183 existing JavaScript tests plus 40 new deterministic opencode tests covering the plugin adapter, shared child and hello-all restart, Node lookup cache, the exclusive bind race, cap/LRU and no-busy-eviction, child sessions, synthetic delivery, the staged-revert guard, receipts and not-found mapping, late notices, names/registry liveness, deleted/moved/closed, two servers, the stdio protocol, CLI/doctor/discovery, Hermes/Codex interop, schema parity and package entrypoints.
+- `npm run check` reported syntax, versions and lockfile consistent.
+- Package: `npm run test:package` packed the artifact, installed it in a temporary directory, verified the CLI, MCP handshake, the opencode `./server` entrypoint through the exports map (and that the package root still does not resolve), and 43 files.
+- **Live opencode model turns were not run for this candidate.** There is therefore no live busy/idle steering, task-change, staged-revert, real-TUI or two-server result for opencode. The staged-revert and synthetic-vs-prompt differences are covered deterministically only. The 16+16 busy/idle synthetic samples and 6+6 task-change samples from the design remain unrun; README keeps opencode in the experimental section and the top line stays Claude Code/Codex.
+- No push, tag, GitHub release edit or npm publish was performed; the candidate is a local commit on `release/1.0.0-rc.6`.
+
 ## 1.0.0-rc.4
 
 Verified on 2026-10-17 on Linux with Node 22.23.1. Documentation-only candidate: no runtime, wire or package-layout change since 1.0.0-rc.3, so the rc.3 live evidence below applies to this tree. The live suites were not rerun for this candidate; they create real sessions and were not required for a documentation-only delta.

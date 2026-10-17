@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-for (const directory of ["src", "bin", "scripts", "test"]) {
+for (const directory of ["src", "bin", "scripts", "test", "opencode"]) {
   for (const file of readdirSync(join(root, directory)).filter((file) => file.endsWith(".mjs"))) {
     const result = spawnSync(process.execPath, ["--check", join(root, directory, file)], { stdio: "inherit" });
     if (result.status !== 0) process.exit(result.status ?? 1);

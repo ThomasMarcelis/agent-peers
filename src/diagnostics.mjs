@@ -1,8 +1,10 @@
-import { lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
+import { spawnSync } from "node:child_process";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { VERSION } from "./version.mjs";
-import { claudeHome, peersHome } from "./wire.mjs";
+import { claudeHome, opencodePeers, peersHome } from "./wire.mjs";
 import { loggingConfig } from "./logging.mjs";
 import { daemonSocket } from "./app-server.mjs";
 
@@ -48,6 +50,100 @@ async function daemonAnswers(path) {
   } finally { app.close(); }
 }
 
+// ---- opencode checks (read-only) ----
+
+// The opencode binary may be outside PATH: its installer puts it in ~/.opencode/bin.
+function opencodeExecutable(env = process.env) {
+  const name = process.platform === "win32" ? "opencode.exe" : "opencode";
+  for (const directory of (env.PATH ?? "").split(":")) {
+    if (!directory) continue;
+    const path = join(directory, name);
+    try { if (statSync(path).isFile()) return path; } catch {}
+  }
+  const fallback = join(env.HOME || homedir(), ".opencode", "bin", name);
+  try { if (statSync(fallback).isFile()) return fallback; } catch {}
+  return undefined;
+}
+
+function opencodeBinary() {
+  const path = opencodeExecutable();
+  if (!path) return { status: "warning", message: "opencode not found; install opencode 2.x to load the agent-peers plugin" };
+  const result = spawnSync(path, ["--version"], { encoding: "utf8", timeout: 2000 });
+  const version = /v?(\d+\.\d+\.\d+)/.exec(String(result.stdout ?? result.stderr ?? ""));
+  if (!version) return { status: "warning", message: `${path} did not report a version` };
+  const major = Number(version[1].split(".")[0]);
+  if (major < 2) return { status: "warning", message: `${path} is opencode ${version[1]}; agent-peers supports opencode 2.x only` };
+  return { status: "ok", message: `${path} (${version[1]})` };
+}
+
+function opencodeConfigPath(env = process.env) {
+  return join(env.XDG_CONFIG_HOME || join(env.HOME || homedir(), ".config"), "opencode", "opencode.json");
+}
+
+function localPackageVersion(entry) {
+  let directory;
+  try { directory = dirname(entry); } catch { return undefined; }
+  for (let depth = 0; depth < 8; depth++) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
+      if (pkg?.name === "agent-peers" && typeof pkg.version === "string") return pkg.version;
+    } catch {}
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return undefined;
+}
+
+// The installed plugin package, resolved the way opencode's loader sees the config entry. A local
+// path is walked up to its package.json; a package name resolves from the config's directory.
+function installedPluginVersion(entries, configPath) {
+  for (const entry of entries) {
+    if (entry !== "agent-peers" && !entry.startsWith("agent-peers@") && !entry.endsWith(".mjs") && !entry.endsWith(".js") && !entry.startsWith(".") && !entry.startsWith("/")) continue;
+    if (entry.endsWith(".mjs") || entry.endsWith(".js") || entry.startsWith(".") || entry.startsWith("/")) {
+      const local = localPackageVersion(entry);
+      if (local) return local;
+      continue;
+    }
+    try {
+      const require = createRequire(configPath);
+      const path = require.resolve("agent-peers/package.json");
+      const pkg = JSON.parse(readFileSync(path, "utf8"));
+      if (typeof pkg.version === "string") return pkg.version;
+    } catch {}
+  }
+  return undefined;
+}
+
+function opencodePlugin() {
+  const path = opencodeConfigPath();
+  let config;
+  try { config = JSON.parse(readFileSync(path, "utf8")); }
+  catch (error) {
+    if (error.code === "ENOENT") return { status: "warning", message: `${path} is absent; install the plugin with "opencode plugin add agent-peers"` };
+    return { status: "warning", message: `${path} could not be read as JSON; install the plugin with "opencode plugin add agent-peers"` };
+  }
+  const plugins = Array.isArray(config?.plugins) ? config.plugins : [];
+  const entries = plugins.map((entry) => Array.isArray(entry) ? entry[0] : entry).filter((entry) => typeof entry === "string");
+  const listed = entries.some((entry) => entry === "agent-peers" || entry.startsWith("agent-peers@"));
+  if (!listed) return { status: "warning", message: `agent-peers is not in ${path}'s plugins; run "opencode plugin add agent-peers"` };
+  const installed = installedPluginVersion(entries, path);
+  if (!installed) return { status: "warning", message: `agent-peers is listed; its installed package version is unknown (CLI ${VERSION})` };
+  if (installed !== VERSION) {
+    return { status: "warning", message: `version skew: installed opencode plugin ${installed}, CLI ${VERSION}; pin one package version` };
+  }
+  return { status: "ok", message: `listed; installed package ${installed}` };
+}
+
+function opencodeRecords() {
+  try {
+    const live = opencodePeers();
+    return { status: "ok", message: `${live.length} live opencode bridge record${live.length === 1 ? "" : "s"}` };
+  } catch (error) {
+    return { status: "warning", message: `opencode records could not be read: ${error.message}` };
+  }
+}
+
 // Inspect metadata and ask the app-server one read-only question: no configuration writes,
 // daemon startup or model turns.
 export async function diagnose() {
@@ -86,6 +182,10 @@ export async function diagnose() {
   add("logging", logging.enabled && !logging.valid ? "error" : "ok", logging.enabled
     ? `enabled; ${logging.mode}: ${logging.location}${logging.valid ? "" : "; expected an absolute normalized path"}`
     : `disabled; set AGENT_PEERS_DEBUG=1 to capture future events in ${logging.location}`);
-  add("compatibility", "warning", "An answering daemon is not a delivery check. Codex threads are reachable only on the app-server agent-peers is pointed at; Hermes replies require the documented route APIs. See the compatibility guide.");
+  const binary = opencodeBinary(), plugin = opencodePlugin(), records = opencodeRecords();
+  add("opencode binary", binary.status, binary.message);
+  add("opencode plugin", plugin.status, plugin.message);
+  add("opencode records", records.status, records.message);
+  add("compatibility", "warning", "An answering daemon is not a delivery check. Codex threads are reachable only on the app-server agent-peers is pointed at; Hermes replies require the documented route APIs. opencode reaches peers through its plugin and one bridge child per server; live interoperability is not verified by doctor. See the compatibility guide.");
   return { version: VERSION, ok: !checks.some((c) => c.status === "error"), logging, checks };
 }
