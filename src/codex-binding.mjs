@@ -84,6 +84,9 @@ async function bindNow(meta) {
   roots.set(threadId, root);
   try { publishRegistry(root); }
   catch (error) { unbind(root); throw error; }
+  // At once: the registry now names this process, so the thread's names count as stopped until
+  // they name it too, and another thread could take one over meanwhile.
+  refreshClaims(root);
   const previousDirectories = (previous?.addresses ?? []).flatMap((addr) => {
     const socket = peerSocket(addr);
     return socket ? [dirname(socket)] : [];
@@ -93,7 +96,6 @@ async function bindNow(meta) {
     catch (error) { log("inbox.alias", { threadId: logIdentity(threadId), outcome: "failed", ...errorFields(error) }); }
   }
   log("inbox.bound", { threadId: logIdentity(threadId), rootId: logIdentity(rootId), outcome: "succeeded" });
-  refreshClaims(root);
   return root;
 }
 

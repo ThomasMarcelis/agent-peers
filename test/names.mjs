@@ -387,6 +387,34 @@ test("a Claude record without a start time counts as stopped: it is taken over a
   assert.deepEqual([took.status, took.previous.running], ["taken-over", false]);
 });
 
+// A Codex MCP process that no longer serves a thread (its root was unbound, or left behind by /new
+// and dropped) frees the thread's names, though the process runs on.
+test("a Codex holder whose thread's registry file is gone or names another process counts as stopped", (t) => {
+  const f = fixture(t), start = processStart(process.pid), registry = join(f.peers, "codex-T1.json");
+  const codex = (thread) => ({ kind: "codex", owner: generation("codex", thread), generation: generation("codex", thread, start), address: null,
+    holder: { pid: process.pid, procStart: start, autoName: `codex:${thread}-0001`, threadId: thread, addresses: [] } });
+  const serve = (fields) => {
+    rmSync(registry, { force: true });
+    writeFileSync(registry, JSON.stringify({ pid: process.pid, procStart: start, name: "codex:T1-0001", threadId: "T1",
+      address: "uds:/nowhere/codex.sock", ...fields }), { mode: 0o600 });
+  };
+  mkdirSync(f.peers, { recursive: true, mode: 0o700 });
+  serve({});
+  assert.equal(claim("codex:proj/lead", codex("T1")).status, "claimed");
+  assert.equal(claim("codex:proj/lead", codex("T2")).reason, "name-held", "its process serves the thread");
+  // A file this process would not use as a registry view (another user could write it) is no evidence.
+  chmodSync(registry, 0o666);
+  assert.equal(claim("codex:proj/lead", codex("T2")).reason, "name-held");
+  serve({ pid: 0x7ffffff0 });
+  assert.equal(claimRows()[0].running, false, "another process serves the thread now");
+  serve({});
+  assert.equal(claimRows()[0].running, true);
+  rmSync(registry);
+  assert.throws(() => resolveClaim("codex:proj/lead"), (error) => error.reason === "not-running");
+  const took = claim("codex:proj/lead", codex("T2"));
+  assert.deepEqual([took.status, took.previous.running], ["taken-over", false]);
+});
+
 // A holder is always this user's process: a PID that now belongs to another user (kill gives EPERM)
 // means the holder stopped, even when its start time happens to match.
 test("a holder whose PID belongs to another user now counts as stopped", { skip: process.getuid() === 0 && "runs as root" }, async (t) => {

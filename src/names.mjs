@@ -12,7 +12,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { CLAIMED_NAME, SendFailure } from "./status.mjs";
 import {
   address, claudeSessions, codexPeers, ensurePrivateDir, generation, inDiscoveryScope, peerSocket, peersHome, processStarts,
-  readPeerFile, safeDirectory, safeText, scoped, socketPath, validPid, validSocketPath, validThreadId,
+  readPeerFile, readPeerRecord, safeDirectory, safeText, scoped, socketPath, validPid, validSocketPath, validThreadId,
 } from "./wire.mjs";
 
 const KINDS = ["claude", "codex", "hermes"];
@@ -119,7 +119,9 @@ function ownProcess(pid) {
 // (its CLAUDE_CONFIG_DIR, its socket directories, a registry file Claude is rewriting) is never
 // evidence, or one process could take over a name another still routes to. A Claude record without
 // a start time (rc.2 wrote them for older Claude Code builds) cannot tell its holder from a later
-// session that reused the PID and socket, so it counts as stopped.
+// session that reused the PID and socket, so it counts as stopped. A Codex holder has also stopped
+// when its process no longer serves the thread: codex-<threadId>.json is gone (the root was unbound,
+// or left behind by /new and dropped) or names another process.
 function stopped(record) {
   const h = record.holder;
   if (!ownProcess(h.pid)) return true;
@@ -129,7 +131,19 @@ function stopped(record) {
     const start = processStarts([h.pid]).get(h.pid);
     if (start !== undefined && start !== h.procStart) return true;
   }
+  if (record.kind === "codex") return codexServerGone(h);
   return record.kind === "hermes" && !hermesInboxes(h).length;
+}
+
+// The thread's own registry file, read directly rather than through a registry view: whatever this
+// process may or may not send to, a file that is missing or names another pid or start time is
+// evidence. A file that cannot be read for another reason is not.
+function codexServerGone(h) {
+  let entry;
+  try { entry = readPeerRecord(join(resolve(peersHome()), `codex-${h.threadId}.json`)); }
+  catch (error) { return error.code === "ENOENT"; }
+  const start = entry.procStart === undefined ? undefined : String(entry.procStart);
+  return entry.pid !== h.pid || start !== h.procStart;
 }
 
 // Where this process can reach a holder: its current name and the addresses it may send to, or
