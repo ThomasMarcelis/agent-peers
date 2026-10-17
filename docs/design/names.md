@@ -137,7 +137,7 @@ As built after "Names hardening 2" (§13): only this evidence in the record deci
 
   For a claimed name:
   1. Grammar → `invalid-request`.
-  2. No record → `failed`/`not-found`: "No session has claimed `X`. Its holder must claim it (Claude: `agent-peers claim`; Codex or Hermes: `claim_name`). Nothing was sent."
+  2. No record → `failed`/`not-found`: "No session has claimed `X`. Its holder must claim it (Claude: `agent-peers claim`; Codex, Hermes or opencode: `claim_name`). Nothing was sent."
   3. Holder not running → `failed`/`not-running`: "`X` is claimed by a Claude session that is no longer running (claimed …, gen …). Nothing was sent. The new session must claim it."
   4. Pick the holder's address in the needed directory, or give `inbox-unavailable`.
   5. Post as in core §3–5. In the result, `name` is the claimed name and `generation` is the holder's.

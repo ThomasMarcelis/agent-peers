@@ -10,7 +10,7 @@ Ask Codex:
 
 > Find the Claude session working on the API. Ask which response shape it chose, then use its answer for the client.
 
-[Get started](#get-started) · [Hermes plugin](#hermes-experimental) · [Compatibility](docs/compatibility.md) · [Reference](docs/reference.md)
+[Get started](#get-started) · [Hermes plugin](#hermes-experimental) · [opencode plugin](#opencode-experimental) · [Compatibility](docs/compatibility.md) · [Reference](docs/reference.md)
 
 ## Why agent-peers
 
@@ -25,7 +25,7 @@ Backed by [live Claude/Codex round trips, Hermes routing tests, and Linux/macOS 
 Requires **Node.js 22+**, Linux or macOS, and [compatible agent versions](docs/compatibility.md#tested-agent-builds).
 
 ```sh
-npm install -g agent-peers@0.3.0
+npm install -g agent-peers@next
 ```
 
 ### Codex (MCP server)
@@ -62,6 +62,20 @@ hermes plugins install ThomasMarcelis/agent-peers --enable
 ```
 
 Complete the [dependency setup and injection grant](docs/hermes.md). A Hermes conversation stays unlisted and opens a private reply inbox on its first send; it becomes reachable by others only through a [stable name](docs/reference.md#names) it claims (experimental), scoped to its profile. Discord routing is verified; CLI/Desktop lifecycle behavior remains experimental.
+
+### opencode (experimental)
+
+opencode **2.x** can load a plugin that exposes the same four tools, `list_peers`, `send_peer`, `claim_name` and `release_name`, with the same names and input schemas as Codex:
+
+```sh
+opencode plugin add agent-peers@next
+```
+
+Restart opencode after installation. The plugin registers the tools immediately and starts one bridge child per opencode server; every project location in that server shares it. A session becomes reachable after its first prompt or after its first tool call, even if it never calls agent-peers itself. After an opencode or bridge restart, its record is gone and it is unreachable until its next prompt or tool call; peers see a dead `opencode:` name as `not-running` until then.
+
+opencode identity is tool-only: `list_peers.self`, `claim_name`, `release_name` and `send_peer` know the calling session. `agent-peers whoami` and `agent-peers claim` do not act for it, and `OPENCODE_SESSION_ID` is not an agent-peers identity. Peers need no opencode password or service URL; delivery uses the plugin's in-process host client and `session.synthetic`.
+
+Support is experimental. This release was verified live only on a private `opencode serve` (a smoke run and a three-host run with Claude Code and Codex); the background service, `--standalone` and the TUI were not run, and no steering rate is claimed. Deterministic tests cover the plugin, bridge, registry, names and delivery. opencode unloads a project location after 60 minutes without session activity, which unbinds its sessions until their next prompt or tool call. Do not run one opencode session in two servers: the first live bridge owns it, the second refuses, and a `resume: true` delivery can start a second process-local runner in the other server. `--auto` auto-approves tool calls that are not explicitly denied, so do not use it with untrusted peers or sensitive repositories. See [compatibility](docs/compatibility.md#opencode-experimental) and [reference](docs/reference.md#opencode-plugin-and-bridge).
 
 ## Scope
 

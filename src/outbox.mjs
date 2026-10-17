@@ -82,12 +82,12 @@ export function resolveTarget(to, pins, { directory } = {}) {
     } else {
       if (/[@*?,\s]/u.test(to)) throw new SendFailure("invalid-request", `"${to}" is not a peer name; names never contain patterns or lists`);
       let matches = peers.filter((p) => p.name === to);
-      if (!matches.length) matches = peers.filter((p) => p.name === `claude:${to}` || p.name === `codex:${to}`);
+      if (!matches.length) matches = peers.filter((p) => p.name === `claude:${to}` || p.name === `codex:${to}` || p.name === `opencode:${to}`);
       if (matches.length > 1) {
         throw new SendFailure("ambiguous", `"${to}" is ambiguous: ${matches.map((p) => `${p.name} (${p.address})`).join(", ")}`);
       }
       if (!matches.length) {
-        const stale = stalePeers().find((p) => p.name === to || p.name === `claude:${to}` || p.name === `codex:${to}`);
+        const stale = stalePeers().find((p) => p.name === to || p.name === `claude:${to}` || p.name === `codex:${to}` || p.name === `opencode:${to}`);
         if (stale) throw notRunning(stale);
         const needle = to.toLowerCase();
         const near = peers.map((p) => p.name).filter((name) => name.toLowerCase().includes(needle)).slice(0, 5);

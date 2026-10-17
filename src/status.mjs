@@ -21,7 +21,7 @@ export const validMessageId = (id) => typeof id === "string" && MESSAGE_ID.test(
 const REASON = /^[a-z][a-z0-9-]{0,63}$/;
 const GENERATION = /^[a-f0-9]{16}$/;
 // A claimed name, <kind>:<scope>/<claim> (names.mjs): lowercase ASCII with exactly one "/".
-export const CLAIMED_NAME = /^(claude|codex|hermes):[a-z0-9][a-z0-9_-]{0,63}\/[a-z0-9][a-z0-9_.-]{0,63}$/;
+export const CLAIMED_NAME = /^(claude|codex|hermes|opencode):[a-z0-9][a-z0-9_-]{0,63}\/[a-z0-9][a-z0-9_.-]{0,63}$/;
 
 // The extension a 1.0 sender adds to each message line. Claude Code and agent-peers 0.x ignore it.
 // `to_name` is the claimed name the sender resolved to reach this inbox.

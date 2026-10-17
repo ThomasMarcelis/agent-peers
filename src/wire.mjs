@@ -124,6 +124,10 @@ export const validSocketPath = (path) => typeof path === "string" && Buffer.byte
   path.endsWith(".sock") && !/[\x00-\x1f\x7f]/.test(path);
 export const validPid = (pid) => Number.isInteger(pid) && pid > 0 && pid <= 0x7fffffff;
 export const validThreadId = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id);
+// An opencode session id is "ses" plus the host's alphabet. Root sessions own the registry record
+// and the inbox; child sessions only borrow the root's address.
+export const validSessionId = (id) => typeof id === "string" && /^ses[A-Za-z0-9_-]{1,125}$/.test(id);
+
 
 // Every well-formed Claude record, marked `running`; read once per discovery scope. Without
 // `starts`, records are not marked: socket-directory checks need only live PIDs, not start times.
@@ -329,16 +333,51 @@ const codexRow = (p) => ({ kind: "codex", name: p.name, address: p.address, sock
 
 export const codexPeers = () => inDiscoveryScope(() => codexRecordScan().filter((p) => p.running).map(codexRow));
 
+// An opencode registry record is written by the one bridge child that serves the root session.
+// The record is the exclusive bind seat (opencode-bridge.mjs): a live bridge record means another
+// opencode server already serves this session, so a second bridge never publishes or claims.
+export function isSafeOpencodeRecord(p) {
+  return !!p && validPid(p.pid) && safeText(p.name, 160) && p.name.startsWith("opencode:") &&
+    validSessionId(p.threadId) && (p.cwd === undefined || safeText(p.cwd, 4096)) && !!peerSocket(p.address);
+}
+
+// Every safe opencode record, marked `running`; read once per discovery scope.
+function opencodeRecordScan() {
+  if (discoveryScope?.opencode) return discoveryScope.opencode;
+  const dir = resolve(peersHome());
+  let files = [];
+  try { safeDirectory(dir, true); files = readdirSync(dir); } catch {}
+  const out = [];
+  for (const f of files.filter((f) => /^opencode-[A-Za-z0-9_-]+\.json$/.test(f))) {
+    try {
+      const p = readPeerRecord(join(dir, f));
+      if (isSafeOpencodeRecord(p) && f === `opencode-${p.threadId}.json` &&
+          (p.procStart === undefined || safeText(String(p.procStart), 64))) out.push(p);
+    } catch {}
+  }
+  const starts = processStarts(out.filter((p) => p.procStart !== undefined).map((p) => p.pid));
+  for (const p of out) p.running = running(p, starts);
+  if (discoveryScope) discoveryScope.opencode = out;
+  return out;
+}
+
+const opencodeRow = (p) => ({ kind: "opencode", name: p.name, address: p.address, socket: peerSocket(p.address), cwd: p.cwd,
+  threadId: p.threadId, pid: p.pid, startedAt: p.startedAt, generation: generation("opencode", p.threadId, p.procStart),
+  addresses: Array.isArray(p.addresses) ? p.addresses.slice(0, 16).filter((addr) => peerSocket(addr)) : [p.address] });
+
+export const opencodePeers = () => inDiscoveryScope(() => opencodeRecordScan().filter((p) => p.running).map(opencodeRow));
+
 // One listing shares a single directory scan across its rows.
 export function allPeers() {
-  return inDiscoveryScope(() => [...claudeSessions(), ...codexPeers()]);
+  return inDiscoveryScope(() => [...claudeSessions(), ...codexPeers(), ...opencodePeers()]);
 }
 
 // Registered sessions whose process exited or whose PID was reused. They are never listed, but
 // a send to their name or address fails as "not running" instead of "not found".
 export function stalePeers() {
   return inDiscoveryScope(() => [...claudeRecordScan().filter((s) => !s.running).map(claudeRow),
-    ...codexRecordScan().filter((p) => !p.running).map(codexRow)]);
+    ...codexRecordScan().filter((p) => !p.running).map(codexRow),
+    ...opencodeRecordScan().filter((p) => !p.running).map(opencodeRow)]);
 }
 
 // Process ancestry of this process, nearest parent first. Linux reads /proc; elsewhere ps.
@@ -363,11 +402,12 @@ function parentPid(pid) {
   } catch { return NaN; }
 }
 
-// The agent a process runs, as "claude", "codex" or "hermes", or undefined: its command name or
-// argv[0] is one of them (claude.exe included), or it is an interpreter whose script is (npm's
-// codex.js, Claude Code's cli.js, a hermes console script, python -m hermes_cli). Linux reads
-// /proc; elsewhere ps. Shells, wrappers and agent-peers itself are never agents.
-const AGENTS = new Set(["claude", "codex", "hermes"]);
+// The agent a process runs, as "claude", "codex", "hermes" or "opencode", or undefined: its command
+// name or argv[0] is one of them (claude.exe included), or it is an interpreter whose script is
+// (npm's codex.js, Claude Code's cli.js, a hermes console script, python -m hermes_cli, the opencode
+// binary run through bun). Linux reads /proc; elsewhere ps. Shells, wrappers and agent-peers itself
+// are never agents.
+const AGENTS = new Set(["claude", "codex", "hermes", "opencode"]);
 // Interpreters as distributions name them: node, nodejs, node-22, python3.12.
 const INTERPRETER = /^(?:node|nodejs|bun|deno|python)(?:-?[0-9][0-9.]*)?$/;
 const stem = (path) => basename(String(path)).toLowerCase().replace(/\.(?:exe|js|mjs|cjs|py)$/, "");

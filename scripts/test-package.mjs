@@ -15,7 +15,8 @@ let client;
 try {
   const [pack] = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", scratch], { cwd: root, encoding: "utf8" }));
   const files = new Set(pack.files.map((file) => file.path));
-  for (const name of ["LICENSE", "README.md", "package.json", "plugin.yaml", "__init__.py", "bin/agent-peers.mjs", "src/codex-peer.mjs", "src/version.mjs"]) {
+  for (const name of ["LICENSE", "README.md", "package.json", "plugin.yaml", "__init__.py", "bin/agent-peers.mjs", "src/codex-peer.mjs",
+    "src/version.mjs", "src/peer-tool-definitions.json", "opencode/server.mjs"]) {
     assert.ok(files.has(name), `missing package file: ${name}`);
   }
   for (const file of files) assert.ok(!/(^|\/)(artifacts|test|node_modules|__pycache__|\.git|\.pytest_cache)(\/|$)|\.pyc$|\.env(?:\.|$)/.test(file), `unexpected package content: ${file}`);
@@ -30,6 +31,13 @@ try {
   assert.equal(JSON.parse(launch(["doctor", "--json"])).ok, true);
   const pkg = JSON.parse(readFileSync(join(installed, "package.json"), "utf8"));
   assert.equal(pkg.version, VERSION);
+  // The opencode entrypoint resolves through the exports map from the installed tarball, and the
+  // package root still does not. No opencode server or model turn is started.
+  const entry = execFileSync(process.execPath, ["--input-type=module", "-e",
+    "import server from 'agent-peers/server'; if (server.id !== 'agent-peers' || typeof server.setup !== 'function') process.exit(3);" +
+    "import('agent-peers').then(() => process.exit(4), (error) => { if (error.code !== 'ERR_PACKAGE_PATH_NOT_EXPORTED') process.exit(5); });"],
+  { cwd: install, encoding: "utf8", env });
+  assert.equal(entry.trim(), "");
   client = new Client({ name: "package-smoke", version: "1.0.0" });
   await client.connect(new StdioClientTransport({ command: join(install, "node_modules", ".bin", "codex-peer"), env, stderr: "pipe" }));
   assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name).sort(), ["claim_name", "list_peers", "release_name", "send_peer"]);

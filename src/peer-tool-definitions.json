@@ -1,0 +1,71 @@
+{
+  "list_peers": {
+    "name": "list_peers",
+    "description": "List local Claude Code, Codex and opencode peers with their exact messaging targets.",
+    "input": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  "send_peer": {
+    "name": "send_peer",
+    "description": "Send to a listed peer name, inbox address, or incoming reply_to. Set in_reply_to to the id of the message you answer. Keep coordination useful and brief. Send what's new; link existing detail rather than repeating it. Reply when it adds value.",
+    "input": {
+      "type": "object",
+      "properties": {
+        "to": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000000
+        },
+        "in_reply_to": {
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "to",
+        "message"
+      ]
+    }
+  },
+  "claim_name": {
+    "name": "claim_name",
+    "description": "Claim a stable name, opencode:<scope>/<claim> or <scope>/<claim>, so peers reach this session by it with send_peer. Lowercase letters, digits, - and _ (and . in the claim). A running holder keeps its name; one that stopped is taken over. This session takes its names back after its bridge restarts.",
+    "input": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  },
+  "release_name": {
+    "name": "release_name",
+    "description": "Release an opencode: name this session holds, or one whose holder is no longer running.",
+    "input": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  }
+}

@@ -18,7 +18,7 @@ From 1.0.0, agent-peers follows [semantic versioning](https://semver.org) for th
 - Timings and limits, such as receipt windows, retry schedules, rate limits, queue sizes and size bounds. They may change in a minor release to keep the transport safe.
 - Diagnostic log event names and fields.
 - Socket filenames and directory choices, apart from the `uds:` encoding.
-- Internal module layout, and the JSON-lines protocol between the Hermes plugin and its bridge subprocess. Both ship together in one package version.
+- Internal module layout, and the JSON-lines protocols between the Hermes plugin and its bridge subprocess, and between the opencode plugin and its bridge subprocess. Each pair ships together in one package version.
 - The protocols of the hosts agent-peers connects to. Claude Code's inbox protocol is undocumented, the Codex app-server protocol changes between releases, and Hermes sending needs the documented host fork. Only the builds in [compatibility](compatibility.md#tested-agent-builds) are supported; a host upgrade can break interoperation without any agent-peers change.
 
 ## Experimental
@@ -26,6 +26,7 @@ From 1.0.0, agent-peers follows [semantic versioning](https://semver.org) for th
 Experimental features are labelled as such in the reference and changelog, and may change in a minor release. Each change is listed in the changelog.
 
 - **Hermes support:** its plugin surface follows this policy, but compatibility depends on the host fork.
+- **opencode support:** the opencode plugin, its four tools, the bridge protocol, `opencode:` names, opencode registry rows, and the read-only `doctor` checks. Experimental; may change in a minor release. Covered surfaces listed above stay backward compatible.
 - **Claimed names** (`<kind>:<scope>/<claim>`): the `claim`, `release` and `resolve` commands and their `--json` output, the `claim_name` and `release_name` tools, the `names[]`, `claims` and `reply_name` fields, the `agent_peers.to_name` extension, the `name_resolved` control line and its `name_resolved_status` answer, and the `names/` directory under the registry. The rules a later version must keep are the safety ones: a name never reaches anyone but its current holder, a running holder is never displaced, a Hermes name stays inside its profile, and a Hermes conversation admits a first message only from senders that used its name or that it contacted. Claimed names are new in 1.0 and are expected to settle with use; a minor release may change their commands, fields or storage.
 
 Sessions that do not claim names use only covered surfaces.
