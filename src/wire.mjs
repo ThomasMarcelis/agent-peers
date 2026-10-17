@@ -505,6 +505,42 @@ export function post(socket, line) {
   });
 }
 
+// Write one line and wait up to `answerMs` after the write completes for an answer on the same
+// connection that `accept` recognises. Resolves with that answer, or with undefined when none came
+// (older peers answer nothing); rejects with a coded error, as post does, when the write fails.
+export function exchange(socket, line, accept, { answerMs = 1000 } = {}) {
+  if (typeof socket !== "string" || inDiscoveryScope(() => peerSocket(address(socket))) !== socket) {
+    return Promise.reject(new Error("invalid peer inbox socket"));
+  }
+  const data = JSON.stringify(line) + "\n";
+  if (Buffer.byteLength(data) > MAX_LINE) return Promise.reject(Object.assign(new Error("message too large"), { code: "E2BIG" }));
+  return new Promise((resolve, reject) => {
+    const c = connect(socket);
+    let settled = false, written = false, timer;
+    const finish = (error, answer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      c.destroy();
+      error ? reject(error) : resolve(answer);
+    };
+    const failed = (message, code) => Object.assign(new Error(message), { code });
+    timer = setTimeout(() => finish(failed("peer inbox did not accept the line within 5 s", "ETIMEDOUT")), 5000);
+    // Once the line is written, a closed or failed connection only means no answer is coming.
+    c.on("error", (error) => (written ? finish(undefined, undefined) : finish(error)));
+    c.on("close", () => (written ? finish(undefined, undefined) : finish(failed("peer inbox closed before accepting the line", "ERR_SOCKET_CLOSED"))));
+    c.on("connect", () => {
+      readLines(c, (answer) => { if (accept(answer)) finish(undefined, answer); });
+      c.write(data, (error) => {
+        if (error) return finish(error);
+        written = true;
+        clearTimeout(timer);
+        timer = setTimeout(() => finish(undefined, undefined), answerMs);
+      });
+    });
+  });
+}
+
 // Count bytes per frame, including its newline, rather than per incoming chunk. Buffering bytes
 // until the complete line also preserves UTF-8 codepoints split across arbitrary socket writes.
 export function readLines(conn, onLine) {

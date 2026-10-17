@@ -75,7 +75,19 @@ export function receiptLine({ from, ids, status, reason }) {
 export const nameResolvedLine = ({ from, name }) => ({ type: "control", action: "name_resolved", msgV: 1, msg_id: randomUUID(), from, name,
   agent_peers: { v: 1 } });
 export const readNameResolved = (line) => line?.type === "control" && line.action === "name_resolved" && typeof line.from === "string" &&
-  typeof line.name === "string" && CLAIMED_NAME.test(line.name) ? { from: line.from, name: line.name } : undefined;
+  typeof line.name === "string" && CLAIMED_NAME.test(line.name)
+  ? { from: line.from, name: line.name, id: validMessageId(line.msg_id) ? line.msg_id : undefined } : undefined;
+
+// The holder's answer to name_resolved, on the same connection: whether it admitted the session at
+// `from` of the name_resolved line, or why not (`not-holder`, `unknown-sender`, `inbox-closed`).
+// Bridges before this answer nothing, which resolve takes as admitted.
+export const nameResolvedStatusLine = ({ from, id, admitted, reason }) => ({ type: "control", action: "name_resolved_status", msgV: 1,
+  msg_id: randomUUID(), from, orig_msg_id: id, status: admitted ? "admitted" : "dropped", ...(admitted ? {} : { drop_reason: reason }),
+  agent_peers: { v: 1 } });
+export const readNameResolvedStatus = (line, id) => line?.type === "control" && line.action === "name_resolved_status" && line.orig_msg_id === id &&
+  ["admitted", "dropped"].includes(line.status)
+  ? { admitted: line.status === "admitted", reason: line.status === "admitted" ? null : REASON.test(line.drop_reason ?? "") ? line.drop_reason : "other" }
+  : undefined;
 
 // A send that never produced a deliverable line, with a stable reason code.
 export class SendFailure extends Error {

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Admission } from "../src/inbox.mjs";
-import { describe, extension, isError, nameResolvedLine, readExtension, readNameResolved, readReceipt, receiptLine, sendResult } from "../src/status.mjs";
+import { describe, extension, isError, nameResolvedLine, nameResolvedStatusLine, readExtension, readNameResolved, readNameResolvedStatus, readReceipt, receiptLine,
+  sendResult } from "../src/status.mjs";
 
 test("receipts normalize Claude's vocabulary and ignore what this version does not know", () => {
   const id = "4b0c9f7e-1d2a-4c3b-9e8f-0a1b2c3d4e5f", other = "5c1d0a8f-2e3b-4d4c-8f9a-1b2c3d4e5f60";
@@ -32,9 +33,19 @@ test("the extension opts in to queued and accepted only, and carries a valid in_
 test("a name_resolved line names a Claude sender and a claimed name; anything else is not one", () => {
   const line = nameResolvedLine({ from: "uds:/a.sock", name: "hermes:jd/relay" });
   assert.deepEqual([line.type, line.action, line.agent_peers], ["control", "name_resolved", { v: 1 }]);
-  assert.deepEqual(readNameResolved(line), { from: "uds:/a.sock", name: "hermes:jd/relay" });
+  assert.deepEqual(readNameResolved(line), { from: "uds:/a.sock", name: "hermes:jd/relay", id: line.msg_id });
   for (const bad of [{ ...line, name: "hermes:jd" }, { ...line, from: 5 }, { ...line, action: "peer_message_status" }, { ...line, type: "user" }]) {
     assert.equal(readNameResolved(bad), undefined);
+  }
+  // The holder's answer names the line it answers; only that answer, admitted or dropped, counts.
+  const admitted = nameResolvedStatusLine({ from: "uds:/h.sock", id: line.msg_id, admitted: true });
+  const dropped = nameResolvedStatusLine({ from: "uds:/h.sock", id: line.msg_id, admitted: false, reason: "unknown-sender" });
+  assert.deepEqual([admitted.type, admitted.action, admitted.orig_msg_id, admitted.status, admitted.drop_reason], ["control", "name_resolved_status", line.msg_id, "admitted", undefined]);
+  assert.deepEqual(readNameResolvedStatus(admitted, line.msg_id), { admitted: true, reason: null });
+  assert.deepEqual(readNameResolvedStatus(dropped, line.msg_id), { admitted: false, reason: "unknown-sender" });
+  assert.deepEqual(readNameResolvedStatus({ ...dropped, drop_reason: "Not A Code" }, line.msg_id), { admitted: false, reason: "other" });
+  for (const bad of [{ ...admitted, orig_msg_id: "another" }, { ...admitted, status: "queued" }, { ...admitted, action: "peer_message_status" }]) {
+    assert.equal(readNameResolvedStatus(bad, line.msg_id), undefined);
   }
 });
 

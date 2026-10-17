@@ -8,7 +8,7 @@ import { Admission, Receipts, checkSocketPath, closeInbox, listenInbox, readMess
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
 import { SCOPE, claim, claimAt, claimRefusal, claimRows, claimsOf, heldBy, holds, parseName, release, withClaims } from "./names.mjs";
 import { Outbox, Pins, sendPeer } from "./outbox.mjs";
-import { SendFailure, isError, readNameResolved } from "./status.mjs";
+import { SendFailure, isError, nameResolvedStatusLine, readNameResolved } from "./status.mjs";
 import {
   MAX_LINE, address, allPeers, claudeSessions, existingSocket, generation, inDiscoveryScope, peerSocket, processStart, socketDir,
   socketDirectories,
@@ -319,7 +319,7 @@ export class HermesBridge {
     checkSocketPath(socket);
     if (!peerSocket(route.address)) throw new Error("unsafe Hermes reply inbox directory");
     route.inbox = await listenInbox(socket, {
-      maxConnections: QUEUE_MAX, onLine: (line) => this.#receive(route, line),
+      maxConnections: QUEUE_MAX, onLine: (line, _inbox, conn) => this.#receive(route, line, conn),
       onRefused: (reason) => event("receive.dropped", { sessionId, reason: reason === "closed" ? "closed" : "queue_full" }),
       onError: (error) => {
         event("inbox.error", { sessionId, ...errorFields(error) });
@@ -379,14 +379,14 @@ export class HermesBridge {
     return { ...result, text };
   }
 
-  #receive(route, line) {
+  #receive(route, line, conn) {
     const sessionId = logIdentity(route.session);
     const drop = (reason, fields = {}) => event("receive.dropped", { sessionId, reason, ...fields });
+    const resolved = readNameResolved(line);
+    if (resolved) return this.#nameResolved(route, resolved, conn);
     if (route.closed) return drop("closed");
     if (!line || typeof line !== "object") return drop("malformed");
     if (line.type === "control") {
-      const resolved = readNameResolved(line);
-      if (resolved) return this.#nameResolved(route, resolved);
       if (!route.outbox.receive(line)) drop("malformed");
       return;
     }
@@ -464,12 +464,20 @@ export class HermesBridge {
   }
 
   // `agent-peers resolve`, run by the Claude session at `from` for a name this conversation holds:
-  // that session may write first, as a send_peer to the name may. Nothing answers it.
-  #nameResolved(route, { from, name }) {
+  // that session may write first, as a send_peer to the name may, until this conversation closes
+  // (or 64 later senders by name push it out). The answer, on the same connection, tells resolve
+  // whether its SendMessage will be admitted: `not-holder` (the name moved), `unknown-sender` (this
+  // bridge sees no live Claude session at `from`, as with another CLAUDE_CONFIG_DIR) or `inbox-closed`.
+  #nameResolved(route, { from, name, id }, conn) {
     const sessionId = logIdentity(route.session), conversation = this.#conversations.get(route.session);
-    const valid = conversation && inDiscoveryScope(() => from !== route.address && existingSocket(from) &&
-      claudeSessions().some((session) => session.address === from) && holds(name, generation("hermes", route.session)));
-    if (!valid) return event("receive.dropped", { sessionId, reason: "malformed" });
+    const reason = route.closed || !conversation ? "inbox-closed"
+      : !holds(name, generation("hermes", route.session)) ? "not-holder"
+      : !inDiscoveryScope(() => from !== route.address && existingSocket(from) && claudeSessions().some((session) => session.address === from))
+        ? "unknown-sender" : undefined;
+    if (id && conn && !conn.destroyed) {
+      try { conn.write(JSON.stringify(nameResolvedStatusLine({ from: route.address, id, admitted: !reason, reason })) + "\n"); } catch {}
+    }
+    if (reason) return event("receive.dropped", { sessionId, reason: code(reason) });
     this.#admitNamed(route.session, from);
     event("receive.name_resolved", { sessionId, targetId: logIdentity(from) });
   }

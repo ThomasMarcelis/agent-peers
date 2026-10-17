@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { HermesBridge } from "../src/hermes-bridge.mjs";
 import { claim, claudeClaimant, resolveClaim } from "../src/names.mjs";
-import { MAX_LINE, address, allPeers, claudeSessionAt, generation, messageLine, parseEnvelope, peerSocket, post, processStart, readLines } from "../src/wire.mjs";
+import { MAX_LINE, address, allPeers, claudeSessionAt, exchange, generation, messageLine, parseEnvelope, peerSocket, post, processStart, readLines } from "../src/wire.mjs";
+import { nameResolvedLine, readNameResolvedStatus } from "../src/status.mjs";
 import { closeServer, listen } from "./listeners.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -879,6 +880,53 @@ test("a Claude session that ran agent-peers resolve may write first; another Cla
   await until(() => f.controls.some(({ kind, line }) => kind === "claude" && line.drop_reason === "not-a-reply-target"), "the refusal");
   assert.deepEqual(f.events.map((e) => e.params.message), ["from the lead"]);
   shell.stdin.end();
+});
+
+// Runs the CLI from a shell that is a Claude session (its record in `config`), as Claude's Bash tool
+// does, without blocking this process, which hosts the bridge.
+async function claudeShell(t, config, socket, args) {
+  const shell = execFile("sh", ["-c", `read go; "${process.execPath}" "${join(root, "bin", "agent-peers.mjs")}" ${args}; echo "@@$?"; true`],
+    { encoding: "utf8", env: { ...process.env, CLAUDE_CONFIG_DIR: config } });
+  t.after(() => shell.kill());
+  let out = "";
+  shell.stdout.on("data", (data) => { out += data; });
+  writeFileSync(join(config, "sessions", `${shell.pid}.json`), JSON.stringify({ pid: shell.pid, name: "lead", messagingSocketPath: socket,
+    procStart: processStart(shell.pid) }));
+  const started = performance.now();
+  shell.stdin.end("go\n");
+  await once(shell, "close");
+  const [stdout, status] = out.split("@@");
+  return { stdout, status: Number(status), ms: performance.now() - started };
+}
+
+test("resolve hears whether the holder admits its Claude session, and takes an older bridge's silence as admitted", async (t) => {
+  const f = await fixture(t, { profile: "jd" });
+  const inbox = peerSocket((await named(f.bridge, "claim_name", "named", "conversation", "jd/relay")).address);
+  const ask = async (from, name) => {
+    const line = nameResolvedLine({ from, name });
+    return readNameResolvedStatus(await exchange(inbox, line, (reply) => readNameResolvedStatus(reply, line.msg_id)), line.msg_id);
+  };
+  // The answer comes on the same connection.
+  const claude = address(join(f.sockets, "claude-test.sock"));
+  assert.deepEqual(await ask(claude, "hermes:jd/relay"), { admitted: true, reason: null });
+  assert.deepEqual(await ask(claude, "hermes:jd/other"), { admitted: false, reason: "not-holder" });
+  assert.deepEqual(await ask(address(join(f.sockets, "nobody.sock")), "hermes:jd/relay"), { admitted: false, reason: "unknown-sender" });
+  // A Claude session under another CLAUDE_CONFIG_DIR: the bridge cannot see it, so resolve fails.
+  const elsewhere = join(f.dir, "claude-b"), lead = join(f.sockets, "lead.sock");
+  mkdirSync(join(elsewhere, "sessions"), { recursive: true, mode: 0o700 });
+  await listen(createServer((conn) => readLines(conn, () => {})), lead, t);
+  const refused = await claudeShell(t, elsewhere, lead, "resolve hermes:jd/relay --json");
+  const result = JSON.parse(refused.stdout);
+  assert.deepEqual([refused.status, result.status, result.reason], [1, "failed", "unknown-sender"]);
+  assert.match(result.text, /did not admit this session \(unknown-sender\): .*same CLAUDE_CONFIG_DIR\. Nothing was sent/);
+  // A holder whose inbox reads the line and answers nothing, as bridges before this one.
+  const old = join(f.sockets, `hermes-${"c".repeat(32)}.sock`), start = processStart(process.pid);
+  await listen(createServer((conn) => readLines(conn, () => {})), old, t);
+  claim("hermes:jd/old", { kind: "hermes", scope: "jd", owner: generation("hermes", "jd", "old"), generation: generation("hermes", "old-route"),
+    address: address(old), holder: { pid: process.pid, procStart: start, autoName: "hermes:jd:oldroute", addresses: [address(old)] } });
+  const silent = await claudeShell(t, f.claude, lead, "resolve hermes:jd/old");
+  assert.deepEqual([silent.status, silent.stdout], [0, `${address(old)}\n`]);
+  assert.ok(silent.ms >= 1000, "it waited for an answer");
 });
 
 test("arrivals carry reply_name only for a verified claim, and first messages to Claude name this conversation", async (t) => {
