@@ -35,12 +35,13 @@ function fixture(t) {
     writeFileSync(join(claude, "sessions", `${pid}.json`), JSON.stringify({ pid, name, messagingSocketPath: socket, ...extra }));
   // This process is a Claude session that records its start, so a PID reuse is detectable.
   record(process.pid, "me", join(sockets, "me.sock"), { procStart: processStart(process.pid) });
-  // Another live Claude session: a process of its own with a registry record.
+  // Another live Claude session: a process of its own with a registry record, which records its
+  // start as current Claude Code does.
   const session = async (name, socket) => {
     const child = spawn("sleep", ["60"], { stdio: "ignore" });
     children.push(child);
     await once(child, "spawn");
-    record(child.pid, name, socket);
+    record(child.pid, name, socket, { procStart: processStart(child.pid) });
     return { child, claimant: () => claudeClaimant(claudeSessionAt(child.pid)),
       stop: async () => { const exited = once(child, "exit"); child.kill(); await exited; } };
   };
@@ -84,7 +85,7 @@ async function shells(f, count, args) {
     let out = "", err = "";
     shell.stdout.on("data", (data) => { out += data; });
     shell.stderr.on("data", (data) => { err += data; });
-    f.record(shell.pid, `racer-${i}`);
+    f.record(shell.pid, `racer-${i}`, undefined, { procStart: processStart(shell.pid) });
     runs.push({ shell, output: () => out, errors: () => err });
   }
   const finish = async () => { for (const run of runs) { const closed = once(run.shell, "close"); run.shell.stdin.end(); await closed; } };
@@ -213,7 +214,7 @@ test("the conflict table: dead and reused holders are taken over, the same owner
   const live = await f.session("live");
   assert.equal(claim(name, live.claimant()).status, "taken-over");
   // The same owner in a new generation (here a new socket) refreshes, with no flag.
-  f.record(live.child.pid, "live", join(f.sockets, "moved.sock"));
+  f.record(live.child.pid, "live", join(f.sockets, "moved.sock"), { procStart: processStart(live.child.pid) });
   const refreshed = claim(name, live.claimant());
   assert.deepEqual([refreshed.status, refreshed.previous.running], ["refreshed", false]);
   assert.equal(claim(name, live.claimant()).text, `${name} already names this session.`, "an unchanged refresh writes nothing");

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { WebSocketServer } from "ws";
@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { VERSION } from "../src/version.mjs";
-import { generation } from "../src/wire.mjs";
+import { generation, processStart } from "../src/wire.mjs";
 
 const cli = fileURLToPath(new URL("../bin/agent-peers.mjs", import.meta.url));
 // For tests whose fake servers live in this process: spawnSync would block their event loop.
@@ -168,16 +168,20 @@ test("whoami finds the calling Claude session through process ancestry and fails
 
 // Runs CLI commands from a shell that is the Claude session, as Claude's Bash tool does, and returns
 // each command's { status, stdout, stderr }.
-async function inSession({ home, env }, socket, commands) {
+// The shell is a Claude session whose registry record has its start, as current Claude Code
+// writes; `procStart: false` stands for an older build that records none.
+async function inSession({ home, env }, socket, commands, { procStart: recorded = true } = {}) {
   const steps = commands.map((args) => `out=$("${process.execPath}" "${cli}" ${args} 2>"${home}/err"); status=$?; ` +
     `printf '%s\\n' "$out"; printf 'E:'; cat "${home}/err"; echo "@@$status"`);
   const shell = execFile("sh", ["-c", `read go; ${steps.join("; ")}`], { encoding: "utf8", env: { ...process.env, ...env } });
   let out = "";
   shell.stdout.on("data", (d) => { out += d; });
-  writeFileSync(join(home, "claude", "sessions", `${shell.pid}.json`), JSON.stringify({ pid: shell.pid, name: "lead", cwd: "/tmp", messagingSocketPath: socket }));
+  const procStart = recorded ? processStart(shell.pid) : undefined;
+  writeFileSync(join(home, "claude", "sessions", `${shell.pid}.json`), JSON.stringify({ pid: shell.pid, name: "lead", cwd: "/tmp",
+    messagingSocketPath: socket, procStart }));
   shell.stdin.end("go\n");
   await once(shell, "close");
-  return { pid: shell.pid, results: out.split(/@@(\d+)\n/).reduce((acc, part, i, all) => {
+  return { pid: shell.pid, procStart, results: out.split(/@@(\d+)\n/).reduce((acc, part, i, all) => {
     if (i % 2 === 0 && i + 1 < all.length) {
       const [stdout, stderr] = part.split("E:");
       acc.push({ stdout, stderr, status: Number(all[i + 1]) });
@@ -189,11 +193,11 @@ async function inSession({ home, env }, socket, commands) {
 test("claim, resolve, list, whoami and release from inside a Claude session, with exit codes 0, 1 and 2", async () => {
   const session = sessionHome(), socket = join(session.sockets, "lead.sock"), addr = `uds:${socket}`;
   try {
-    const { pid, results } = await inSession(session, socket, ["claim proj/lead --json", "claim proj/lead", "whoami --json",
+    const { pid, procStart, results } = await inSession(session, socket, ["claim proj/lead --json", "claim proj/lead", "whoami --json",
       "resolve claude:proj/lead", "resolve proj/lead --json", "list --json --no-probe", "list --no-probe", "claim codex:proj/x --json",
       "claim Proj/x", "claim a/b c/d", "resolve proj/missing", "release proj/lead", "resolve proj/lead --json"]);
     const [claimed, again, me, resolved, resolvedJson, listed, text, denied, invalid, usage, missing, released, gone] = results;
-    const gen = generation("claude", pid, undefined, socket);
+    const gen = generation("claude", pid, procStart, socket);
     assert.equal(claimed.status, 0, claimed.stderr);
     assert.deepEqual(JSON.parse(claimed.stdout), { status: "claimed", reason: null, name: "claude:proj/lead", kind: "claude", generation: gen,
       address: addr, previous: null, text: "Claimed claude:proj/lead; senders now reach this session by that name." });
@@ -238,6 +242,17 @@ test("a dead claim stays listed as not running, and anyone may release it", asyn
     assert.match(resolved.stderr, /is claimed by claude:lead, a Claude session that is no longer running/);
     assert.equal(run(["release", "proj/lead"], session.env).status, 0);
     assert.deepEqual(JSON.parse(run(["list", "--json"], session.env).stdout).names, []);
+  } finally { rmSync(session.home, { recursive: true, force: true }); }
+});
+
+test("a Claude session whose registry records no start time cannot claim a name", async () => {
+  const session = sessionHome(), socket = join(session.sockets, "lead.sock");
+  try {
+    const { results: [refused] } = await inSession(session, socket, ["claim proj/lead --json"], { procStart: false });
+    const result = JSON.parse(refused.stdout);
+    assert.deepEqual([refused.status, result.status, result.reason, result.name, result.generation], [1, "refused", "unsupported-host", "claude:proj/lead", null]);
+    assert.match(result.text, /records no process start time .* Update Claude Code to claim names\. Nothing changed\.$/);
+    assert.equal(existsSync(join(session.home, "peers", "names")), false, "nothing was written");
   } finally { rmSync(session.home, { recursive: true, force: true }); }
 });
 

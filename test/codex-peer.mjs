@@ -51,8 +51,9 @@ async function fixture(t, options = {}) {
     rmSync(dir, { recursive: true, force: true });
   });
   await listen(receiver, inbox);
-  writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "test", cwd: dir, messagingSocketPath: inbox }));
-  const reply = (ws, message, result) => ws.send(JSON.stringify({ id: message.id, result }));
+  writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "test", cwd: dir, messagingSocketPath: inbox,
+    procStart: processStart(process.pid) }));
+  const reply =(ws, message, result) => ws.send(JSON.stringify({ id: message.id, result }));
   let hold = !!options.hold;
   wss.on("connection", (ws) => ws.on("message", (data) => {
     const message = JSON.parse(data);
@@ -116,7 +117,7 @@ test("MCP binds privately, discovers peers, sends and receives framed messages, 
   // One result shape: the wire message id and the resolved target ride beside the prose, so a
   // transcript reader can pair the send with its arrival.
   assert.deepEqual(sent.structuredContent, { status: "accepted", reason: null, message_id: f.messages[0].msg_id, in_reply_to: null,
-    to: address(f.inbox), name: "claude:test", generation: generation("claude", process.pid, undefined, f.inbox), from: record.address });
+    to: address(f.inbox), name: "claude:test", generation: generation("claude", process.pid, processStart(process.pid), f.inbox), from: record.address });
   assert.deepEqual(f.messages[0].agent_peers, { v: 1, receipts: ["queued", "accepted"], generation: record.generation });
   const incoming = messageLine({ from: address(f.inbox), fromName: "claude:test", body: "reply 😀" });
   await post(socket, incoming); await post(socket, incoming);

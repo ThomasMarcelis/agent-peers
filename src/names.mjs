@@ -209,6 +209,12 @@ export function claim(text, claimant) {
     if (claimant.scope !== undefined && parsed.scope !== claimant.scope) {
       return claimRefusal("scope-denied", `Names claimed in this Hermes profile are hermes:${claimant.scope}/<claim>, not ${parsed.name}.`, fields);
     }
+    // Without a start time the owner is a PID alone, and a later session that reuses the PID and
+    // socket path would inherit the name. Older Claude Code builds record none.
+    if (claimant.kind === "claude" && claimant.holder.procStart === undefined) {
+      return claimRefusal("unsupported-host", "This Claude Code build records no process start time in its session registry, so a later " +
+        `session that reuses this PID could inherit ${parsed.name}. Update Claude Code to claim names. Nothing changed.`, fields);
+    }
     ensurePrivateDir(peersHome());
     const file = join(ensurePrivateDir(directory()), fileName(parsed.name));
     const next = { v: 1, name: parsed.name, kind: parsed.kind, owner: claimant.owner, generation: claimant.generation,

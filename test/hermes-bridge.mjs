@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { HermesBridge } from "../src/hermes-bridge.mjs";
 import { claim, claudeClaimant, resolveClaim } from "../src/names.mjs";
-import { MAX_LINE, address, allPeers, claudeSessionAt, generation, messageLine, parseEnvelope, peerSocket, post, readLines } from "../src/wire.mjs";
+import { MAX_LINE, address, allPeers, claudeSessionAt, generation, messageLine, parseEnvelope, peerSocket, post, processStart, readLines } from "../src/wire.mjs";
 import { closeServer, listen } from "./listeners.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -62,7 +62,7 @@ async function fixture(t, options = {}) {
     servers.push(server);
     await listen(server, socket);
     if (kind === "claude") writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({
-      pid: process.pid, name: "test", cwd: dir, status: "busy", messagingSocketPath: socket,
+      pid: process.pid, name: "test", cwd: dir, status: "busy", messagingSocketPath: socket, procStart: processStart(process.pid),
     }));
     else writeFileSync(join(peers, "codex-test.json"), JSON.stringify({
       pid: process.pid, name: "codex:test", address: address(socket), cwd: dir, threadId: "live-thread",
@@ -140,7 +140,7 @@ test("private sessions send, receive replies, and remain absent from every regis
   assert.notEqual(first.from, second.from);
   assert.deepEqual(first, { status: "accepted", reason: null, message_id: f.messages[0].line.msg_id, in_reply_to: null,
     to: address(join(f.sockets, "claude-test.sock")), name: "claude:test",
-    generation: generation("claude", process.pid, undefined, join(f.sockets, "claude-test.sock")), from: first.from, text: "Accepted by claude:test." });
+    generation: generation("claude", process.pid, processStart(process.pid), join(f.sockets, "claude-test.sock")), from: first.from, text: "Accepted by claude:test." });
   assert.equal(second.text, "Accepted by codex:test.");
   assert.deepEqual(f.messages[0].line.agent_peers, { v: 1, receipts: ["queued", "accepted"], generation: generation("hermes", "conversation-a") });
   const outbound = f.messages.map((entry) => parseEnvelope(entry.line.message.content));
