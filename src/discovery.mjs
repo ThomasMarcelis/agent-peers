@@ -90,6 +90,7 @@ export function formatSessionPeer(p) {
 // which resolves the name itself). A Hermes holder accepts a Claude sender only after it ran resolve.
 export function formatName(row, { sendPeer = false } = {}) {
   if (!row.running) return `${row.name}  not running  (its holder stopped; the new session must claim it)`;
+  if (!row.address) return `${row.name}  running  (no inbox this session can reach: its holder uses a session registry or socket directory this session does not)`;
   if (sendPeer) return `${row.name}  running  send_peer ${JSON.stringify({ to: row.name })}`;
   if (row.kind === "hermes") return `${row.name}  running  agent-peers resolve ${row.name}, then SendMessage to the printed address`;
   return `${row.name}  running  SendMessage ${JSON.stringify({ to: row.address })}`;

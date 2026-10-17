@@ -243,6 +243,51 @@ test("a Hermes holder is running wherever its inboxes are, even in a directory t
   assert.equal(claimRows()[0].running, false, "its inbox is gone");
 });
 
+// Liveness comes only from the record (PID and start time); a registry view only picks the address.
+test("a running holder out of this process's sight is never taken over, released or replaced by another session", async (t) => {
+  const f = fixture(t), lead = await f.session("lead");
+  assert.equal(claim(NAME, lead.claimant()).status, "claimed");
+  const sessionFile = join(f.claude, "sessions", `${lead.child.pid}.json`), saved = readFileSync(sessionFile, "utf8");
+  // Another CLAUDE_CONFIG_DIR, as a shell or session with a different configuration sees.
+  const elsewhere = join(f.dir, "claude-b");
+  mkdirSync(join(elsewhere, "sessions"), { recursive: true, mode: 0o700 });
+  const rival = { ...f.me(), owner: generation("claude", "rival"), generation: generation("claude", "rival", "s") };
+  const views = { "another CLAUDE_CONFIG_DIR": () => { process.env.CLAUDE_CONFIG_DIR = elsewhere; },
+    "a registry file Claude is rewriting": () => { writeFileSync(sessionFile, saved.slice(0, 20)); } };
+  for (const [view, enter] of Object.entries(views)) {
+    enter();
+    try {
+      const taken = claim(NAME, rival);
+      assert.deepEqual([taken.status, taken.reason, taken.previous.running], ["refused", "name-held", true], view);
+      assert.deepEqual([release(NAME, undefined, "claude").reason, release(NAME, rival).reason], ["not-holder", "not-holder"], view);
+      assert.throws(() => resolveClaim(NAME), (error) => error.reason === "inbox-unavailable" && /which is running/.test(error.message), view);
+      assert.deepEqual(claimRows().map((row) => [row.running, row.address, row.holder]), [[true, null, "claude:lead"]], view);
+    } finally { process.env.CLAUDE_CONFIG_DIR = f.claude; writeFileSync(sessionFile, saved); }
+  }
+  assert.equal(resolveClaim(NAME).address, address(join(f.sockets, `${lead.child.pid}.sock`)), "the holder still has its name");
+  // A Codex holder whose primary inbox sits in a directory this process knows only from another
+  // configuration's Claude sessions.
+  const custom = join(f.dir, "custom"), codexAddress = address(join(custom, "codex-w.sock")), start = processStart(lead.child.pid);
+  mkdirSync(custom, { mode: 0o700 });
+  await f.session("custom", join(custom, "c.sock"));
+  writeFileSync(join(f.peers, "codex-w.json"), JSON.stringify({ pid: lead.child.pid, procStart: start, name: "codex:worker-0001", threadId: "w",
+    address: codexAddress, addresses: [codexAddress] }), { mode: 0o600 });
+  const codex = { kind: "codex", owner: generation("codex", "w"), generation: generation("codex", "w", start), address: codexAddress,
+    holder: { pid: lead.child.pid, procStart: start, autoName: "codex:worker-0001", threadId: "w", addresses: [codexAddress] } };
+  const codexRival = { ...codex, owner: generation("codex", "v"), generation: generation("codex", "v", "x"),
+    holder: { ...codex.holder, pid: process.pid, procStart: processStart(process.pid), threadId: "v" } };
+  assert.equal(claim("codex:proj/worker", codex).status, "claimed");
+  process.env.CLAUDE_CONFIG_DIR = elsewhere;
+  try {
+    assert.deepEqual([claim("codex:proj/worker", codexRival).reason, release("codex:proj/worker", codexRival).reason], ["name-held", "not-holder"]);
+    assert.throws(() => resolveClaim("codex:proj/worker"), (error) => error.reason === "inbox-unavailable");
+  } finally { process.env.CLAUDE_CONFIG_DIR = f.claude; }
+  assert.equal(resolveClaim("codex:proj/worker").address, codexAddress);
+  // Positive evidence: once the process is gone, both names are taken over.
+  await lead.stop();
+  assert.deepEqual([claim(NAME, rival).status, claim("codex:proj/worker", codexRival).status], ["taken-over", "taken-over"]);
+});
+
 test("the conflict table: dead and reused holders are taken over, the same owner refreshes, a live holder is refused", async (t) => {
   const f = fixture(t);
   // A holder whose process was killed.
@@ -261,10 +306,11 @@ test("the conflict table: dead and reused holders are taken over, the same owner
   claim(name, reused);
   const live = await f.session("live");
   assert.equal(claim(name, live.claimant()).status, "taken-over");
-  // The same owner in a new generation (here a new socket) refreshes, with no flag.
+  // The same owner in a new generation (here a new socket) refreshes, with no flag. Its process,
+  // the previous holder, still runs.
   f.record(live.child.pid, "live", join(f.sockets, "moved.sock"), { procStart: processStart(live.child.pid) });
   const refreshed = claim(name, live.claimant());
-  assert.deepEqual([refreshed.status, refreshed.previous.running], ["refreshed", false]);
+  assert.deepEqual([refreshed.status, refreshed.previous.running], ["refreshed", true]);
   assert.equal(claim(name, live.claimant()).text, `${name} already names this session.`, "an unchanged refresh writes nothing");
   // A running holder with another owner is always refused.
   const held = claim(name, f.me());

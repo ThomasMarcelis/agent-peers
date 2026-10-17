@@ -90,10 +90,34 @@ const scan = () => scoped("claims", () => {
   });
 });
 
-// The running holder of a record, as { name, addresses }, or undefined. Claude and Codex holders
-// are checked against their live registries, which also give their current addresses; a Hermes
-// holder has no registry, so its bridge must still run and every recorded inbox must still exist.
-function live(record) {
+// A Hermes holder's recorded inboxes that exist now as sockets of this user, in any directory.
+function hermesInboxes(h) {
+  return h.addresses.filter((addr) => {
+    const path = socketPath(addr);
+    if (!validSocketPath(path) || address(path) !== addr || !HERMES_SOCKET.test(basename(path))) return false;
+    try { const st = lstatSync(path); return st.isSocket() && st.uid === process.getuid(); } catch { return false; }
+  });
+}
+
+// Whether a record's holder stopped, decided only from positive evidence in the record: its process
+// is gone, or its PID now belongs to a process with another start time; a Hermes conversation has
+// also stopped when none of its recorded inboxes exists. What this process can see of the holder
+// (its CLAUDE_CONFIG_DIR, its socket directories, a registry file Claude is rewriting) is never
+// evidence, or one process could take over a name another still routes to.
+function stopped(record) {
+  const h = record.holder;
+  if (!alive(h.pid)) return true;
+  if (h.procStart !== undefined) {
+    const start = processStarts([h.pid]).get(h.pid);
+    if (start !== undefined && start !== h.procStart) return true;
+  }
+  return record.kind === "hermes" && !hermesInboxes(h).length;
+}
+
+// Where this process can reach a holder: its current name and the addresses it may send to, or
+// undefined when it cannot see the holder. Claude and Codex holders come from this process's view
+// of their registries, which knows their current addresses; Hermes keeps no registry.
+function reach(record) {
   const h = record.holder;
   if (record.kind === "claude") {
     const s = claudeSessions().find((peer) => peer.pid === h.pid && peer.generation === record.generation);
@@ -103,17 +127,15 @@ function live(record) {
     const p = codexPeers().find((peer) => peer.threadId === h.threadId && peer.generation === record.generation);
     return p && { name: p.name, addresses: [...new Set([p.address, ...p.addresses])] };
   }
-  if (!alive(h.pid) || !h.addresses.length) return undefined;
-  const start = processStarts([h.pid]).get(h.pid);
-  if (h.procStart !== undefined && start !== undefined && start !== h.procStart) return undefined;
-  // Whether the inboxes exist, not whether this process may send to their directories: every
-  // process must agree on who is running, or one could take over a name another still routes to.
-  const inboxes = h.addresses.every((addr) => {
-    const path = socketPath(addr);
-    if (!validSocketPath(path) || address(path) !== addr || !HERMES_SOCKET.test(basename(path))) return false;
-    try { const st = lstatSync(path); return st.isSocket() && st.uid === process.getuid(); } catch { return false; }
-  });
-  return inboxes ? { name: h.autoName, addresses: h.addresses } : undefined;
+  return { name: h.autoName, addresses: hermesInboxes(h).filter((addr) => peerSocket(addr)) };
+}
+
+// A record's holder for listings, resolution and conflicts: whether it runs, its name, and the
+// addresses this process may send to (none when it runs out of this process's sight).
+function holderOf(record) {
+  if (stopped(record)) return { running: false, name: record.holder.autoName, addresses: [] };
+  const seen = reach(record);
+  return { running: true, name: seen?.name ?? record.holder.autoName, addresses: seen?.addresses ?? [] };
 }
 
 // The record in a name's file and that file's identity. `record` is undefined for a file that is
@@ -208,8 +230,8 @@ export const claudeClaimant = (s) => ({ kind: "claude", owner: generation("claud
   address: s.address, holder: { pid: s.pid, procStart: s.procStart, autoName: s.name, socket: s.socket, addresses: [s.address] } });
 
 const previousOf = (record) => {
-  const holder = live(record);
-  return { holder: holder?.name ?? record.holder.autoName, generation: record.generation, running: Boolean(holder) };
+  const holder = holderOf(record);
+  return { holder: holder.name, generation: record.generation, running: holder.running };
 };
 
 // Claim a name for `claimant`: { kind, owner, generation, address, holder, scope? }. The owner is the
@@ -306,26 +328,36 @@ export function resolveClaim(to, { directory: preferred } = {}) {
       throw new SendFailure("not-found", `No session has claimed ${parsed.name ?? `"${to}"`}. Its holder must claim it ` +
         "(Claude: agent-peers claim; Codex or Hermes: claim_name). Nothing was sent.");
     }
-    const holder = live(record);
-    if (!holder) {
+    const holder = holderOf(record);
+    if (!holder.running) {
       throw new SendFailure("not-running", `${record.name} is claimed by ${record.holder.autoName}, ${HOLDER[record.kind]} that is no longer running ` +
         `(claimed ${new Date(record.claimedAt).toISOString()}, generation ${record.generation}). Nothing was sent. The new session must claim it.`);
     }
     const usable = holder.addresses.filter((addr) => peerSocket(addr));
     const target = (preferred && usable.find((addr) => dirname(peerSocket(addr)) === preferred)) || usable[0];
-    if (!target) throw new SendFailure("inbox-unavailable", `${record.name} is held by ${holder.name}, which has no usable inbox address. Nothing was sent.`);
+    // Running, but not where this process looks: never another session instead.
+    if (!target) {
+      throw new SendFailure("inbox-unavailable", `${record.name} is held by ${holder.name}, which is running, but this session sees no inbox ` +
+        "of it to send to (its session registry or socket directory is not one this session uses). Nothing was sent.");
+    }
     return { kind: record.kind, name: record.name, address: target, socket: peerSocket(target), addresses: usable, generation: record.generation,
       holder: holder.name, claimed: true };
   });
 }
 
 // Every claimed name, running or not, for listings. Dead names stay until claimed again or released.
-export const claimRows = ({ directory: preferred } = {}) => inDiscoveryScope(() => scoped(`claimRows\0${preferred ?? ""}`, () => scan().map((r) => {
-  const holder = live(r), addresses = holder ? holder.addresses.filter((addr) => peerSocket(addr)) : [];
-  return { name: r.name, kind: r.kind, running: Boolean(holder),
-    address: (preferred && addresses.find((addr) => dirname(peerSocket(addr)) === preferred)) || addresses[0] || null,
-    addresses, generation: r.generation, holder: holder?.name ?? null, claimedAt: r.claimedAt };
-}).sort((a, b) => (a.name < b.name ? -1 : 1))));
+// A running holder this process cannot see is listed as running with no address.
+export const claimRows = ({ directory: preferred } = {}) => inDiscoveryScope(() => scoped(`claimRows\0${preferred ?? ""}`, () => {
+  const records = scan();
+  // One start-time lookup for every holder (a single ps on macOS); stopped() then reads the cache.
+  processStarts(records.filter((r) => r.holder.procStart !== undefined).map((r) => r.holder.pid));
+  return records.map((r) => {
+    const holder = holderOf(r), addresses = holder.addresses.filter((addr) => peerSocket(addr));
+    return { name: r.name, kind: r.kind, running: holder.running,
+      address: (preferred && addresses.find((addr) => dirname(peerSocket(addr)) === preferred)) || addresses[0] || null,
+      addresses, generation: r.generation, holder: holder.running ? holder.name : null, claimedAt: r.claimedAt };
+  }).sort((a, b) => (a.name < b.name ? -1 : 1));
+}));
 
 // The names a running session of this kind and generation holds.
 export const heldBy = (kind, gen) => claimRows().filter((row) => row.running && row.kind === kind && row.generation === gen).map((row) => row.name);
@@ -334,7 +366,7 @@ export const heldBy = (kind, gen) => claimRows().filter((row) => row.running && 
 export const withClaims = (rows) => inDiscoveryScope(() => rows.map((row) => ({ ...row, claims: heldBy(row.kind, row.generation) })));
 
 // The name a verified, running claim holds at this inbox address, for a recipient's frame. A record
-// that names the address but whose holder is not running is ignored.
+// that names the address but whose holder is not running, or not this process's view of it, is ignored.
 export const claimAt = (addr) => claimRows().find((row) => row.running && row.addresses.includes(addr))?.name;
 
 // Whether the record for `name` is held by this generation: a recipient checking a name a sender
