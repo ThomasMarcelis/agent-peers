@@ -8,7 +8,8 @@ import { test } from "node:test";
 import { WebSocketServer } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { address, generation, messageLine, parseEnvelope, peerSocket, post, processStart, readLines } from "../src/wire.mjs";
+import { claim, claudeClaimant, release, resolveClaim } from "../src/names.mjs";
+import { address, claudeSessionAt, generation, messageLine, parseEnvelope, peerSocket, post, processStart, readLines } from "../src/wire.mjs";
 import { closeServer, listen } from "./listeners.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -634,7 +635,7 @@ test("one process serves two root threads, each with its own inbox, registry and
   const listed = await peer.call("list_peers", {}, thread);
   const first = record(f.registry), firstSocket = peerSocket(first.address);
   assert.deepEqual(listed.structuredContent.self, { name: first.name, kind: "codex", address: first.address, addresses: first.addresses,
-    generation: generation("codex", thread, processStart(peer.transport.pid)), threadId: thread, subagent: false });
+    generation: generation("codex", thread, processStart(peer.transport.pid)), threadId: thread, subagent: false, claims: [] });
   assert.equal(first.generation, listed.structuredContent.self.generation);
   assert.match(listed.content[0].text, new RegExp(`^You are ${first.name}\\.\\n`));
   await peer.call("list_peers", {}, other);
@@ -707,4 +708,73 @@ test("in_reply_to rides in the extension, is echoed, shows on frames, and footer
   await post(socket, reply);
   await until(() => f.turns.length === 1);
   assert.match(f.turns[0].input[0].text, new RegExp(`id="${reply.msg_id}" in_reply_to="${sent.structuredContent.message_id}">`));
+});
+
+test("claim_name: a root claims a name, lists it and is reached by it; subagents hold none", async (t) => {
+  const child = "01900000-0000-0000-0000-00000000c41d";
+  const f = await fixture(t, { loaded: [thread, child], parents: { [child]: thread } }), peer = await f.start();
+  const claimed = await peer.call("claim_name", { name: "proj/lead" });
+  const record = JSON.parse(readFileSync(f.registry, "utf8"));
+  assert.equal(claimed.isError, undefined);
+  assert.deepEqual(claimed.structuredContent, { status: "claimed", reason: null, name: "codex:proj/lead", kind: "codex",
+    generation: record.generation, address: record.address, previous: null, text: "Claimed codex:proj/lead; senders now reach this session by that name." });
+  const listed = await peer.call("list_peers");
+  assert.deepEqual(listed.structuredContent.self.claims, ["codex:proj/lead"]);
+  assert.deepEqual(listed.structuredContent.names.map((row) => [row.name, row.running, row.holder, row.address]),
+    [["codex:proj/lead", true, record.name, record.address]]);
+  assert.match(listed.content[0].text, /Claimed names:\n {2}codex:proj\/lead {2}running {2}send_peer \{"to":"codex:proj\/lead"\}/);
+  // Senders resolve the name to this root's inbox.
+  assert.equal(resolveClaim("codex:proj/lead").address, record.address);
+  await post(peerSocket(record.address), messageLine({ from: address(f.inbox), body: "by name" }));
+  await until(() => f.turns.length === 1);
+  for (const [name, args, reason] of [["a subagent", { name: "proj/sub" }, "no-session"], ["another kind", { name: "claude:proj/x" }, "scope-denied"],
+    ["an invalid name", { name: "Proj/x" }, "invalid-request"]]) {
+    const refused = await peer.call("claim_name", args, name === "a subagent" ? child : thread);
+    assert.deepEqual([refused.isError, refused.structuredContent.status, refused.structuredContent.reason], [true, "refused", reason], name);
+  }
+  // The first message to a Claude session names the stable name; a send to a claimed name marks it.
+  claim("claude:proj/test", claudeClaimant(claudeSessionAt(process.pid)));
+  const sent = await peer.call("send_peer", { to: "claude:proj/test", message: "hello by name" });
+  assert.deepEqual([sent.structuredContent.status, sent.structuredContent.name, sent.structuredContent.to],
+    ["accepted", "claude:proj/test", address(f.inbox)]);
+  assert.equal(f.messages.at(-1).agent_peers.to_name, "claude:proj/test");
+  assert.equal(parseEnvelope(f.messages.at(-1).message.content).body,
+    "hello by name\n\n(Codex CLI peer; notify_when_idle unavailable.) (Stable name: codex:proj/lead.)");
+  assert.equal((await peer.call("release_name", { name: "proj/lead" })).structuredContent.status, "released");
+  assert.deepEqual((await peer.call("list_peers")).structuredContent.self.claims, []);
+});
+
+test("a rebind in a new process takes back only its own thread's names, and each root keeps its own", async (t) => {
+  const other = "01900000-0000-0000-0000-00000000beef";
+  const f = await fixture(t, { loaded: [thread, other] }), first = await f.start();
+  assert.equal((await first.call("claim_name", { name: "proj/a" }, thread)).structuredContent.status, "claimed");
+  assert.equal((await first.call("claim_name", { name: "proj/b" }, other)).structuredContent.status, "claimed");
+  const self = async (peer, id) => (await peer.call("list_peers", {}, id)).structuredContent.self;
+  assert.deepEqual((await self(first, thread)).claims, ["codex:proj/a"]);
+  assert.deepEqual((await self(first, other)).claims, ["codex:proj/b"]);
+  // An MCP replacement for one thread: the same owner in a new generation, with no flag.
+  const second = await f.start();
+  assert.deepEqual((await self(second, thread)).claims, ["codex:proj/a"]);
+  assert.equal(resolveClaim("codex:proj/a").generation, generation("codex", thread, processStart(second.transport.pid)));
+  assert.equal(resolveClaim("codex:proj/b").generation, generation("codex", other, processStart(first.transport.pid)), "another thread's name is untouched");
+  const stale = await first.call("claim_name", { name: "proj/a" }, thread);
+  assert.deepEqual([stale.isError, stale.structuredContent.reason], [true, "no-session"], "the replaced process cannot take it back");
+  assert.equal(resolveClaim("codex:proj/a").generation, generation("codex", thread, processStart(second.transport.pid)));
+});
+
+test("frames name the sender only by a claim the recipient verified", async (t) => {
+  const f = await fixture(t), peer = await f.start();
+  await peer.call("list_peers");
+  const socket = peerSocket(JSON.parse(readFileSync(f.registry, "utf8")).address);
+  claim("claude:proj/test", claudeClaimant(claudeSessionAt(process.pid)));
+  await post(socket, messageLine({ from: address(f.inbox), fromName: "claude:test", body: "verified" }));
+  await until(() => f.turns.length === 1);
+  assert.match(f.turns[0].input[0].text, new RegExp(`<peer_message from="claude:test" reply_to="${address(f.inbox)}" reply_name="claude:proj/test" id=`));
+  // A record that names this address but whose holder is not this live session shows nothing.
+  assert.equal(release("claude:proj/test", claudeClaimant(claudeSessionAt(process.pid))).status, "released");
+  claim("claude:proj/forged", { ...claudeClaimant(claudeSessionAt(process.pid)), owner: generation("claude", "forged"),
+    generation: generation("claude", process.pid, "another-start", f.inbox) });
+  await post(socket, messageLine({ from: address(f.inbox), fromName: "claude:proj/forged", body: "unverified" }));
+  await until(() => f.turns.length === 2);
+  assert.doesNotMatch(f.turns[1].input[0].text, /reply_name/);
 });

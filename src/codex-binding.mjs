@@ -9,6 +9,7 @@ import { AppServer, daemonSocket } from "./app-server.mjs";
 import { bindDelayMs, bindReporter } from "./bind-retry.mjs";
 import { Admission, checkSocketPath, closeInbox, listenInbox, ownsSocket } from "./inbox.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
+import { claim, claimsOf } from "./names.mjs";
 import { VERSION } from "./version.mjs";
 import {
   address, codexPeers, ensurePrivateDir, generation, isSafePeerRecord, peerSocket, peersHome, processStart, readPeerRecord,
@@ -92,7 +93,28 @@ async function bindNow(meta) {
     catch (error) { log("inbox.alias", { threadId: logIdentity(threadId), outcome: "failed", ...errorFields(error) }); }
   }
   log("inbox.bound", { threadId: logIdentity(threadId), rootId: logIdentity(rootId), outcome: "succeeded" });
+  refreshClaims(root);
   return root;
+}
+
+// A root thread owns its claimed names; this process holds them while it serves the thread.
+export const claimantOf = (root) => ({ kind: "codex", owner: generation("codex", root.threadId), generation: root.generation, address: root.address,
+  holder: { pid: process.pid, procStart: root.procStart, autoName: root.name, threadId: root.threadId,
+    addresses: [...root.inboxes.values()].map((inbox) => inbox.address) } });
+
+// After a restart or an MCP replacement the thread is the same owner in a new generation, so it
+// takes back the names it claimed, without any flag. Another thread's names are never touched.
+function refreshClaims(root) {
+  const claimant = claimantOf(root);
+  for (const name of claimsOf({ owner: claimant.owner })) {
+    try {
+      const result = claim(name, claimant);
+      log("names.refresh", { threadId: logIdentity(root.threadId), targetId: logIdentity(name),
+        outcome: result.status === "refused" ? "failed" : "succeeded", ...(result.reason ? { reason: result.reason.replaceAll("-", "_") } : {}) });
+    } catch (error) {
+      log("names.refresh", { threadId: logIdentity(root.threadId), targetId: logIdentity(name), outcome: "failed", ...errorFields(error) });
+    }
+  }
 }
 
 async function resolveThread(threadId) {
