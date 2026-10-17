@@ -20,7 +20,8 @@ export const SCOPE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const CLAIM = /^[a-z0-9][a-z0-9_.-]{0,63}$/, HEX16 = /^[a-f0-9]{16}$/, FILE = /^n-[a-f0-9]{32}\.json$/;
 const HERMES_SOCKET = /^hermes-[a-f0-9]{32}\.sock$/;
 const LEFTOVER = /^\.(?:reap|t)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
-const NAMES_PER_OWNER = 8, SCAN_MAX = 1024, ATTEMPTS = 3, LEFTOVER_MS = 60_000;
+// NAMES_MAX bounds the directory, so a scan reads every record: a new record is refused past it.
+const NAMES_PER_OWNER = 8, NAMES_MAX = 1024, SWEEP_MAX = 1024, ATTEMPTS = 3, LEFTOVER_MS = 60_000;
 const GRAMMAR = "<kind>:<scope>/<claim>, with kind claude, codex or hermes, scope [a-z0-9][a-z0-9_-]{0,63} and claim [a-z0-9][a-z0-9_.-]{0,63}";
 const HOLDER = { claude: "a Claude session", codex: "a Codex session", hermes: "a Hermes conversation" };
 
@@ -85,10 +86,11 @@ function readName(name) {
   try { return validRecord(readPeerFile(file).record, file); } catch { return undefined; }
 }
 
-// Every valid record, at most SCAN_MAX files, read once per discovery scope.
+// Every valid record, read once per discovery scope. Never a part of them: the re-claim after a
+// restart and the per-owner cap must see every name. NAMES_MAX keeps the directory bounded.
 const scan = () => scoped("claims", () => {
   let dir, files = [];
-  try { dir = existingDirectory(); if (dir) files = readdirSync(dir).filter((f) => FILE.test(f)).sort().slice(0, SCAN_MAX); } catch {}
+  try { dir = existingDirectory(); if (dir) files = readdirSync(dir).filter((f) => FILE.test(f)).sort(); } catch {}
   return files.flatMap((f) => {
     try { const record = validRecord(readPeerFile(join(dir, f)).record, join(dir, f)); return record ? [record] : []; }
     catch { return []; }
@@ -179,7 +181,7 @@ function temporaryRecord(dir, record) {
 // so a swap still in progress is never swept. Only this user's regular files are removed.
 function sweep(dir) {
   let files;
-  try { files = readdirSync(dir).filter((f) => LEFTOVER.test(f)).slice(0, SCAN_MAX); } catch { return; }
+  try { files = readdirSync(dir).filter((f) => LEFTOVER.test(f)).slice(0, SWEEP_MAX); } catch { return; }
   const before = Date.now() - LEFTOVER_MS;
   for (const f of files) {
     try {
@@ -279,6 +281,11 @@ export function claim(text, claimant) {
       }
       if (!ours && scan().filter((r) => r.owner === claimant.owner && r.name !== parsed.name).length >= NAMES_PER_OWNER) {
         return claimRefusal("too-many-names", `This session already holds ${NAMES_PER_OWNER} names; release one before claiming another.`, fields);
+      }
+      // Only a new file counts against the directory bound; refreshes and takeovers replace one.
+      if (!current && readdirSync(dirname(file)).filter((f) => FILE.test(f)).length >= NAMES_MAX) {
+        return claimRefusal("too-many-names", `There are already ${NAMES_MAX} claimed names on this machine; release names whose holder ` +
+          "stopped (agent-peers list shows them as not running) before claiming a new one.", fields);
       }
       if (ours && record.owner === next.owner && record.generation === next.generation &&
           JSON.stringify(record.holder) === JSON.stringify(next.holder)) {

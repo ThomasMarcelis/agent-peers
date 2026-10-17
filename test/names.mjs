@@ -11,7 +11,7 @@ import { createServer } from "node:net";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { claim, claimRows, claudeClaimant, parseName, release, resolveClaim, withClaims } from "../src/names.mjs";
+import { claim, claimRows, claimsOf, claudeClaimant, parseName, release, resolveClaim, withClaims } from "../src/names.mjs";
 import { Pins, resolveTarget } from "../src/outbox.mjs";
 import { address, claudeSessionAt, claudeSessions, generation, processStart } from "../src/wire.mjs";
 
@@ -348,6 +348,30 @@ test("at most 8 names per owner", (t) => {
   assert.equal(claim("proj/n0", f.me()).status, "refreshed", "a refresh adds no name");
   assert.equal(release("proj/n0", f.me()).status, "released");
   assert.equal(claim("proj/n8", f.me()).status, "claimed");
+});
+
+test("scans read every record, and a new record is refused once 1024 exist while refreshes and takeovers still work", (t) => {
+  const f = fixture(t), names = join(f.peers, "names");
+  mkdirSync(names, { recursive: true, mode: 0o700 });
+  const owner = (id) => ({ kind: "codex", owner: generation("codex", id), generation: generation("codex", id, "1"), address: null,
+    holder: { pid: 0x7ffffff0, autoName: `codex:${id}-0001`, threadId: id, addresses: [] } });
+  const write = (name, o) => writeFileSync(fileOf(f.dir, name), JSON.stringify({ v: 1, name, kind: "codex", owner: o.owner, generation: o.generation,
+    claimedAt: 1, holder: o.holder }), { mode: 0o600 }), hash = (name) => basename(fileOf(f.dir, name));
+  // More records than the bound, as an older agent-peers could leave; nine of one owner's sort last.
+  for (let i = 0; i < 1100; i++) write(`codex:old/worker-${i}`, owner(`w${i}`));
+  const last = readdirSync(names).sort().at(-1), mine = [];
+  for (let i = 0; mine.length < 9; i++) if (hash(`codex:proj/role-${i}`) > last) mine.push(`codex:proj/role-${i}`);
+  for (const name of mine) write(name, owner("me"));
+  assert.deepEqual(claimsOf({ owner: owner("me").owner }).sort(), [...mine].sort(), "the restart re-claim sees every name");
+  assert.equal(claimRows().length, 1109);
+  // The owner already holds more than 8, all of which the cap counts, so it cannot take another.
+  assert.equal(claim("codex:old/worker-0", owner("me")).reason, "too-many-names");
+  assert.equal(claim(mine[0], owner("me")).status, "refreshed", "a refresh still works");
+  // Another owner: no new file past the bound, but a dead record is taken over.
+  const refused = claim("codex:proj/new", owner("other"));
+  assert.deepEqual([refused.reason, /1024 claimed names/.test(refused.text)], ["too-many-names", true]);
+  assert.equal(claim("codex:old/worker-1", owner("other")).status, "taken-over");
+  assert.equal(readdirSync(names).filter((name) => name.startsWith("n-")).length, 1109);
 });
 
 test("release: only the holder of a running claim, anyone once the holder stopped, and never a newer record", async (t) => {
