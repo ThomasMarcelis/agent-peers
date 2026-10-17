@@ -11,8 +11,8 @@ import { linkSync, lstatSync, readdirSync, renameSync, rmSync, writeFileSync } f
 import { basename, dirname, join, resolve } from "node:path";
 import { CLAIMED_NAME, SendFailure } from "./status.mjs";
 import {
-  alive, claudeSessions, codexPeers, ensurePrivateDir, generation, inDiscoveryScope, peerSocket, peersHome, processStarts, readPeerFile,
-  safeDirectory, safeText, scoped, validPid, validSocketPath, validThreadId,
+  address, alive, claudeSessions, codexPeers, ensurePrivateDir, generation, inDiscoveryScope, peerSocket, peersHome, processStarts,
+  readPeerFile, safeDirectory, safeText, scoped, socketPath, validPid, validSocketPath, validThreadId,
 } from "./wire.mjs";
 
 const KINDS = ["claude", "codex", "hermes"];
@@ -105,29 +105,40 @@ function live(record) {
   if (!alive(h.pid) || !h.addresses.length) return undefined;
   const start = processStarts([h.pid]).get(h.pid);
   if (h.procStart !== undefined && start !== undefined && start !== h.procStart) return undefined;
+  // Whether the inboxes exist, not whether this process may send to their directories: every
+  // process must agree on who is running, or one could take over a name another still routes to.
   const inboxes = h.addresses.every((addr) => {
-    const path = peerSocket(addr);
-    if (!path || !HERMES_SOCKET.test(basename(path))) return false;
-    try { return lstatSync(path).isSocket(); } catch { return false; }
+    const path = socketPath(addr);
+    if (!validSocketPath(path) || address(path) !== addr || !HERMES_SOCKET.test(basename(path))) return false;
+    try { const st = lstatSync(path); return st.isSocket() && st.uid === process.getuid(); } catch { return false; }
   });
   return inboxes ? { name: h.autoName, addresses: h.addresses } : undefined;
 }
 
-// The record in a name's file and that file's identity; `record` is undefined for an invalid file,
-// which a claim may replace.
+// The record in a name's file and that file's identity. `record` is undefined for a file that is
+// not a valid record (unsafe, a symlink, not JSON, or wrong fields), which a claim may replace. A
+// file that could not be read now (`unreadable`) or a record a newer agent-peers wrote (`newer`)
+// is never replaced or removed: its holder may be running.
 function slot(file) {
-  let st;
+  let st, read;
   try { st = lstatSync(file); } catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
   if (!st.isFile() && !st.isSymbolicLink()) throw new Error(`unsafe names entry ${file}`);
-  try {
-    const { record, dev, ino } = readPeerFile(file);
-    return { dev, ino, record: validRecord(record, file) };
-  } catch { return { dev: st.dev, ino: st.ino, record: undefined }; }
+  try { read = readPeerFile(file); }
+  catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    if (error.code && error.code !== "ELOOP") return { unreadable: error.code };
+    return { dev: st.dev, ino: st.ino, record: undefined };
+  }
+  const record = validRecord(read.record, file);
+  return { dev: read.dev, ino: read.ino, record, newer: !record && Number.isInteger(read.record.v) && read.record.v > 1 };
 }
+const untouchable = (name, { newer, unreadable }) => newer ? `${name} was claimed with a newer agent-peers; only that version can change it.`
+  : `Could not read the record for ${name} (${unreadable}); nothing changed. Try again.`;
 
 function temporaryRecord(dir, record) {
   const path = join(dir, `.t-${randomUUID()}.json`);
-  writeFileSync(path, JSON.stringify(record), { mode: 0o600, flag: "wx" });
+  try { writeFileSync(path, JSON.stringify(record), { mode: 0o600, flag: "wx" }); }
+  catch (error) { rmSync(path, { force: true }); throw error; }
   return path;
 }
 
@@ -136,6 +147,14 @@ function create(file, record) {
   const temporary = temporaryRecord(dirname(file), record);
   try { linkSync(temporary, file); return "done"; }
   catch (error) { if (error.code === "EEXIST") return "retry"; throw error; }
+  finally { rmSync(temporary, { force: true }); }
+}
+
+// Replace a record this generation holds in one rename, so the name never looks unclaimed while
+// its running holder refreshes it. Nobody else writes a running holder's record.
+function replace(file, record) {
+  const temporary = temporaryRecord(dirname(file), record);
+  try { renameSync(temporary, file); return "done"; }
   finally { rmSync(temporary, { force: true }); }
 }
 
@@ -197,6 +216,7 @@ export function claim(text, claimant) {
     const mine = { ...fields, generation: claimant.generation, address: claimant.address };
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       const current = slot(file), record = current?.record;
+      if (current?.newer || current?.unreadable) return claimRefusal(current.newer ? "name-held" : "conflict", untouchable(parsed.name, current), fields);
       const ours = Boolean(record) && (record.owner === claimant.owner || record.generation === claimant.generation);
       const previous = record ? previousOf(record) : null;
       if (record && !ours && previous.running) {
@@ -210,7 +230,7 @@ export function claim(text, claimant) {
           JSON.stringify(record.holder) === JSON.stringify(next.holder)) {
         return claimResult("refreshed", { ...mine, previous, text: `${parsed.name} already names this session.` });
       }
-      const outcome = current ? swap(file, current, next) : create(file, next);
+      const outcome = !current ? create(file, next) : record?.generation === claimant.generation ? replace(file, next) : swap(file, current, next);
       if (outcome === "retry") continue;
       if (outcome === "conflict") break;
       if (ours) return claimResult("refreshed", { ...mine, previous, text: `Refreshed ${parsed.name}; it names this session again.` });
@@ -233,6 +253,7 @@ export function release(text, claimant, kind = claimant?.kind) {
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       const current = file && slot(file), record = current?.record;
       if (!current) return claimRefusal("not-found", `No session has claimed ${parsed.name}.`, fields);
+      if (current.newer || current.unreadable) return claimRefusal(current.newer ? "not-holder" : "conflict", untouchable(parsed.name, current), fields);
       const ours = Boolean(claimant && record) && (record.owner === claimant.owner || record.generation === claimant.generation);
       const previous = record ? previousOf(record) : null;
       if (record && !ours && previous.running) {

@@ -7,6 +7,7 @@ import { once } from "node:events";
 import fs, { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync,
   writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -159,6 +160,40 @@ test("compare-and-swap: a record replaced between read and rename is restored, a
   assert.equal(resolveClaim(NAME).generation, next.claimant().generation);
 });
 
+test("a running holder's refresh never leaves its name free for another claimant", async (t) => {
+  const f = fixture(t), other = await f.session("other");
+  assert.equal(claim(NAME, f.me()).status, "claimed");
+  // Another session claims right after each rename the refresh makes.
+  const rename = fs.renameSync, during = [];
+  fs.renameSync = (source, destination) => {
+    rename(source, destination);
+    if (!during.length) { during.push(null); during[0] = claim(NAME, other.claimant()); }
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.renameSync = rename; syncBuiltinESMExports(); });
+  const refreshed = claim(NAME, { ...f.me(), holder: { ...f.me().holder, autoName: "claude:me-renamed" } });
+  assert.deepEqual([refreshed.status, during[0]?.status, during[0]?.reason], ["refreshed", "refused", "name-held"]);
+  const stored = JSON.parse(readFileSync(fileOf(f.dir, NAME), "utf8"));
+  assert.deepEqual([stored.generation, stored.holder.autoName], [f.me().generation, "claude:me-renamed"]);
+});
+
+test("a Hermes holder is running wherever its inboxes are, even in a directory this process may not send to", async (t) => {
+  const f = fixture(t), socket = join(f.other, `hermes-${"a".repeat(32)}.sock`), server = createServer();
+  await new Promise((resolve) => server.listen(socket, resolve));
+  t.after(() => server.close());
+  const hermes = (route, owner) => ({ kind: "hermes", scope: "proj", owner: generation("hermes", "proj", owner),
+    generation: generation("hermes", route), address: address(socket),
+    holder: { pid: process.pid, procStart: processStart(process.pid), autoName: `hermes:${owner}`, addresses: [address(socket)] } });
+  const name = "hermes:proj/relay";
+  assert.equal(claim(name, hermes("route-1", "conversation-1")).status, "claimed");
+  const [row] = claimRows();
+  assert.deepEqual([row.running, row.address], [true, null], "running, with no address this process may use");
+  assert.deepEqual([claim(name, hermes("route-2", "conversation-2")).reason, release(name, undefined, "hermes").reason], ["name-held", "not-holder"]);
+  assert.throws(() => resolveClaim(name), (error) => error.reason === "inbox-unavailable");
+  await new Promise((resolve) => server.close(resolve));
+  assert.equal(claimRows()[0].running, false, "its inbox is gone");
+});
+
 test("the conflict table: dead and reused holders are taken over, the same owner refreshes, a live holder is refused", async (t) => {
   const f = fixture(t);
   // A holder whose process was killed.
@@ -257,6 +292,17 @@ test("file safety: unsafe, foreign or mismatched files are never read as claims;
   // An invalid file in the name's place can be claimed over.
   writeFileSync(file, "not json", { mode: 0o600 });
   assert.equal(claim(NAME, f.me()).status, "claimed");
+  // A record from a newer agent-peers, or one that cannot be read right now, is never replaced or removed.
+  writeFileSync(file, JSON.stringify({ ...JSON.parse(good), v: 2, holder: { future: true } }), { mode: 0o600 });
+  assert.deepEqual([claim(NAME, f.me()).reason, release(NAME, undefined, "claude").reason], ["name-held", "not-holder"]);
+  if (process.getuid() !== 0) {
+    writeFileSync(file, good, { mode: 0o600 });
+    chmodSync(file, 0o000);
+    const [claimed, released] = [claim(NAME, f.me()), release(NAME, undefined, "claude")];
+    assert.deepEqual([claimed.reason, released.reason, claimed.name], ["conflict", "conflict", NAME]);
+    assert.match(claimed.text, /\(EACCES\); nothing changed/);
+    chmodSync(file, 0o600);
+  }
   chmodSync(names, 0o755);
   assert.deepEqual(claimRows(), [], "a shared directory is not read");
   assert.throws(() => claim(NAME, f.me()), /unsafe peer directory/);
