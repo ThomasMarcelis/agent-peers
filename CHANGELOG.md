@@ -6,12 +6,29 @@
 
 - Claimed names are [experimental](docs/stability.md#experimental) in 1.x. Their commands, fields and storage may change in a minor release. Their safety rules stay fixed: no misrouting, no displacing a running holder, profile scoping, and the Hermes first-message rule. Sessions that do not claim names depend on covered surfaces only.
 - A Claude session claims a name only if Claude's session registry records its process start time, as current Claude Code does. Older builds get `unsupported-host` instead of a claim owned by the PID alone, which a later session reusing the PID and socket path could inherit (#30).
+- Experimental names: a name whose holder stopped is released only by a releaser of its own kind, and for Hermes only within its profile. `agent-peers release`, also outside a session, removes dead `claude:` names and Codex `release_name` dead `codex:` names; anything else is `scope-denied`, so a gateway restart's dead Hermes names wait for their own conversation.
+- Experimental names: `agent-peers claim`, `release`, `resolve` and `list` stop looking for the calling Claude session at the first agent process (`claude`, `codex`, `hermes`, or Node or Python running one) that has no Claude session record. A worker an agent started inside a Claude session gets `no-session` instead of claiming for that session.
+- Experimental names: a claim that would add a new name once 1024 exist on the machine is refused with `too-many-names`; refreshes and takeovers still work.
+- Experimental names: `agent-peers resolve` waits up to a second for a Hermes holder's answer to its `name_resolved` line, and exits 1 when the holder will not admit the calling session (`not-holder`, `unknown-sender`, `inbox-closed`). A bridge that does not answer, as before this release, counts as admitting.
+- Experimental names: a Codex recipient drops a line sent to a claimed name it does not hold now with `not-a-reply-target`, as a Hermes conversation does, and a Hermes conversation now drops such a line from its reply targets too.
 
 ### Fixed
 
+- Experimental names: a running holder that the reading process could not see in its own registry view (another `CLAUDE_CONFIG_DIR`, a socket directory only another configuration knows, a Claude session file being rewritten) counted as stopped, so its name could be taken over or released while it still received messages. Only a dead process, a reused PID, or for Hermes the loss of every recorded inbox now stops a holder; one that runs out of sight lists as running with no address and resolves to `inbox-unavailable`.
+- Experimental names: a Claude claim recorded without a start time (by rc.2) counts as not running, instead of resolving to a later session at the same PID and socket.
+- Experimental names: scans read every record. Past 1024 name files, the re-claim after a restart and the per-owner cap missed names that resolve still found.
+- Experimental names: senders admitted to a Hermes conversation by its name have their own rate-limit table, so a burst of them no longer gives the conversation's own reply targets `queue-full`; and a sender is admitted by name only from a socket that exists.
+- Experimental names: a record written by a newer agent-peers is never replaced or removed, even when this version can read it.
+- Experimental names: a Hermes holder runs while any of its recorded inboxes exists, and its records follow the inboxes its later sends open, so senders in a new socket directory get an inbox there.
+- Experimental names: a record that a claim which died midway left aside is put back while its name is free, instead of being deleted with the other leftovers.
+- Experimental names: a Hermes conversation whose names cannot be taken back retries at most once a minute, instead of opening and closing inboxes on every call.
 - Senders admitted to a Hermes conversation by its claimed name are kept apart from the peers it wrote to, at most the latest 64, so they can no longer push those reply targets out (#30).
 - A refused Hermes claim closes the inboxes it opened (#30).
 - A claim or release removes `.reap-*` and `.t-*` files that a claim or release that died midway left in `$AGENT_PEERS_HOME/names/` more than a minute ago (#30).
+
+### Documented
+
+- Experimental names: a Hermes conversation that is compressed and then loses its gateway before its next agent-peers call does not take its names back automatically, because their owner is still its old conversation id ([Hermes](docs/hermes.md#stable-names)). A Codex root that `/new` left behind keeps its names until its MCP process exits. A sender admitted by `name_resolved` stays admitted for the conversation's lifetime.
 
 ## 1.0.0-rc.2 — 2026-10-17
 
