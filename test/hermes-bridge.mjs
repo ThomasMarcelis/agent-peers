@@ -793,6 +793,29 @@ test("a claimed name admits senders that used the name, never one that found the
   assert.deepEqual([f.events[2].params.session, f.events[2].params.message], ["named", "from another conversation"]);
 });
 
+test("senders admitted by name are bounded, apart from the peers the conversation wrote to", { timeout: 30_000 }, async (t) => {
+  const f = await fixture(t, { profile: "jd" });
+  const inbox = peerSocket((await named(f.bridge, "claim_name", "named", "conversation", "jd/relay")).address);
+  const codex = address(join(f.sockets, "codex-test.sock")), claude = address(join(f.sockets, "claude-test.sock"));
+  const byName = (from, body) => ({ ...messageLine({ from, body }), agent_peers: { v: 1, to_name: "hermes:jd/relay" } });
+  // A peer this conversation wrote to, which has answered once.
+  await f.send("named", "codex:test", "hello");
+  await post(inbox, messageLine({ from: codex, body: "reply" }));
+  await until(() => f.events.length === 1, "the reply");
+  // The first sender admitted by name, then more than either bound (64 by name, 256 written to).
+  await post(inbox, byName(claude, "first by name"));
+  await until(() => f.events.length === 2, "the first message by name");
+  for (let i = 0; i < 300; i++) await post(inbox, byName(address(join(f.sockets, `named-${i}.sock`)), `by name ${i}`));
+  await until(() => f.events.length >= 2 + 64, "the later messages by name");
+  await delay(300);
+  const forgotten = messageLine({ from: claude, body: "forgotten" });
+  await post(inbox, forgotten);
+  await post(inbox, messageLine({ from: codex, body: "still a reply target" }));
+  await until(() => f.events.some((e) => e.params.message === "still a reply target"), "the reply target's message");
+  await until(() => f.controls.some(({ kind, line }) => kind === "claude" && line.drop_reason === "not-a-reply-target" &&
+    line.dropped_msg_ids.includes(forgotten.msg_id)), "the oldest sender by name forgotten");
+});
+
 test("a Claude session that ran agent-peers resolve may write first; another Claude session may not", async (t) => {
   const f = await fixture(t, { profile: "jd" });
   await named(f.bridge, "claim_name", "named", "conversation", "jd/relay");
