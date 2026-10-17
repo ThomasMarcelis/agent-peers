@@ -176,17 +176,31 @@ function temporaryRecord(dir, record) {
   return path;
 }
 
-// Remove what a claim or release that died midway left behind: a record moved aside (.reap-) or
-// one never published (.t-), unchanged for a minute since. Renaming a file aside sets its ctime,
-// so a swap still in progress is never swept. Only this user's regular files are removed.
+// Clear up after a claim or release that died midway, once its file is unchanged for a minute:
+// renaming a file aside sets its ctime (test/names.mjs checks this on each CI filesystem), so a
+// swap still in progress is never touched. A record moved aside (.reap-) whose name file is gone
+// goes back in place: it may be a running holder's record that a swap had not put back yet.
+// Otherwise it is removed, as is a record never published (.t-); a .reap- record a newer
+// agent-peers wrote is left for that version. Only this user's regular files are touched.
 function sweep(dir) {
   let files;
   try { files = readdirSync(dir).filter((f) => LEFTOVER.test(f)).slice(0, SWEEP_MAX); } catch { return; }
   const before = Date.now() - LEFTOVER_MS;
   for (const f of files) {
     try {
-      const st = lstatSync(join(dir, f));
-      if (st.isFile() && st.uid === process.getuid() && st.ctimeMs < before) rmSync(join(dir, f));
+      const path = join(dir, f), st = lstatSync(path);
+      if (!st.isFile() || st.uid !== process.getuid() || st.ctimeMs >= before) continue;
+      if (f.startsWith(".reap-")) {
+        let value;
+        try { value = readPeerFile(path).record; } catch {}
+        if (newer(value)) continue;
+        const target = CLAIMED_NAME.test(value?.name ?? "") && join(dir, fileName(value.name));
+        if (target && validRecord(value, target)) {
+          try { linkSync(path, target); }
+          catch (error) { if (error.code !== "EEXIST") continue; }
+        }
+      }
+      rmSync(path);
     } catch {}
   }
 }

@@ -209,6 +209,52 @@ test("a claim or release sweeps what a dead claim left aside a minute ago, and n
   assert.equal(readdirSync(names).includes(another), false, "a release sweeps too");
 });
 
+test("a record left aside by a claim that died is put back while its name is free, and removed once it is not", async (t) => {
+  const f = fixture(t), names = join(f.peers, "names"), lead = await f.session("lead");
+  claim(NAME, lead.claimant());
+  claim("claude:proj/second", lead.claimant());
+  const aside = (name) => {
+    const path = join(names, `.reap-${randomUUID()}.json`);
+    fs.renameSync(fileOf(f.dir, name), path);
+    return basename(path);
+  };
+  // A swap that died between moving the record aside and putting it back; the second name was
+  // claimed again meanwhile; a newer agent-peers' record is never removed.
+  const orphan = aside(NAME), stale = aside("claude:proj/second"), future = `.reap-${randomUUID()}.json`;
+  writeFileSync(join(names, future), JSON.stringify({ v: 2, name: "claude:proj/future" }), { mode: 0o600 });
+  const other = await f.session("other");
+  assert.equal(claim("claude:proj/second", other.claimant()).status, "claimed");
+  assert.throws(() => resolveClaim(NAME), (error) => error.reason === "not-found", "fresh: it may be a swap still running");
+  const now = Date.now;
+  Date.now = () => now() + 61_000;
+  t.after(() => { Date.now = now; });
+  assert.equal(release("proj/missing", f.me()).reason, "not-found");
+  assert.equal(resolveClaim(NAME).holder, "claude:lead", "the orphaned record is back");
+  assert.equal(resolveClaim("claude:proj/second").holder, "claude:other", "a name claimed again is kept");
+  assert.deepEqual(readdirSync(names).filter((name) => name.startsWith(".")), [future]);
+  assert.ok(![orphan, stale].some((name) => readdirSync(names).includes(name)));
+});
+
+// The sweep above tells a swap in progress by its ctime, which rename(2) must update. Linux
+// filesystems and APFS do (stat(2) on macOS lists rename); CI checks each runner's filesystem.
+test("renaming a file aside updates its ctime on this filesystem", async (t) => {
+  const dir = mkdtempSync(join(realpathSync("/tmp"), "ap-ctime-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "record.json");
+  writeFileSync(file, "{}");
+  const before = lstatSync(file).ctimeMs;
+  // Wait until this filesystem's clock, at its own resolution, has passed that ctime.
+  for (let i = 0; i < 300; i++) {
+    writeFileSync(join(dir, "probe"), String(i));
+    if (lstatSync(join(dir, "probe")).ctimeMs > before) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(lstatSync(join(dir, "probe")).ctimeMs > before, "the filesystem clock advanced");
+  fs.renameSync(file, join(dir, `.reap-${randomUUID()}.json`));
+  const moved = readdirSync(dir).find((name) => name.startsWith(".reap-"));
+  assert.ok(lstatSync(join(dir, moved)).ctimeMs > before, "rename updated the ctime");
+});
+
 test("a running holder's refresh never leaves its name free for another claimant", async (t) => {
   const f = fixture(t), other = await f.session("other");
   assert.equal(claim(NAME, f.me()).status, "claimed");
