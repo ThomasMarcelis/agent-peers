@@ -20,7 +20,8 @@ export const SCOPE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const CLAIM = /^[a-z0-9][a-z0-9_.-]{0,63}$/, HEX16 = /^[a-f0-9]{16}$/, FILE = /^n-[a-f0-9]{32}\.json$/;
 const HERMES_SOCKET = /^hermes-[a-f0-9]{32}\.sock$/;
 const LEFTOVER = /^\.(?:reap|t)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
-const NAMES_PER_OWNER = 8, SCAN_MAX = 1024, ATTEMPTS = 3, LEFTOVER_MS = 60_000;
+// NAMES_MAX bounds the directory, so a scan reads every record: a new record is refused past it.
+const NAMES_PER_OWNER = 8, NAMES_MAX = 1024, SWEEP_MAX = 1024, ATTEMPTS = 3, LEFTOVER_MS = 60_000;
 const GRAMMAR = "<kind>:<scope>/<claim>, with kind claude, codex or hermes, scope [a-z0-9][a-z0-9_-]{0,63} and claim [a-z0-9][a-z0-9_.-]{0,63}";
 const HOLDER = { claude: "a Claude session", codex: "a Codex session", hermes: "a Hermes conversation" };
 
@@ -41,6 +42,11 @@ export function parseName(text, kind) {
   return { kind: resolved, scope: parts[0], claim: parts[1], elided: named === undefined,
     name: resolved ? `${resolved}:${parts[0]}/${parts[1]}` : undefined };
 }
+
+// The record version this agent-peers writes. A later version that changes what a record means
+// raises it, and this version then never replaces or removes such a record (slot).
+const RECORD_V = 1;
+const newer = (value) => Number.isInteger(value?.v) && value.v > RECORD_V;
 
 const directory = () => join(resolve(peersHome()), "names");
 const fileName = (name) => `n-${createHash("sha256").update(name).digest("hex").slice(0, 32)}.json`;
@@ -80,20 +86,49 @@ function readName(name) {
   try { return validRecord(readPeerFile(file).record, file); } catch { return undefined; }
 }
 
-// Every valid record, at most SCAN_MAX files, read once per discovery scope.
+// Every valid record, read once per discovery scope. Never a part of them: the re-claim after a
+// restart and the per-owner cap must see every name. NAMES_MAX keeps the directory bounded.
 const scan = () => scoped("claims", () => {
   let dir, files = [];
-  try { dir = existingDirectory(); if (dir) files = readdirSync(dir).filter((f) => FILE.test(f)).sort().slice(0, SCAN_MAX); } catch {}
+  try { dir = existingDirectory(); if (dir) files = readdirSync(dir).filter((f) => FILE.test(f)).sort(); } catch {}
   return files.flatMap((f) => {
     try { const record = validRecord(readPeerFile(join(dir, f)).record, join(dir, f)); return record ? [record] : []; }
     catch { return []; }
   });
 });
 
-// The running holder of a record, as { name, addresses }, or undefined. Claude and Codex holders
-// are checked against their live registries, which also give their current addresses; a Hermes
-// holder has no registry, so its bridge must still run and every recorded inbox must still exist.
-function live(record) {
+// A Hermes holder's recorded inboxes that exist now as sockets of this user, in any directory.
+function hermesInboxes(h) {
+  return h.addresses.filter((addr) => {
+    const path = socketPath(addr);
+    if (!validSocketPath(path) || address(path) !== addr || !HERMES_SOCKET.test(basename(path))) return false;
+    try { const st = lstatSync(path); return st.isSocket() && st.uid === process.getuid(); } catch { return false; }
+  });
+}
+
+// Whether a record's holder stopped, decided only from positive evidence in the record: its process
+// is gone, or its PID now belongs to a process with another start time; a Hermes conversation has
+// also stopped when none of its recorded inboxes exists. What this process can see of the holder
+// (its CLAUDE_CONFIG_DIR, its socket directories, a registry file Claude is rewriting) is never
+// evidence, or one process could take over a name another still routes to. A Claude record without
+// a start time (rc.2 wrote them for older Claude Code builds) cannot tell its holder from a later
+// session that reused the PID and socket, so it counts as stopped.
+function stopped(record) {
+  const h = record.holder;
+  if (!alive(h.pid)) return true;
+  if (h.procStart === undefined) {
+    if (record.kind === "claude") return true;
+  } else {
+    const start = processStarts([h.pid]).get(h.pid);
+    if (start !== undefined && start !== h.procStart) return true;
+  }
+  return record.kind === "hermes" && !hermesInboxes(h).length;
+}
+
+// Where this process can reach a holder: its current name and the addresses it may send to, or
+// undefined when it cannot see the holder. Claude and Codex holders come from this process's view
+// of their registries, which knows their current addresses; Hermes keeps no registry.
+function reach(record) {
   const h = record.holder;
   if (record.kind === "claude") {
     const s = claudeSessions().find((peer) => peer.pid === h.pid && peer.generation === record.generation);
@@ -103,23 +138,22 @@ function live(record) {
     const p = codexPeers().find((peer) => peer.threadId === h.threadId && peer.generation === record.generation);
     return p && { name: p.name, addresses: [...new Set([p.address, ...p.addresses])] };
   }
-  if (!alive(h.pid) || !h.addresses.length) return undefined;
-  const start = processStarts([h.pid]).get(h.pid);
-  if (h.procStart !== undefined && start !== undefined && start !== h.procStart) return undefined;
-  // Whether the inboxes exist, not whether this process may send to their directories: every
-  // process must agree on who is running, or one could take over a name another still routes to.
-  const inboxes = h.addresses.every((addr) => {
-    const path = socketPath(addr);
-    if (!validSocketPath(path) || address(path) !== addr || !HERMES_SOCKET.test(basename(path))) return false;
-    try { const st = lstatSync(path); return st.isSocket() && st.uid === process.getuid(); } catch { return false; }
-  });
-  return inboxes ? { name: h.autoName, addresses: h.addresses } : undefined;
+  return { name: h.autoName, addresses: hermesInboxes(h).filter((addr) => peerSocket(addr)) };
+}
+
+// A record's holder for listings, resolution and conflicts: whether it runs, its name, and the
+// addresses this process may send to (none when it runs out of this process's sight).
+function holderOf(record) {
+  if (stopped(record)) return { running: false, name: record.holder.autoName, addresses: [] };
+  const seen = reach(record);
+  return { running: true, name: seen?.name ?? record.holder.autoName, addresses: seen?.addresses ?? [] };
 }
 
 // The record in a name's file and that file's identity. `record` is undefined for a file that is
 // not a valid record (unsafe, a symlink, not JSON, or wrong fields), which a claim may replace. A
-// file that could not be read now (`unreadable`) or a record a newer agent-peers wrote (`newer`)
-// is never replaced or removed: its holder may be running.
+// file that could not be read now (`unreadable`) or a record with a higher `v` than this version
+// writes (`newer`, even one it can read) is never replaced or removed: its holder may be running,
+// by rules this version does not know.
 function slot(file) {
   let st, read;
   try { st = lstatSync(file); } catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
@@ -130,8 +164,7 @@ function slot(file) {
     if (error.code && error.code !== "ELOOP") return { unreadable: error.code };
     return { dev: st.dev, ino: st.ino, record: undefined };
   }
-  const record = validRecord(read.record, file);
-  return { dev: read.dev, ino: read.ino, record, newer: !record && Number.isInteger(read.record.v) && read.record.v > 1 };
+  return { dev: read.dev, ino: read.ino, record: validRecord(read.record, file), newer: newer(read.record) };
 }
 const untouchable = (name, { newer, unreadable }) => newer ? `${name} was claimed with a newer agent-peers; only that version can change it.`
   : `Could not read the record for ${name} (${unreadable}); nothing changed. Try again.`;
@@ -143,17 +176,31 @@ function temporaryRecord(dir, record) {
   return path;
 }
 
-// Remove what a claim or release that died midway left behind: a record moved aside (.reap-) or
-// one never published (.t-), unchanged for a minute since. Renaming a file aside sets its ctime,
-// so a swap still in progress is never swept. Only this user's regular files are removed.
+// Clear up after a claim or release that died midway, once its file is unchanged for a minute:
+// renaming a file aside sets its ctime (test/names.mjs checks this on each CI filesystem), so a
+// swap still in progress is never touched. A record moved aside (.reap-) whose name file is gone
+// goes back in place: it may be a running holder's record that a swap had not put back yet.
+// Otherwise it is removed, as is a record never published (.t-); a .reap- record a newer
+// agent-peers wrote is left for that version. Only this user's regular files are touched.
 function sweep(dir) {
   let files;
-  try { files = readdirSync(dir).filter((f) => LEFTOVER.test(f)).slice(0, SCAN_MAX); } catch { return; }
+  try { files = readdirSync(dir).filter((f) => LEFTOVER.test(f)).slice(0, SWEEP_MAX); } catch { return; }
   const before = Date.now() - LEFTOVER_MS;
   for (const f of files) {
     try {
-      const st = lstatSync(join(dir, f));
-      if (st.isFile() && st.uid === process.getuid() && st.ctimeMs < before) rmSync(join(dir, f));
+      const path = join(dir, f), st = lstatSync(path);
+      if (!st.isFile() || st.uid !== process.getuid() || st.ctimeMs >= before) continue;
+      if (f.startsWith(".reap-")) {
+        let value;
+        try { value = readPeerFile(path).record; } catch {}
+        if (newer(value)) continue;
+        const target = CLAIMED_NAME.test(value?.name ?? "") && join(dir, fileName(value.name));
+        if (target && validRecord(value, target)) {
+          try { linkSync(path, target); }
+          catch (error) { if (error.code !== "EEXIST") continue; }
+        }
+      }
+      rmSync(path);
     } catch {}
   }
 }
@@ -208,8 +255,8 @@ export const claudeClaimant = (s) => ({ kind: "claude", owner: generation("claud
   address: s.address, holder: { pid: s.pid, procStart: s.procStart, autoName: s.name, socket: s.socket, addresses: [s.address] } });
 
 const previousOf = (record) => {
-  const holder = live(record);
-  return { holder: holder?.name ?? record.holder.autoName, generation: record.generation, running: Boolean(holder) };
+  const holder = holderOf(record);
+  return { holder: holder.name, generation: record.generation, running: holder.running };
 };
 
 // Claim a name for `claimant`: { kind, owner, generation, address, holder, scope? }. The owner is the
@@ -234,7 +281,7 @@ export function claim(text, claimant) {
     ensurePrivateDir(peersHome());
     const file = join(ensurePrivateDir(directory()), fileName(parsed.name));
     sweep(dirname(file));
-    const next = { v: 1, name: parsed.name, kind: parsed.kind, owner: claimant.owner, generation: claimant.generation,
+    const next = { v: RECORD_V, name: parsed.name, kind: parsed.kind, owner: claimant.owner, generation: claimant.generation,
       claimedAt: Date.now(), holder: holderFields(parsed.kind, claimant.holder) };
     const mine = { ...fields, generation: claimant.generation, address: claimant.address };
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
@@ -248,6 +295,11 @@ export function claim(text, claimant) {
       }
       if (!ours && scan().filter((r) => r.owner === claimant.owner && r.name !== parsed.name).length >= NAMES_PER_OWNER) {
         return claimRefusal("too-many-names", `This session already holds ${NAMES_PER_OWNER} names; release one before claiming another.`, fields);
+      }
+      // Only a new file counts against the directory bound; refreshes and takeovers replace one.
+      if (!current && readdirSync(dirname(file)).filter((f) => FILE.test(f)).length >= NAMES_MAX) {
+        return claimRefusal("too-many-names", `There are already ${NAMES_MAX} claimed names on this machine; release names whose holder ` +
+          "stopped (agent-peers list shows them as not running) before claiming a new one.", fields);
       }
       if (ours && record.owner === next.owner && record.generation === next.generation &&
           JSON.stringify(record.holder) === JSON.stringify(next.holder)) {
@@ -267,11 +319,22 @@ export function claim(text, claimant) {
   });
 }
 
-// Remove a name: its holder (the same owner or generation) may, and anyone may once the holder is
-// not running. `claimant` is undefined outside a session; `kind` fills in an elided kind.
+// Remove a name: its holder (the same owner or generation) may, and once the holder is not running
+// so may another releaser of the same kind (for Hermes, of the same profile). A dead name of another
+// kind or profile is left for its own claimant, which may take it back after a restart. `claimant`
+// is undefined for the CLI outside a session, which releases claude: names; `kind` fills in an
+// elided kind.
+const RELEASES = {
+  claude: "agent-peers release removes only claude: names; a Codex session or Hermes conversation releases its own with release_name",
+  codex: "A Codex session releases only codex: names", hermes: "A Hermes conversation releases only hermes: names",
+};
 export function release(text, claimant, kind = claimant?.kind) {
   return inDiscoveryScope(() => {
     const parsed = parseName(text, kind), fields = { name: parsed.name, kind: parsed.kind };
+    if (parsed.kind !== kind) return claimRefusal("scope-denied", `${RELEASES[kind]}, not ${parsed.name}.`, fields);
+    if (claimant?.scope !== undefined && parsed.scope !== claimant.scope) {
+      return claimRefusal("scope-denied", `This Hermes profile releases only hermes:${claimant.scope}/<claim> names, not ${parsed.name}.`, fields);
+    }
     const dir = existingDirectory(), file = dir && join(dir, fileName(parsed.name));
     if (dir) sweep(dir);
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
@@ -306,26 +369,36 @@ export function resolveClaim(to, { directory: preferred } = {}) {
       throw new SendFailure("not-found", `No session has claimed ${parsed.name ?? `"${to}"`}. Its holder must claim it ` +
         "(Claude: agent-peers claim; Codex or Hermes: claim_name). Nothing was sent.");
     }
-    const holder = live(record);
-    if (!holder) {
+    const holder = holderOf(record);
+    if (!holder.running) {
       throw new SendFailure("not-running", `${record.name} is claimed by ${record.holder.autoName}, ${HOLDER[record.kind]} that is no longer running ` +
         `(claimed ${new Date(record.claimedAt).toISOString()}, generation ${record.generation}). Nothing was sent. The new session must claim it.`);
     }
     const usable = holder.addresses.filter((addr) => peerSocket(addr));
     const target = (preferred && usable.find((addr) => dirname(peerSocket(addr)) === preferred)) || usable[0];
-    if (!target) throw new SendFailure("inbox-unavailable", `${record.name} is held by ${holder.name}, which has no usable inbox address. Nothing was sent.`);
+    // Running, but not where this process looks: never another session instead.
+    if (!target) {
+      throw new SendFailure("inbox-unavailable", `${record.name} is held by ${holder.name}, which is running, but this session sees no inbox ` +
+        "of it to send to (its session registry or socket directory is not one this session uses). Nothing was sent.");
+    }
     return { kind: record.kind, name: record.name, address: target, socket: peerSocket(target), addresses: usable, generation: record.generation,
       holder: holder.name, claimed: true };
   });
 }
 
 // Every claimed name, running or not, for listings. Dead names stay until claimed again or released.
-export const claimRows = ({ directory: preferred } = {}) => inDiscoveryScope(() => scoped(`claimRows\0${preferred ?? ""}`, () => scan().map((r) => {
-  const holder = live(r), addresses = holder ? holder.addresses.filter((addr) => peerSocket(addr)) : [];
-  return { name: r.name, kind: r.kind, running: Boolean(holder),
-    address: (preferred && addresses.find((addr) => dirname(peerSocket(addr)) === preferred)) || addresses[0] || null,
-    addresses, generation: r.generation, holder: holder?.name ?? null, claimedAt: r.claimedAt };
-}).sort((a, b) => (a.name < b.name ? -1 : 1))));
+// A running holder this process cannot see is listed as running with no address.
+export const claimRows = ({ directory: preferred } = {}) => inDiscoveryScope(() => scoped(`claimRows\0${preferred ?? ""}`, () => {
+  const records = scan();
+  // One start-time lookup for every holder (a single ps on macOS); stopped() then reads the cache.
+  processStarts(records.filter((r) => r.holder.procStart !== undefined).map((r) => r.holder.pid));
+  return records.map((r) => {
+    const holder = holderOf(r), addresses = holder.addresses.filter((addr) => peerSocket(addr));
+    return { name: r.name, kind: r.kind, running: holder.running,
+      address: (preferred && addresses.find((addr) => dirname(peerSocket(addr)) === preferred)) || addresses[0] || null,
+      addresses, generation: r.generation, holder: holder.running ? holder.name : null, claimedAt: r.claimedAt };
+  }).sort((a, b) => (a.name < b.name ? -1 : 1));
+}));
 
 // The names a running session of this kind and generation holds.
 export const heldBy = (kind, gen) => claimRows().filter((row) => row.running && row.kind === kind && row.generation === gen).map((row) => row.name);
@@ -334,7 +407,7 @@ export const heldBy = (kind, gen) => claimRows().filter((row) => row.running && 
 export const withClaims = (rows) => inDiscoveryScope(() => rows.map((row) => ({ ...row, claims: heldBy(row.kind, row.generation) })));
 
 // The name a verified, running claim holds at this inbox address, for a recipient's frame. A record
-// that names the address but whose holder is not running is ignored.
+// that names the address but whose holder is not running, or not this process's view of it, is ignored.
 export const claimAt = (addr) => claimRows().find((row) => row.running && row.addresses.includes(addr))?.name;
 
 // Whether the record for `name` is held by this generation: a recipient checking a name a sender

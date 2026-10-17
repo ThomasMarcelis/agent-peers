@@ -11,7 +11,7 @@ import { createServer } from "node:net";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { claim, claimRows, claudeClaimant, parseName, release, resolveClaim, withClaims } from "../src/names.mjs";
+import { claim, claimRows, claimsOf, claudeClaimant, parseName, release, resolveClaim, withClaims } from "../src/names.mjs";
 import { Pins, resolveTarget } from "../src/outbox.mjs";
 import { address, claudeSessionAt, claudeSessions, generation, processStart } from "../src/wire.mjs";
 
@@ -209,6 +209,52 @@ test("a claim or release sweeps what a dead claim left aside a minute ago, and n
   assert.equal(readdirSync(names).includes(another), false, "a release sweeps too");
 });
 
+test("a record left aside by a claim that died is put back while its name is free, and removed once it is not", async (t) => {
+  const f = fixture(t), names = join(f.peers, "names"), lead = await f.session("lead");
+  claim(NAME, lead.claimant());
+  claim("claude:proj/second", lead.claimant());
+  const aside = (name) => {
+    const path = join(names, `.reap-${randomUUID()}.json`);
+    fs.renameSync(fileOf(f.dir, name), path);
+    return basename(path);
+  };
+  // A swap that died between moving the record aside and putting it back; the second name was
+  // claimed again meanwhile; a newer agent-peers' record is never removed.
+  const orphan = aside(NAME), stale = aside("claude:proj/second"), future = `.reap-${randomUUID()}.json`;
+  writeFileSync(join(names, future), JSON.stringify({ v: 2, name: "claude:proj/future" }), { mode: 0o600 });
+  const other = await f.session("other");
+  assert.equal(claim("claude:proj/second", other.claimant()).status, "claimed");
+  assert.throws(() => resolveClaim(NAME), (error) => error.reason === "not-found", "fresh: it may be a swap still running");
+  const now = Date.now;
+  Date.now = () => now() + 61_000;
+  t.after(() => { Date.now = now; });
+  assert.equal(release("proj/missing", f.me()).reason, "not-found");
+  assert.equal(resolveClaim(NAME).holder, "claude:lead", "the orphaned record is back");
+  assert.equal(resolveClaim("claude:proj/second").holder, "claude:other", "a name claimed again is kept");
+  assert.deepEqual(readdirSync(names).filter((name) => name.startsWith(".")), [future]);
+  assert.ok(![orphan, stale].some((name) => readdirSync(names).includes(name)));
+});
+
+// The sweep above tells a swap in progress by its ctime, which rename(2) must update. Linux
+// filesystems and APFS do (stat(2) on macOS lists rename); CI checks each runner's filesystem.
+test("renaming a file aside updates its ctime on this filesystem", async (t) => {
+  const dir = mkdtempSync(join(realpathSync("/tmp"), "ap-ctime-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "record.json");
+  writeFileSync(file, "{}");
+  const before = lstatSync(file).ctimeMs;
+  // Wait until this filesystem's clock, at its own resolution, has passed that ctime.
+  for (let i = 0; i < 300; i++) {
+    writeFileSync(join(dir, "probe"), String(i));
+    if (lstatSync(join(dir, "probe")).ctimeMs > before) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(lstatSync(join(dir, "probe")).ctimeMs > before, "the filesystem clock advanced");
+  fs.renameSync(file, join(dir, `.reap-${randomUUID()}.json`));
+  const moved = readdirSync(dir).find((name) => name.startsWith(".reap-"));
+  assert.ok(lstatSync(join(dir, moved)).ctimeMs > before, "rename updated the ctime");
+});
+
 test("a running holder's refresh never leaves its name free for another claimant", async (t) => {
   const f = fixture(t), other = await f.session("other");
   assert.equal(claim(NAME, f.me()).status, "claimed");
@@ -243,6 +289,51 @@ test("a Hermes holder is running wherever its inboxes are, even in a directory t
   assert.equal(claimRows()[0].running, false, "its inbox is gone");
 });
 
+// Liveness comes only from the record (PID and start time); a registry view only picks the address.
+test("a running holder out of this process's sight is never taken over, released or replaced by another session", async (t) => {
+  const f = fixture(t), lead = await f.session("lead");
+  assert.equal(claim(NAME, lead.claimant()).status, "claimed");
+  const sessionFile = join(f.claude, "sessions", `${lead.child.pid}.json`), saved = readFileSync(sessionFile, "utf8");
+  // Another CLAUDE_CONFIG_DIR, as a shell or session with a different configuration sees.
+  const elsewhere = join(f.dir, "claude-b");
+  mkdirSync(join(elsewhere, "sessions"), { recursive: true, mode: 0o700 });
+  const rival = { ...f.me(), owner: generation("claude", "rival"), generation: generation("claude", "rival", "s") };
+  const views = { "another CLAUDE_CONFIG_DIR": () => { process.env.CLAUDE_CONFIG_DIR = elsewhere; },
+    "a registry file Claude is rewriting": () => { writeFileSync(sessionFile, saved.slice(0, 20)); } };
+  for (const [view, enter] of Object.entries(views)) {
+    enter();
+    try {
+      const taken = claim(NAME, rival);
+      assert.deepEqual([taken.status, taken.reason, taken.previous.running], ["refused", "name-held", true], view);
+      assert.deepEqual([release(NAME, undefined, "claude").reason, release(NAME, rival).reason], ["not-holder", "not-holder"], view);
+      assert.throws(() => resolveClaim(NAME), (error) => error.reason === "inbox-unavailable" && /which is running/.test(error.message), view);
+      assert.deepEqual(claimRows().map((row) => [row.running, row.address, row.holder]), [[true, null, "claude:lead"]], view);
+    } finally { process.env.CLAUDE_CONFIG_DIR = f.claude; writeFileSync(sessionFile, saved); }
+  }
+  assert.equal(resolveClaim(NAME).address, address(join(f.sockets, `${lead.child.pid}.sock`)), "the holder still has its name");
+  // A Codex holder whose primary inbox sits in a directory this process knows only from another
+  // configuration's Claude sessions.
+  const custom = join(f.dir, "custom"), codexAddress = address(join(custom, "codex-w.sock")), start = processStart(lead.child.pid);
+  mkdirSync(custom, { mode: 0o700 });
+  await f.session("custom", join(custom, "c.sock"));
+  writeFileSync(join(f.peers, "codex-w.json"), JSON.stringify({ pid: lead.child.pid, procStart: start, name: "codex:worker-0001", threadId: "w",
+    address: codexAddress, addresses: [codexAddress] }), { mode: 0o600 });
+  const codex = { kind: "codex", owner: generation("codex", "w"), generation: generation("codex", "w", start), address: codexAddress,
+    holder: { pid: lead.child.pid, procStart: start, autoName: "codex:worker-0001", threadId: "w", addresses: [codexAddress] } };
+  const codexRival = { ...codex, owner: generation("codex", "v"), generation: generation("codex", "v", "x"),
+    holder: { ...codex.holder, pid: process.pid, procStart: processStart(process.pid), threadId: "v" } };
+  assert.equal(claim("codex:proj/worker", codex).status, "claimed");
+  process.env.CLAUDE_CONFIG_DIR = elsewhere;
+  try {
+    assert.deepEqual([claim("codex:proj/worker", codexRival).reason, release("codex:proj/worker", codexRival).reason], ["name-held", "not-holder"]);
+    assert.throws(() => resolveClaim("codex:proj/worker"), (error) => error.reason === "inbox-unavailable");
+  } finally { process.env.CLAUDE_CONFIG_DIR = f.claude; }
+  assert.equal(resolveClaim("codex:proj/worker").address, codexAddress);
+  // Positive evidence: once the process is gone, both names are taken over.
+  await lead.stop();
+  assert.deepEqual([claim(NAME, rival).status, claim("codex:proj/worker", codexRival).status], ["taken-over", "taken-over"]);
+});
+
 test("the conflict table: dead and reused holders are taken over, the same owner refreshes, a live holder is refused", async (t) => {
   const f = fixture(t);
   // A holder whose process was killed.
@@ -261,10 +352,11 @@ test("the conflict table: dead and reused holders are taken over, the same owner
   claim(name, reused);
   const live = await f.session("live");
   assert.equal(claim(name, live.claimant()).status, "taken-over");
-  // The same owner in a new generation (here a new socket) refreshes, with no flag.
+  // The same owner in a new generation (here a new socket) refreshes, with no flag. Its process,
+  // the previous holder, still runs.
   f.record(live.child.pid, "live", join(f.sockets, "moved.sock"), { procStart: processStart(live.child.pid) });
   const refreshed = claim(name, live.claimant());
-  assert.deepEqual([refreshed.status, refreshed.previous.running], ["refreshed", false]);
+  assert.deepEqual([refreshed.status, refreshed.previous.running], ["refreshed", true]);
   assert.equal(claim(name, live.claimant()).text, `${name} already names this session.`, "an unchanged refresh writes nothing");
   // A running holder with another owner is always refused.
   const held = claim(name, f.me());
@@ -276,6 +368,25 @@ test("the conflict table: dead and reused holders are taken over, the same owner
   assert.equal(claim("proj/x", f.me()).name, "claude:proj/x");
 });
 
+test("a Claude record without a start time counts as stopped: it is taken over and released, and never resolves", async (t) => {
+  const f = fixture(t), socket = join(f.sockets, `${process.pid}.sock`);
+  // What rc.2 wrote for an older Claude Code build at this PID and socket, which records no start.
+  const legacy = { v: 1, name: NAME, kind: "claude", owner: generation("claude", process.pid, undefined),
+    generation: generation("claude", process.pid, undefined, socket), claimedAt: 1,
+    holder: { pid: process.pid, autoName: "claude:old", socket, addresses: [address(socket)] } };
+  mkdirSync(join(f.peers, "names"), { recursive: true, mode: 0o700 });
+  writeFileSync(fileOf(f.dir, NAME), JSON.stringify(legacy), { mode: 0o600 });
+  // A later session at the same PID and socket, also without a start time.
+  f.record(process.pid, "new", socket);
+  assert.throws(() => resolveClaim(NAME), (error) => error.reason === "not-running");
+  assert.deepEqual(claimRows().map((row) => [row.name, row.running, row.holder]), [[NAME, false, null]]);
+  assert.equal(release(NAME, undefined, "claude").status, "released");
+  writeFileSync(fileOf(f.dir, NAME), JSON.stringify(legacy), { mode: 0o600 });
+  const other = await f.session("other");
+  const took = claim(NAME, other.claimant());
+  assert.deepEqual([took.status, took.previous.running], ["taken-over", false]);
+});
+
 test("at most 8 names per owner", (t) => {
   const f = fixture(t);
   for (let i = 0; i < 8; i++) assert.equal(claim(`proj/n${i}`, f.me()).status, "claimed");
@@ -283,6 +394,30 @@ test("at most 8 names per owner", (t) => {
   assert.equal(claim("proj/n0", f.me()).status, "refreshed", "a refresh adds no name");
   assert.equal(release("proj/n0", f.me()).status, "released");
   assert.equal(claim("proj/n8", f.me()).status, "claimed");
+});
+
+test("scans read every record, and a new record is refused once 1024 exist while refreshes and takeovers still work", (t) => {
+  const f = fixture(t), names = join(f.peers, "names");
+  mkdirSync(names, { recursive: true, mode: 0o700 });
+  const owner = (id) => ({ kind: "codex", owner: generation("codex", id), generation: generation("codex", id, "1"), address: null,
+    holder: { pid: 0x7ffffff0, autoName: `codex:${id}-0001`, threadId: id, addresses: [] } });
+  const write = (name, o) => writeFileSync(fileOf(f.dir, name), JSON.stringify({ v: 1, name, kind: "codex", owner: o.owner, generation: o.generation,
+    claimedAt: 1, holder: o.holder }), { mode: 0o600 }), hash = (name) => basename(fileOf(f.dir, name));
+  // More records than the bound, as an older agent-peers could leave; nine of one owner's sort last.
+  for (let i = 0; i < 1100; i++) write(`codex:old/worker-${i}`, owner(`w${i}`));
+  const last = readdirSync(names).sort().at(-1), mine = [];
+  for (let i = 0; mine.length < 9; i++) if (hash(`codex:proj/role-${i}`) > last) mine.push(`codex:proj/role-${i}`);
+  for (const name of mine) write(name, owner("me"));
+  assert.deepEqual(claimsOf({ owner: owner("me").owner }).sort(), [...mine].sort(), "the restart re-claim sees every name");
+  assert.equal(claimRows().length, 1109);
+  // The owner already holds more than 8, all of which the cap counts, so it cannot take another.
+  assert.equal(claim("codex:old/worker-0", owner("me")).reason, "too-many-names");
+  assert.equal(claim(mine[0], owner("me")).status, "refreshed", "a refresh still works");
+  // Another owner: no new file past the bound, but a dead record is taken over.
+  const refused = claim("codex:proj/new", owner("other"));
+  assert.deepEqual([refused.reason, /1024 claimed names/.test(refused.text)], ["too-many-names", true]);
+  assert.equal(claim("codex:old/worker-1", owner("other")).status, "taken-over");
+  assert.equal(readdirSync(names).filter((name) => name.startsWith("n-")).length, 1109);
 });
 
 test("release: only the holder of a running claim, anyone once the holder stopped, and never a newer record", async (t) => {
@@ -306,6 +441,52 @@ test("release: only the holder of a running claim, anyone once the holder stoppe
   interleave(t, file, takeover);
   assert.equal(release(NAME, undefined, "claude").reason, "conflict");
   assert.equal(JSON.parse(readFileSync(file, "utf8")).generation, next.claimant().generation);
+});
+
+test("a dead name is released only by a releaser of its own kind, and a Hermes one only within its profile", async (t) => {
+  const f = fixture(t);
+  // A gaming conversation's names right after its gateway restarted: dead until its next call.
+  const owner = generation("hermes", "gaming", "conversation-1");
+  const gaming = { kind: "hermes", scope: "gaming", owner, generation: generation("hermes", "route-old"), address: null,
+    holder: { pid: 0x7ffffffd, autoName: "hermes:gaming:abcd1234", addresses: [address(join(f.sockets, `hermes-${"b".repeat(32)}.sock`))] } };
+  for (const name of ["hermes:gaming/relay", "hermes:gaming/scout"]) assert.equal(claim(name, gaming).status, "claimed");
+  const deadCodex = { kind: "codex", owner: generation("codex", "gone"), generation: generation("codex", "gone", "1"), address: null,
+    holder: { pid: 0x7ffffffe, autoName: "codex:gone-1234", threadId: "gone", addresses: [] } };
+  assert.equal(claim("codex:proj/worker", deadCodex).status, "claimed");
+  const codex = { kind: "codex", owner: generation("codex", "T"), generation: generation("codex", "T", "1"), address: null,
+    holder: { pid: process.pid, autoName: "codex:x-0001", threadId: "T", addresses: [] } };
+  const casa = { ...gaming, scope: "casa", owner: generation("hermes", "casa", "conversation-2"), generation: generation("hermes", "route-casa") };
+  for (const [who, name, claimant, kind] of [["the CLI outside a session", "hermes:gaming/relay", undefined, "claude"],
+    ["the CLI outside a session", "codex:proj/worker", undefined, "claude"], ["a Claude session", "codex:proj/worker", f.me(), "claude"],
+    ["a Codex session", "hermes:gaming/scout", codex, "codex"], ["another Hermes profile", "hermes:gaming/scout", casa, "hermes"]]) {
+    const refused = release(name, claimant, kind);
+    assert.deepEqual([refused.status, refused.reason, refused.name], ["refused", "scope-denied", name], `${who}: ${name}`);
+  }
+  assert.deepEqual(claimRows().map((row) => row.name), ["codex:proj/worker", "hermes:gaming/relay", "hermes:gaming/scout"], "nothing was removed");
+  // Its own kind may: Codex releases the dead Codex name, the gaming profile its own dead name.
+  assert.equal(release("codex:proj/worker", codex).status, "released");
+  const sibling = { ...gaming, owner: generation("hermes", "gaming", "conversation-3"), generation: generation("hermes", "route-3") };
+  assert.equal(release("hermes:gaming/scout", sibling).status, "released");
+  assert.equal(release("hermes:gaming/relay", gaming).status, "released");
+});
+
+test("a record with a higher version is read when it validates, and never replaced or removed", async (t) => {
+  const f = fixture(t), live = await f.session("live"), gone = await f.session("gone");
+  claim(NAME, live.claimant());
+  claim("claude:proj/gone", gone.claimant());
+  await gone.stop();
+  for (const name of [NAME, "claude:proj/gone"]) {
+    const file = fileOf(f.dir, name);
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), v: 2, future: { meaning: "unknown here" } }), { mode: 0o600 });
+  }
+  assert.equal(resolveClaim(NAME).holder, "claude:live", "a v2 record this version can read still resolves");
+  assert.throws(() => resolveClaim("claude:proj/gone"), (error) => error.reason === "not-running");
+  for (const name of [NAME, "claude:proj/gone"]) {
+    const before = readFileSync(fileOf(f.dir, name), "utf8");
+    assert.deepEqual([claim(name, f.me()).reason, release(name, undefined, "claude").reason], ["name-held", "not-holder"], name);
+    assert.equal(readFileSync(fileOf(f.dir, name), "utf8"), before, `${name} is untouched`);
+  }
+  assert.deepEqual([claim(NAME, live.claimant()).reason, release(NAME, live.claimant()).reason], ["name-held", "not-holder"], "not even by its holder");
 });
 
 test("file safety: unsafe, foreign or mismatched files are never read as claims; the directory is private", async (t) => {

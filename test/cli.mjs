@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
@@ -10,9 +10,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { VERSION } from "../src/version.mjs";
-import { generation, processStart } from "../src/wire.mjs";
+import { agentProcess, generation, processStart } from "../src/wire.mjs";
 
 const cli = fileURLToPath(new URL("../bin/agent-peers.mjs", import.meta.url));
+const sleepPath = ["/bin/sleep", "/usr/bin/sleep"].find((path) => existsSync(path));
 // For tests whose fake servers live in this process: spawnSync would block their event loop.
 function runAsync(args, env = {}) {
   return new Promise((resolve) => execFile(process.execPath, [cli, ...args], { encoding: "utf8", timeout: 10_000,
@@ -222,9 +223,11 @@ test("claim, resolve, list, whoami and release from inside a Claude session, wit
     assert.equal(released.status, 0);
     assert.deepEqual([gone.status, JSON.parse(gone.stdout).reason], [1, "not-found"]);
 
+    // No Claude session of this registry here; run inside a real Claude session, that session is a
+    // nested agent without a record in this test's registry. Either way, nothing is claimed.
     const outside = run(["claim", "proj/lead"], session.env);
     assert.equal(outside.status, 1);
-    assert.match(outside.stderr, /no Claude Code session found in this process's ancestry/);
+    assert.match(outside.stderr, /no Claude Code session found in this process's ancestry|without a Claude session record/);
   } finally { rmSync(session.home, { recursive: true, force: true }); }
 });
 
@@ -240,8 +243,56 @@ test("a dead claim stays listed as not running, and anyone may release it", asyn
     const resolved = run(["resolve", "claude:proj/lead"], session.env);
     assert.equal(resolved.status, 1);
     assert.match(resolved.stderr, /is claimed by claude:lead, a Claude session that is no longer running/);
+    // The CLI releases only claude: names, dead or not; other kinds are left to their own claimants.
+    const foreign = run(["release", "hermes:jd/relay", "--json"], session.env);
+    assert.deepEqual([foreign.status, JSON.parse(foreign.stdout).reason], [1, "scope-denied"]);
     assert.equal(run(["release", "proj/lead"], session.env).status, 0);
     assert.deepEqual(JSON.parse(run(["list", "--json"], session.env).stdout).names, []);
+  } finally { rmSync(session.home, { recursive: true, force: true }); }
+});
+
+test("an agent process recognises claude, codex and hermes by name or script, and nothing else", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "ap-agent-")), children = [];
+  t.after(() => { for (const child of children) child.kill(); rmSync(home, { recursive: true, force: true }); });
+  symlinkSync(sleepPath, join(home, "claude"));
+  symlinkSync(sleepPath, join(home, "hermes"));
+  writeFileSync(join(home, "codex.js"), "setTimeout(() => {}, 60_000);");
+  writeFileSync(join(home, "agent-peers.mjs"), "setTimeout(() => {}, 60_000);");
+  const start = async (command, args) => {
+    const child = spawn(command, args, { stdio: "ignore" });
+    children.push(child);
+    await once(child, "spawn");
+    // The exec has happened once the process no longer runs this test's own command.
+    for (let i = 0; i < 100 && agentProcess(child.pid) === agentProcess(process.pid); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    return child.pid;
+  };
+  const cases = [[join(home, "claude"), ["60"], "claude"], [join(home, "hermes"), ["60"], "hermes"], [process.execPath, [join(home, "codex.js")], "codex"],
+    [sleepPath, ["60"], undefined], [process.execPath, [join(home, "agent-peers.mjs")], undefined]];
+  for (const [command, args, expected] of cases) assert.equal(agentProcess(await start(command, args)), expected, `${command} ${args.join(" ")}`);
+  assert.equal(agentProcess(process.pid), undefined, "a test runner is no agent");
+});
+
+test("a nested agent without a Claude session record never claims or releases for the Claude session above it", async () => {
+  const session = sessionHome(), socket = join(session.sockets, "lead.sock"), worker = join(session.home, "codex");
+  // A Codex worker the Claude lead started: a shell exec'd under the name codex, with no Claude record.
+  symlinkSync("/bin/sh", worker);
+  const run = (args) => `"${process.execPath}" "${cli}" ${args}`;
+  try {
+    const shell = execFile("sh", ["-c", `read go; ${run("claim proj/lead")} >/dev/null; ` +
+      `"${worker}" -c '${run("claim proj/worker --json")}; echo @@; ${run("release proj/lead --json")}; echo @@; ${run("list --json --no-probe")}; true'; ` +
+      `echo @@; ${run("whoami --json")}; true`], { encoding: "utf8", env: { ...process.env, ...session.env } });
+    let out = "";
+    shell.stdout.on("data", (d) => { out += d; });
+    writeFileSync(join(session.home, "claude", "sessions", `${shell.pid}.json`), JSON.stringify({ pid: shell.pid, name: "lead", cwd: "/tmp",
+      messagingSocketPath: socket, procStart: processStart(shell.pid) }));
+    shell.stdin.end("go\n");
+    await once(shell, "close");
+    const [claimed, released, listed, me] = out.split("@@\n").map((part) => JSON.parse(part));
+    assert.deepEqual([claimed.status, claimed.reason, claimed.name], ["refused", "no-session", "claude:proj/worker"]);
+    assert.match(claimed.text, /nearest agent in this command's process ancestry is a codex process \(pid \d+\) without a Claude session record/);
+    assert.deepEqual([released.status, released.reason], ["refused", "not-holder"], "the lead's running name is not released as the lead");
+    assert.deepEqual(listed.names.map((row) => [row.name, row.running]), [["claude:proj/lead", true]]);
+    assert.deepEqual(me.claims, ["claude:proj/lead"], "the lead still holds its name, and nothing else");
   } finally { rmSync(session.home, { recursive: true, force: true }); }
 });
 

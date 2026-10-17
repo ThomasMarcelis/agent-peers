@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { dirname } from "node:path";
-import { allPeers, ancestorPids, claudeSessionAt, inDiscoveryScope, post, probePeers, whoami } from "../src/wire.mjs";
+import { agentProcess, allPeers, ancestorPids, claudeSessionAt, exchange, inDiscoveryScope, probePeers, whoami } from "../src/wire.mjs";
 import { formatName, formatSessionPeer } from "../src/discovery.mjs";
 import { SCOPE, claim, claimRefusal, claimRows, claudeClaimant, heldBy, parseName, release, withClaims } from "../src/names.mjs";
 import { resolveTarget } from "../src/outbox.mjs";
-import { SendFailure, nameResolvedLine } from "../src/status.mjs";
+import { SendFailure, nameResolvedLine, readNameResolvedStatus } from "../src/status.mjs";
 import { VERSION } from "../src/version.mjs";
 
 const usage = `agent-peers ${VERSION} — local agent messaging
@@ -31,15 +31,26 @@ process.stdout.on("error", (error) => {
   process.exit(1);
 });
 
-// The calling Claude session: the nearest ancestor with a live Claude registry record. Codex shell
-// commands never have codex-peer as an ancestor, so Codex claims go through its claim_name tool.
+// The calling Claude session: the nearest ancestor with a live Claude registry record. The walk
+// stops at the first agent process without one (a headless Claude worker, Codex, Hermes): that
+// agent is the caller, so the command never acts for a Claude lead further up. `nested` names it.
+// Codex shell commands never have codex-peer as an ancestor, so Codex claims go through its
+// claim_name tool. Environment markers (CODEX_THREAD_ID, HERMES_SESSION_ID) are not used: every
+// descendant inherits them, so they cannot say which agent is nearer than the Claude session.
 const claudeCaller = () => inDiscoveryScope(() => {
   for (const pid of ancestorPids()) {
     const session = claudeSessionAt(pid);
-    if (session) return session;
+    if (session) return { session };
+    const agent = agentProcess(pid);
+    if (agent) return { nested: { pid, agent } };
   }
-  return undefined;
+  return {};
 });
+const NO_SESSION = "Codex and Hermes sessions claim names with their claim_name tool.";
+const noSession = ({ nested }, fields) => claimRefusal("no-session", nested
+  ? `the nearest agent in this command's process ancestry is a ${nested.agent} process (pid ${nested.pid}) without a Claude session record, ` +
+    `so agent-peers does not act for a Claude session further up. ${NO_SESSION}`
+  : `no Claude Code session found in this process's ancestry; run agent-peers claim from inside a Claude session. ${NO_SESSION}`, fields);
 
 function report(result, json, ok) {
   if (json) console.log(JSON.stringify(result, null, 2));
@@ -51,14 +62,13 @@ function report(result, json, ok) {
 function claimCommand(cmd, name, json) {
   let result;
   try {
-    parseName(name, "claude");
+    const parsed = parseName(name, "claude");
     const caller = claudeCaller();
-    if (cmd === "release") result = release(name, caller && claudeClaimant(caller), "claude");
-    else if (caller) result = claim(name, claudeClaimant(caller));
-    else {
-      result = claimRefusal("no-session", "no Claude Code session found in this process's ancestry; run agent-peers claim from inside a Claude " +
-        "session. Codex and Hermes sessions claim names with their claim_name tool.");
-    }
+    // Without a Claude session of its own (outside any, or a nested agent), a release removes only a
+    // dead claude: name, never one for the session above.
+    if (cmd === "release") result = release(name, caller.session && claudeClaimant(caller.session), "claude");
+    else if (cmd === "claim" && caller.session) result = claim(name, claudeClaimant(caller.session));
+    else result = noSession(caller, { name: parsed.name, kind: parsed.kind });
   } catch (error) {
     if (!(error instanceof SendFailure)) throw error;
     result = claimRefusal(error.reason, error.message);
@@ -68,17 +78,29 @@ function claimCommand(cmd, name, json) {
 
 // One uds: line for SendMessage, in the caller's socket directory when it has an inbox there. A
 // Hermes holder accepts only senders it wrote to or that used its name, so resolve tells it which
-// Claude session is about to send.
+// Claude session is about to send, and fails when the holder says it will not admit that session.
+const REFUSED = {
+  "not-holder": "that conversation no longer holds the name; run agent-peers resolve again",
+  "unknown-sender": "it sees no live Claude session at this session's address; check that both use the same CLAUDE_CONFIG_DIR",
+  "inbox-closed": "that conversation is closing its inbox",
+};
 async function resolveCommand(to, json) {
-  const caller = claudeCaller();
+  const caller = claudeCaller().session;
   let result;
   try {
     const target = resolveTarget(to, undefined, { directory: caller && dirname(caller.socket) });
     if (target.claimed && target.kind === "hermes") {
       if (!caller) process.stderr.write("agent-peers: no Claude session in this process's ancestry; a Hermes holder refuses a message sent to this address without one.\n");
       else {
-        try { await post(target.socket, nameResolvedLine({ from: caller.address, name: target.name })); }
+        // The holder answers on the same connection; a bridge older than this answers nothing,
+        // which is taken as admitted.
+        const line = nameResolvedLine({ from: caller.address, name: target.name });
+        let answer;
+        try { answer = await exchange(target.socket, line, (reply) => reply?.from === target.address && readNameResolvedStatus(reply, line.msg_id)); }
         catch { throw new SendFailure("not-running", `${target.name} is not running: nothing is listening at its inbox.`); }
+        const status = answer && readNameResolvedStatus(answer, line.msg_id);
+        if (status && !status.admitted) throw new SendFailure(status.reason, `${target.name}'s holder did not admit this session (${status.reason}): ` +
+          `${REFUSED[status.reason] ?? "it gave no reason this version knows"}. Nothing was sent; a SendMessage to ${target.address} would be dropped.`);
       }
     }
     result = { status: "resolved", reason: null, name: target.name ?? null, kind: target.kind ?? null, address: target.address,
@@ -160,7 +182,7 @@ async function main() {
     else console.log(`${name}\n${address}`);
     return;
   }
-  const caller = claudeCaller();
+  const caller = claudeCaller().session;
   const { found, names } = inDiscoveryScope(() => ({ found: withClaims(allPeers()), names: claimRows({ directory: caller && dirname(caller.socket) }) }));
   const peers = args.includes("--no-probe") ? found : await probePeers(found);
   if (args.includes("--json")) console.log(JSON.stringify({ peers, names }, null, 2));

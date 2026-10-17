@@ -747,6 +747,26 @@ test("claim_name: a root claims a name, lists it and is reached by it; subagents
   assert.deepEqual((await peer.call("list_peers")).structuredContent.self.claims, []);
 });
 
+test("a line sent by name reaches a root only while it holds that name; otherwise it is dropped", async (t) => {
+  const f = await fixture(t), peer = await f.start();
+  assert.equal((await peer.call("claim_name", { name: "proj/lead" })).structuredContent.status, "claimed");
+  const socket = peerSocket(JSON.parse(readFileSync(f.registry, "utf8")).address);
+  const byName = (name, body) => ({ ...messageLine({ from: address(f.inbox), body }), agent_peers: { v: 1, to_name: name } });
+  const dropped = (line) => f.controls.some((c) => c.status === "dropped" && c.drop_reason === "not-a-reply-target" && c.dropped_msg_ids.includes(line.msg_id));
+  await post(socket, byName("codex:proj/lead", "held"));
+  await until(() => f.turns.length === 1);
+  const other = byName("codex:proj/other", "a name it never held");
+  await post(socket, other);
+  await until(() => dropped(other));
+  assert.equal((await peer.call("release_name", { name: "proj/lead" })).structuredContent.status, "released");
+  const released = byName("codex:proj/lead", "after the release");
+  await post(socket, released);
+  await until(() => dropped(released));
+  await post(socket, messageLine({ from: address(f.inbox), body: "by address" }));
+  await until(() => f.turns.length === 2);
+  assert.deepEqual(f.turns.map((turn) => /held|by address/.exec(turn.input[0].text)?.[0]), ["held", "by address"]);
+});
+
 test("a rebind in a new process takes back only its own thread's names, and each root keeps its own", async (t) => {
   const other = "01900000-0000-0000-0000-00000000beef";
   const f = await fixture(t, { loaded: [thread, other] }), first = await f.start();
