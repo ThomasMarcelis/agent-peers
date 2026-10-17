@@ -11,7 +11,7 @@ import { linkSync, lstatSync, readdirSync, renameSync, rmSync, writeFileSync } f
 import { basename, dirname, join, resolve } from "node:path";
 import { CLAIMED_NAME, SendFailure } from "./status.mjs";
 import {
-  address, alive, claudeSessions, codexPeers, ensurePrivateDir, generation, inDiscoveryScope, peerSocket, peersHome, processStarts,
+  address, claudeSessions, codexPeers, ensurePrivateDir, generation, inDiscoveryScope, peerSocket, peersHome, processStarts,
   readPeerFile, safeDirectory, safeText, scoped, socketPath, validPid, validSocketPath, validThreadId,
 } from "./wire.mjs";
 
@@ -106,6 +106,13 @@ function hermesInboxes(h) {
   });
 }
 
+// A holder is always a process of this user. kill(pid, 0) failing with EPERM means another user's
+// process now has the PID, so the holder stopped; alive() counts EPERM as running, for records that
+// may come from elsewhere.
+function ownProcess(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
 // Whether a record's holder stopped, decided only from positive evidence in the record: its process
 // is gone, or its PID now belongs to a process with another start time; a Hermes conversation has
 // also stopped when none of its recorded inboxes exists. What this process can see of the holder
@@ -115,7 +122,7 @@ function hermesInboxes(h) {
 // session that reused the PID and socket, so it counts as stopped.
 function stopped(record) {
   const h = record.holder;
-  if (!alive(h.pid)) return true;
+  if (!ownProcess(h.pid)) return true;
   if (h.procStart === undefined) {
     if (record.kind === "claude") return true;
   } else {

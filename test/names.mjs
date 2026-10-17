@@ -387,6 +387,20 @@ test("a Claude record without a start time counts as stopped: it is taken over a
   assert.deepEqual([took.status, took.previous.running], ["taken-over", false]);
 });
 
+// A holder is always this user's process: a PID that now belongs to another user (kill gives EPERM)
+// means the holder stopped, even when its start time happens to match.
+test("a holder whose PID belongs to another user now counts as stopped", { skip: process.getuid() === 0 && "runs as root" }, async (t) => {
+  const f = fixture(t), socket = join(f.sockets, "1.sock");
+  mkdirSync(join(f.peers, "names"), { recursive: true, mode: 0o700 });
+  // PID 1 is root's (init, launchd); its start time is readable.
+  writeFileSync(fileOf(f.dir, NAME), JSON.stringify({ v: 1, name: NAME, kind: "claude", owner: generation("claude", 1, processStart(1)),
+    generation: generation("claude", 1, processStart(1), socket), claimedAt: 1,
+    holder: { pid: 1, procStart: processStart(1), autoName: "claude:pid-one", socket, addresses: [address(socket)] } }), { mode: 0o600 });
+  assert.deepEqual(claimRows().map((row) => [row.name, row.running]), [[NAME, false]]);
+  const took = claim(NAME, f.me());
+  assert.deepEqual([took.status, took.previous.running], ["taken-over", false]);
+});
+
 test("at most 8 names per owner", (t) => {
   const f = fixture(t);
   for (let i = 0; i < 8; i++) assert.equal(claim(`proj/n${i}`, f.me()).status, "claimed");
