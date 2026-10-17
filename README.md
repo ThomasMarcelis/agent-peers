@@ -61,7 +61,7 @@ A native plugin lets Hermes contact Claude and Codex, with private replies to th
 hermes plugins install ThomasMarcelis/agent-peers --enable
 ```
 
-Complete the [dependency setup and injection grant](docs/hermes.md). A Hermes conversation stays unlisted and opens a private reply inbox on its first send; it becomes reachable by others only through a [stable name](docs/reference.md) it claims, scoped to its profile. Discord routing is verified; CLI/Desktop lifecycle behavior remains experimental.
+Complete the [dependency setup and injection grant](docs/hermes.md). A Hermes conversation stays unlisted and opens a private reply inbox on its first send; it becomes reachable by others only through a [stable name](docs/reference.md#names) it claims (experimental), scoped to its profile. Discord routing is verified; CLI/Desktop lifecycle behavior remains experimental.
 
 ## Scope
 

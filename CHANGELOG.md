@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Claimed names are [experimental](docs/stability.md#experimental) in 1.x. Their commands, fields and storage may change in a minor release. Their safety rules stay fixed: no misrouting, no displacing a running holder, profile scoping, and the Hermes first-message rule. Sessions that do not claim names depend on covered surfaces only.
+
 ## 1.0.0-rc.2 — 2026-10-17
 
 Second release candidate for 1.0.0, on the npm `next` tag. Adds explicit, scoped stable names (#13), part of the covered 1.0 surface ([stability](docs/stability.md)). See [names](docs/reference.md#names).

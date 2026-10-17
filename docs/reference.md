@@ -99,6 +99,8 @@ Refusal reasons: `invalid-request` (outside the grammar), `name-held` (a running
 
 ## Names
 
+Claimed names are [experimental](stability.md#experimental) in 1.x: their commands, fields and storage may change in a minor release.
+
 A session or conversation can claim a stable name, so that peers reach whoever holds the role now instead of an address that dies with a restart. A name is claimed explicitly, scoped, resolved at send time, and never falls back to anyone else.
 
 **Grammar.** `<kind>:<scope>/<claim>` with exactly one `/`: kind `claude`, `codex` or `hermes`; scope `[a-z0-9][a-z0-9_-]{0,63}`; claim `[a-z0-9][a-z0-9_.-]{0,63}`. Matching is exact and case-sensitive; anything else, such as an uppercase letter, a second `/` or a `:` in the scope, is `invalid-request`. For Hermes the scope is the conversation's profile id, enforced by the plugin and by its bridge (`hermes:gaming/relay` in profile `gaming`); for Claude and Codex it is a project namespace the owner chooses, which organizes names and is not a security boundary. The kind-elided form `<scope>/<claim>` resolves only when exactly one kind has a record for it, running or not; otherwise it fails `ambiguous` and lists the full names. Claim commands fill in the caller's own kind.
