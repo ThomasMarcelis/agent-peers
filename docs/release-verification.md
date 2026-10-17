@@ -14,12 +14,12 @@ Verified on 2026-10-17 on Linux with Node 22.23.1, Claude Code 2.1.302 and Codex
   - After `release_name`, the name resolved `not-found`. Codex then sent to the released, now unclaimed inbox, whose owner never gave it that address, and got `dropped` / `not-a-reply-target` (#28). The message never reached the conversation.
   - Every private inbox was retired on `close_session`. No product bugs were found.
   - The `--codex-only` mode passed too: two Codex round trips, then the claim, release and guessed-inbox refusal.
-- The four-session live matrix (`npm run test:live`) gained a stable-name check: a Claude session claims `claude:<scope>/<claim>` with `agent-peers claim`, and a Codex session reaches it by name with `send_peer` (`unconfirmed`, with the holder's name, inbox and generation). The check passed with `node test/live-matrix.mjs --names-only`, which starts all four sessions and runs only that check. The full matrix was not re-run here.
+- The four-session live matrix (`npm run test:live`) gained a stable-name check: a Claude session claims `claude:<scope>/<claim>` with `agent-peers claim`, and a Codex session reaches it by name with `send_peer` (`unconfirmed`, with the holder's name, inbox and generation). The full matrix, with this check, passed on the release tree, and so did the Hermes live harness.
 - Steering, live on private app-servers (Codex 0.162.1, gpt-6.1-sol at `xhigh`; 310 trials including gpt-6-astra checks). A lead's correction sent mid-turn landed in the running turn every time.
   - With the brief sentence in [compatibility](compatibility.md#headless-codex-on-a-private-app-server), the worker applied the correction before the turn ended in 26 of 26 runs. With a neutral brief, it applied none (0 of 30).
   - 0.3.0 and 1.0.0-rc.2 behaved the same.
   - With the new frame wording, the contract's busy and idle steps were answered 15 of 16 and 16 of 16 times on gpt-6.1-sol and gpt-6-astra, against 0 of 16 and 0 of 16 with the old wording.
-- Live contract (`node test/contract.mjs --codex-only`) on Codex 0.162.1 with gpt-6-astra at `max` and this frame, run twice: busy and idle delivery, answered both times.
+- Live contract on Codex 0.162.1 with gpt-6-astra at `max` and this frame: `--codex-only` twice and the full contract (with Claude Code 2.1.302) once. Busy and idle delivery were answered every time.
 
 ## 1.0.0-rc.2
 
