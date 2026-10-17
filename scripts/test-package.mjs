@@ -26,13 +26,13 @@ try {
   const env = { ...process.env, CLAUDE_CONFIG_DIR: join(scratch, "claude"), AGENT_PEERS_HOME: join(scratch, "peers"), AGENT_PEERS_CODEX_APP_SERVER: join(scratch, "missing.sock") };
   const launch = (args) => execFileSync(join(install, "node_modules", ".bin", "agent-peers"), args, { env, encoding: "utf8" });
   assert.equal(launch(["--version"]).trim(), VERSION);
-  assert.deepEqual(JSON.parse(launch(["list", "--json"])), { peers: [] });
+  assert.deepEqual(JSON.parse(launch(["list", "--json"])), { peers: [], names: [] });
   assert.equal(JSON.parse(launch(["doctor", "--json"])).ok, true);
   const pkg = JSON.parse(readFileSync(join(installed, "package.json"), "utf8"));
   assert.equal(pkg.version, VERSION);
   client = new Client({ name: "package-smoke", version: "1.0.0" });
   await client.connect(new StdioClientTransport({ command: join(install, "node_modules", ".bin", "codex-peer"), env, stderr: "pipe" }));
-  assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name).sort(), ["list_peers", "send_peer"]);
+  assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name).sort(), ["claim_name", "list_peers", "release_name", "send_peer"]);
   await client.close();
   client = undefined;
   console.log(`Installed and verified agent-peers ${VERSION}: CLI, MCP handshake, package contents (${files.size} files).`);

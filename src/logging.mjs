@@ -26,12 +26,14 @@ const reasons = new Set(["not_found", "ambiguous_target", "native_route_required
   "accepted", "queued", "denied", "expired", "refused", "dropped", "failed", "invalid_request", "ambiguous", "reserved_name",
   "invalid_address", "not_running", "too_large", "write_timeout", "write_failed", "inbox_unavailable", "too_many_pending",
   "unsupported_host", "conversation_closed", "bridge_unavailable", "rate_limited", "hop_loop", "hop_runaway", "host_rejected",
-  "inbox_closed", "not_a_reply_target", "other", "no_receipt", "bridge_lost"]);
+  "inbox_closed", "not_a_reply_target", "other", "no_receipt", "bridge_lost",
+  // Claimed-name refusals (names.mjs).
+  "name_held", "scope_denied", "no_session", "not_holder", "conflict", "too_many_names"]);
 const outcomes = new Set(["started", "succeeded", "failed", "success", "error", "warning", "held", "receipt_delivered",
   "rejected", "inbox_written", "emitted_to_host", "receipt_received", "queued", "dropped", "app_server_input_accepted",
   "skipped", "closed", "accepted", "bound", "unbound", "native_only", "degraded", "receipt_unavailable", "unreachable",
   "delivered", "denied", "expired", "refused", "unconfirmed"]);
-const methods = new Set(["list_peers", "send_peer", "close_session", "shutdown", "initialize", "initialized", "thread/loaded/list",
+const methods = new Set(["list_peers", "send_peer", "claim_name", "release_name", "close_session", "shutdown", "initialize", "initialized", "thread/loaded/list",
   "thread/read", "turn/start", "thread/inject_items", "mcpServerStatus/list",
   // The app-server's requests to clients (0.162.1), which agent-peers logs and never answers.
   "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval",

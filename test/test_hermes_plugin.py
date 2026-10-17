@@ -86,7 +86,7 @@ def test_registration_is_lazy_and_legacy_entrypoint_still_loads(monkeypatch):
     context.on_unload = cleanups.append
     monkeypatch.setattr(plugin, "default_command", lambda: (_ for _ in ()).throw(AssertionError("not lazy")))
     plugin.register(context)
-    assert [entry["name"] for entry in registrations] == ["list_peers", "send_peer"]
+    assert [entry["name"] for entry in registrations] == ["list_peers", "send_peer", "claim_name", "release_name"]
     assert (
         "Keep coordination useful and brief. Send what's new; link existing detail rather than repeating it. "
         "Reply when it adds value."
@@ -117,6 +117,11 @@ def test_route_state_is_bounded_and_unloaded_calls_fail(monkeypatch):
     peers = plugin.PeerTools(Context())
     peers._sessions.update({"one": plugin._RouteState("a"), "two": plugin._RouteState("b")})
     assert "too many active" in peers.send_peer({"to": "x", "message": "body"}, session_id="chat-a")["error"]
+    # A listing at the limit still pins what this conversation saw, without opening a route.
+    peers._bridge = bridge = FakeBridge({"peers": []})
+    peers.list_peers({}, session_id="chat-a")
+    assert (bridge.calls[-1], len(peers._sessions)) == ({"session": "route-a"}, 2)
+    peers._bridge = None
     for index in range(5):
         peers.route_closed(route_id=str(index))
     assert len(peers._sessions) == 2
@@ -273,6 +278,106 @@ def test_a_listing_pins_only_the_conversation_that_asked():
         peers.list_peers({}, session_id="chat-a")
         peers.list_peers({}, session_id="missing")
         peers.list_peers({})
-        assert bridge.calls == [{"session": "route-a"}, {}, {}]
+        assert bridge.calls == [{"session": "route-a", "owner": "chat-a", "identity": "hermes:test-profile:route-a"}, {}, {}]
     finally:
         peers.close()
+
+
+def test_claims_are_scoped_to_the_profile_and_need_a_live_route():
+    peers = plugin.PeerTools(Context())
+    peers._bridge = bridge = FakeBridge({"status": "claimed", "reason": None, "name": "hermes:test-profile/relay", "text": "Claimed."})
+    try:
+        for name in ("relay", "test-profile/relay", "hermes:test-profile/relay"):
+            result = peers.claim_name({"name": name}, session_id="chat-a")
+            assert (result["status"], "error" in result) == ("claimed", False)
+            assert bridge.calls[-1] == {"session": "route-a", "owner": "chat-a", "identity": "hermes:test-profile:route-a",
+                                        "name": "hermes:test-profile/relay"}
+        calls = len(bridge.calls)
+        for name, reason in (("hermes:gaming/relay", "scope-denied"), ("gaming/relay", "scope-denied"), ("codex:test-profile/x", "scope-denied"),
+                             ("Relay", "invalid-request"), ("a/b/c", "invalid-request"), ("", "invalid-request")):
+            result = peers.claim_name({"name": name}, session_id="chat-a")
+            assert (result["status"], result["reason"], result["error"]) == ("refused", reason, result["text"]), name
+        for kwargs in ({"session_id": "missing"}, {}):
+            assert peers.claim_name({"name": "relay"}, **kwargs)["reason"] == "no-session"
+        # Nor release one: a dead name in another profile may be one that profile takes back after a restart.
+        for name in ("hermes:gaming/relay", "codex:test-profile/x"):
+            assert peers.release_name({"name": name}, session_id="chat-a")["reason"] == "scope-denied", name
+        assert len(bridge.calls) == calls, "the model can never choose another profile's scope"
+        peers.release_name({"name": "relay"}, session_id="chat-a")
+        assert bridge.calls[-1]["name"] == "hermes:test-profile/relay"
+    finally:
+        peers.close()
+
+
+def test_the_bridge_gets_the_profile_and_an_invalid_profile_claims_nothing():
+    peers = plugin.PeerTools(Context())
+    try:
+        assert peers._client().command[-2:] == ["--hermes-profile", "test-profile"]
+    finally:
+        peers.close()
+
+    class Spaced(Context):
+        profile_name = "Gaming Profile"
+
+    peers = plugin.PeerTools(Spaced())
+    try:
+        assert peers.claim_name({"name": "relay"}, session_id="chat-a")["reason"] == "scope-denied"
+        assert peers._bridge is None
+        assert "--hermes-profile" not in peers._client().command
+    finally:
+        peers.close()
+
+
+def _post(to_address, from_address, body, **extension):
+    import socket
+    line = {"msgV": 1, "msg_id": f"m-{abs(hash(body))}", "type": "user", "from": from_address, "message": {"role": "user", "content": (
+        f'<cross-session-message from="{from_address}" from-name="claude:test">\n{body}\n</cross-session-message>')}}
+    if extension:
+        line["agent_peers"] = {"v": 1, **extension}
+    with socket.socket(socket.AF_UNIX) as conn:
+        conn.connect(to_address.removeprefix("uds:"))
+        conn.sendall((json.dumps(line) + "\n").encode())
+
+
+def test_a_claimed_conversation_is_listed_reached_by_name_and_restored_on_its_next_call(network):
+    context = Context()
+    peers = plugin.PeerTools(context)
+    claude = "uds:" + str(network.sockets / "claude.sock")
+    try:
+        claimed = peers.claim_name({"name": "relay"}, session_id="chat-a")
+        assert (claimed["status"], claimed["name"], "error" in claimed) == ("claimed", "hermes:test-profile/relay", False), claimed
+        listing = peers.list_peers({})
+        assert [(row["name"], row["running"]) for row in listing["names"]] == [("hermes:test-profile/relay", True)]
+        assert [peer["claims"] for peer in listing["peers"]] == [[]]
+        # The bridge enforces the profile as well.
+        refused = peers._client().call("claim_name", {"session": "route-a", "owner": "chat-a", "identity": "hermes:test-profile:route-a",
+                                                      "name": "hermes:other/relay"})
+        assert (refused["status"], refused["reason"]) == ("refused", "scope-denied")
+        # A sender that used the name reaches the conversation it names; the inbox was opened by the claim.
+        _post(claimed["address"], claude, "by name", to_name="hermes:test-profile/relay")
+        assert context.delivered.wait(5)
+        assert context.received[0][0] == "chat-a" and "by name" in context.received[0][1]
+        taken = peers.claim_name({"name": "relay"}, session_id="chat-b")
+        assert (taken["status"], taken["reason"], bool(taken["error"])) == ("refused", "name-held", True)
+        # The bridge restarts: its inboxes go. The conversation's next call takes its name back.
+        peers._bridge.close()
+        peers._bridge = None
+        assert [row["running"] for row in peers.list_peers({})["names"]] == [False]
+        assert [row["running"] for row in peers.list_peers({}, session_id="chat-a")["names"]] == [True]
+        # Once the route closes, another conversation takes over the name from the stopped holder.
+        context.routes.pop("chat-a")
+        peers.route_closed(route_id="route-a")
+        taken = peers.claim_name({"name": "relay"}, session_id="chat-b")
+        assert (taken["status"], taken["previous"]["running"]) == ("taken-over", False), taken
+        assert peers.release_name({"name": "relay"}, session_id="chat-b")["status"] == "released"
+        assert peers.list_peers({})["names"] == []
+    finally:
+        peers.close()
+
+
+def test_peer_frame_shows_only_a_valid_reply_name():
+    message = {"from_name": "claude:lead", "from": "uds:/safe.sock", "message": "ok", "message_id": "m-1"}
+    framed = plugin._frame({**message, "reply_name": "claude:proj/lead"})
+    assert '<peer_message from="claude:lead" reply_to="uds:/safe.sock" reply_name="claude:proj/lead" id="m-1">' in framed
+    for bad in ('claude:proj/lead" x="y', "Claude:proj/lead", "claude:lead", 5, None):
+        assert "reply_name" not in plugin._frame({**message, "reply_name": bad})

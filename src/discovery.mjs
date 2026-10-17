@@ -10,7 +10,7 @@ export function codexDiscovery(peers, threads, self) {
     const sameTree = self && (p.threadId === self.rootId || t?.sessionId === self.rootId);
     rows.set(p.threadId || p.address, {
       name: p.name, kind: p.kind, cwd: p.cwd, status: t?.status?.type ?? p.status,
-      threadId: p.threadId, generation: p.generation ?? null,
+      threadId: p.threadId, generation: p.generation ?? null, claims: p.claims ?? [],
       native: { reachable: !self || sameTree ? null : false, reason: !self ? "caller session unknown"
         : sameTree ? "native target unavailable; check list_agents"
         : p.kind === "claude" ? "Claude recipient" : "separate Codex session" },
@@ -30,7 +30,7 @@ export function codexDiscovery(peers, threads, self) {
     }
     rows.set(t.id, {
       name: old?.name ?? `codex:${t.agentNickname || target}`,
-      kind: "codex", cwd: t.cwd, status: t.status?.type, threadId: t.id, generation: old?.generation ?? null,
+      kind: "codex", cwd: t.cwd, status: t.status?.type, threadId: t.id, generation: old?.generation ?? null, claims: old?.claims ?? [],
       native: { reachable: true, tool: "send_message", target },
       // Inbox addresses belong to roots; do not present the root's inbox as a way to
       // deliver directly to one of its subagents.
@@ -72,7 +72,8 @@ export function formatCodexPeer(p) {
     : p.native.reachable === true ? "none (use native messaging)" : "none (check list_agents for a native target)";
   const wake = subagent && p.status === "idle"
     ? `\n  start idle turn: followup_task ${JSON.stringify({ target: p.native.target })} (send_message only queues a message)` : "";
-  return `${p.name}  ${p.status ?? ""}  cwd=${p.cwd}\n  native: ${native}\n  bridge: ${bridge}${wake}`;
+  const claims = p.claims?.length ? `\n  claimed names: ${p.claims.join(", ")}` : "";
+  return `${p.name}  ${p.status ?? ""}  cwd=${p.cwd}\n  native: ${native}\n  bridge: ${bridge}${wake}${claims}`;
 }
 
 // The CLI is also used outside Codex, where there is no caller thread to compare.
@@ -80,6 +81,16 @@ export function formatCodexPeer(p) {
 export function formatSessionPeer(p) {
   return `${p.name}  ${p.status ?? ""}${p.reachable === false ? "  stale" : ""}  cwd=${p.cwd}\n` +
     (p.reachable === false ? "  stale: the socket refused a connection; the record is kept\n" : "") +
+    (p.claims?.length ? `  claimed names: ${p.claims.join(", ")}\n` : "") +
     `  Claude native: SendMessage ${JSON.stringify({ to: p.address })}\n` +
     `  Codex bridge: send_peer ${JSON.stringify({ to: p.address })}`;
+}
+
+// A claimed name, from a Claude sender's side (the CLI) or a Codex or Hermes sender's (send_peer,
+// which resolves the name itself). A Hermes holder accepts a Claude sender only after it ran resolve.
+export function formatName(row, { sendPeer = false } = {}) {
+  if (!row.running) return `${row.name}  not running  (its holder stopped; the new session must claim it)`;
+  if (sendPeer) return `${row.name}  running  send_peer ${JSON.stringify({ to: row.name })}`;
+  if (row.kind === "hermes") return `${row.name}  running  agent-peers resolve ${row.name}, then SendMessage to the printed address`;
+  return `${row.name}  running  SendMessage ${JSON.stringify({ to: row.address })}`;
 }

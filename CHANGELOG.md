@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.0-rc.2 — 2026-10-17
+
+Second release candidate for 1.0.0, on the npm `next` tag. Adds explicit, scoped stable names (#13), part of the covered 1.0 surface ([stability](docs/stability.md)). See [names](docs/reference.md#names).
+
+### Added
+
+- A session or conversation claims a name of the form `<kind>:<scope>/<claim>`, such as `claude:marketsimulator/lead`, so peers reach whoever holds that role now: `agent-peers claim` and `agent-peers release` for Claude sessions, `claim_name` and `release_name` tools for Codex and Hermes. A Hermes name is always scoped to its profile, enforced by the plugin and the bridge.
+- A running holder keeps its name. A holder that is not running is taken over, and the result names it; the same claimant refreshes without any flag. A Codex session takes back its names when its MCP server binds again, and a Hermes conversation on its next agent-peers call after a gateway restart.
+- `send_peer` takes a claimed name, resolved when it sends: `not-found` when nobody claimed it, `not-running` when its holder stopped, never another session. `agent-peers resolve <name>` prints the one `uds:` address a Claude session should `SendMessage` to.
+- `list --json` and `list_peers` return `names[]`, including dead names until they are released; peer rows, Codex `self` and `whoami --json` gain `claims`. Frames add `reply_name` when the recipient verified the sender's claim.
+- A Hermes conversation that claims a name accepts a first message from senders that used that name: `send_peer` to the name marks the line with `agent_peers.to_name`, and `agent-peers resolve` tells the holder which Claude session is about to send. A sender that only found its inbox in the socket directory is still refused `not-a-reply-target` (#28).
+- Names are stored as one private file each under `$AGENT_PEERS_HOME/names/`, replaced by compare-and-swap, with no lock and no daemon.
+
+### Changed
+
+- A name containing `/` is now resolved as a claimed name instead of failing `reserved-name`, which is no longer returned; names outside the grammar fail `invalid-request`.
+- The Hermes plugin starts its bridge with `--hermes-profile <profile id>`. A custom `bridge_command` must pass its arguments on.
+
 ## 1.0.0-rc.1 — 2026-10-17
 
 Release candidate for 1.0.0, published to the npm `next` tag (`npm install -g agent-peers@next`). From 1.0.0, the [stability policy](docs/stability.md) defines what semver covers. One delivery protocol for Codex, Hermes and Claude Code peers. See [the reference](docs/reference.md#send_peer-result).

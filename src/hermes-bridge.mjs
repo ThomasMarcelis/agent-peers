@@ -1,17 +1,22 @@
-// Private reply inboxes for Hermes. This process never writes a discovery registry entry:
-// a conversation becomes reachable only by sharing its address with a recipient.
+// Private reply inboxes for Hermes. This process never writes a discovery registry entry: a
+// conversation becomes reachable by sharing its address with a recipient, or by claiming a name.
 
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { AppServer } from "./app-server.mjs";
 import { Admission, Receipts, checkSocketPath, closeInbox, listenInbox, readMessage } from "./inbox.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
+import { SCOPE, claim, claimAt, claimRefusal, claimRows, claimsOf, heldBy, holds, parseName, release, withClaims } from "./names.mjs";
 import { Outbox, Pins, sendPeer } from "./outbox.mjs";
-import { SendFailure, isError } from "./status.mjs";
-import { MAX_LINE, address, allPeers, generation, inDiscoveryScope, peerSocket } from "./wire.mjs";
+import { SendFailure, isError, readNameResolved } from "./status.mjs";
+import {
+  MAX_LINE, address, allPeers, claudeSessions, generation, inDiscoveryScope, peerSocket, processStart, socketDir, socketDirectories,
+} from "./wire.mjs";
 
 const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256, HANDOFFS_MAX = 256, CONTACTS_MAX = 256,
-  CONVERSATIONS_MAX = 2 * SESSIONS_MAX, RETIRED_HANDOFF_MS = 60_000;
+  CONVERSATIONS_MAX = 2 * SESSIONS_MAX, RETIRED_HANDOFF_MS = 60_000, NAME_INBOXES_MAX = 16;
+const IDENTITY = /^hermes:[A-Za-z0-9:_-]+$/;
+const START = processStart(process.pid);
 const IPC_QUEUE_MAX = 128, IPC_WRITE_TIMEOUT_MS = 5000;
 const logger = (message) => console.error(`[hermes-bridge ${process.pid}] ${message}`);
 const event = (name, fields) => logEvent("hermes-bridge", name, fields);
@@ -44,11 +49,14 @@ export class HermesBridge {
   // guessed the address), and its dedup and token buckets. Cleared when it closes.
   #conversations = new Map();
   #retiredHandoffs = new Map();
+  // The Hermes profile every name this bridge claims is scoped to; without one it claims none.
+  #profile;
 
-  constructor({ app = new AppServer(), emit = async () => {}, log = logger } = {}) {
+  constructor({ app = new AppServer(), emit = async () => {}, log = logger, profile } = {}) {
     this.#app = app;
     this.#emit = emit;
     this.#log = log;
+    this.#profile = typeof profile === "string" && SCOPE.test(profile) ? profile : undefined;
   }
 
   #introduce(key) {
@@ -80,19 +88,23 @@ export class HermesBridge {
 
   async request(method, params = {}) {
     const operationId = randomUUID(), started = performance.now();
+    const named = method === "claim_name" || method === "release_name";
     const fields = {
-      operationId, method: ["list_peers", "send_peer", "close_session"].includes(method) ? method : "unknown",
+      operationId, method: ["list_peers", "send_peer", "claim_name", "release_name", "close_session"].includes(method) ? method : "unknown",
       ...(typeof params?.session === "string" ? { sessionId: logIdentity(params.session) } : {}),
       ...(typeof params?.to === "string" ? { targetId: logIdentity(params.to) } : {}),
+      ...(named && typeof params?.name === "string" ? { targetId: logIdentity(params.name) } : {}),
       ...(typeof params?.message === "string" ? { bytes: Buffer.byteLength(params.message) } : {}),
     };
     event("tool.request", fields);
     try {
       const result = await this.#request(method, params, operationId);
+      // A send Claude refused is a warning, as before; a refused claim or release failed.
+      const failed = result.status === "failed" || (named && result.status === "refused");
       event("tool.result", {
         ...fields, durationMs: performance.now() - started,
-        outcome: result.status === "failed" ? "error" : result.note || isError(result.status) ? "warning" : "success",
-        ...(result.status === "failed" ? { reason: code(result.reason) } : {}),
+        outcome: failed ? "error" : result.note || isError(result.status) ? "warning" : "success",
+        ...(failed ? { reason: code(result.reason) } : {}),
         ...(Array.isArray(result.peers) ? { bridgeCount: result.peers.length } : {}),
       });
       return result;
@@ -105,26 +117,120 @@ export class HermesBridge {
   async #request(method, params, operationId) {
     if (this.#closed) throw new Error("Hermes bridge is closed");
     if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("params must be an object");
-    // A listing pins only the conversation that asked for it.
-    if (method === "list_peers") return this.#listPeers(params.session === undefined ? undefined : requiredString(params.session, "session", 512));
-    if (method !== "send_peer" && method !== "close_session") throw new Error(`unknown method: ${method}`);
+    // A listing pins only the conversation that asked for it. It waits for that conversation's
+    // other requests only when it has names to take back (#touch).
+    if (method === "list_peers") {
+      const session = params.session === undefined ? undefined : requiredString(params.session, "session", 512);
+      if (session && this.#untouched(session, params)) await this.#serialized(session, () => this.#touch(session, params));
+      return this.#listPeers(session);
+    }
+    if (!["send_peer", "claim_name", "release_name", "close_session"].includes(method)) throw new Error(`unknown method: ${method}`);
     const session = requiredString(params.session, "session", 512);
-    // One conversation's requests run in order, so a close cannot race a send creating the same
-    // route. Other conversations run concurrently.
-    const previous = this.#locks.get(session) ?? Promise.resolve();
-    const operation = previous.catch(() => {}).then(async () => {
-      if (this.#closed) throw new Error("Hermes bridge is closed");
-      if (method === "send_peer") return this.#send(session, params, operationId);
+    return this.#serialized(session, async () => {
+      if (method === "send_peer") {
+        await this.#touch(session, { owner: params.owner, identity: params.name });
+        return this.#send(session, params, operationId);
+      }
+      if (method !== "close_session") return this.#claimRequest(method, session, params);
       const routes = [...this.#routes.values()].filter((route) => route.session === session);
       await Promise.all(routes.map((route) => this.#retire(route)));
       this.#conversations.delete(session);
       return { closed: routes.length > 0 };
+    });
+  }
+
+  // One conversation's requests run in order, so a close cannot race a send or a claim creating the
+  // same route. Other conversations run concurrently.
+  async #serialized(session, fn) {
+    const previous = this.#locks.get(session) ?? Promise.resolve();
+    const operation = previous.catch(() => {}).then(() => {
+      if (this.#closed) throw new Error("Hermes bridge is closed");
+      return fn();
     });
     this.#locks.set(session, operation);
     try {
       return await operation;
     } finally {
       if (this.#locks.get(session) === operation) this.#locks.delete(session);
+    }
+  }
+
+  // Who claims for a conversation: the owner is its Hermes profile and conversation id, which
+  // survive a gateway restart; the generation is its route, which does not. Its inboxes are
+  // whichever this route has open.
+  #claimant(session, owner, identity) {
+    const addresses = [...this.#routes.values()].filter((route) => route.session === session).map((route) => route.address).slice(0, NAME_INBOXES_MAX);
+    return { kind: "hermes", scope: this.#profile, owner: generation("hermes", this.#profile, owner), generation: generation("hermes", session),
+      address: addresses[0] ?? null, holder: { pid: process.pid, procStart: START, autoName: identity, addresses } };
+  }
+
+  #untouched(session, { owner, identity } = {}) {
+    return Boolean(this.#profile) && typeof owner === "string" && owner.length > 0 && owner.length <= 512 && typeof identity === "string" &&
+      IDENTITY.test(identity) && identity.length <= 80 && this.#conversations.get(session)?.touched !== owner;
+  }
+
+  // The lazy re-claim. Route ids change at every gateway restart, so a conversation's next
+  // agent-peers call takes back the names its conversation claimed (the same owner); and while a
+  // route lives, its names follow the conversation id it now has, so compression cannot orphan
+  // them. Once per route and conversation id.
+  async #touch(session, params) {
+    if (!this.#untouched(session, params)) return;
+    const { owner, identity } = params, claimant = this.#claimant(session, owner, identity);
+    let settled = true;
+    for (const name of claimsOf({ owner: claimant.owner, generation: claimant.generation })) {
+      // A name that cannot be refreshed now must never fail the call that triggered it.
+      let result;
+      try { result = await this.#claimName(session, owner, identity, name); }
+      catch (error) { result = claimRefusal("conflict", safeError(error)); }
+      if (result.status === "refused") settled = false;
+      event("names.refresh", { sessionId: logIdentity(session), targetId: logIdentity(name),
+        outcome: result.status === "refused" ? "failed" : "succeeded", ...(result.reason ? { reason: code(result.reason) } : {}) });
+    }
+    if (settled) this.#conversation(session).touched = owner;
+  }
+
+  // Claiming opens this route's inboxes in every verified socket directory first and records them,
+  // because a Hermes conversation has no registry: the claim is the only way it is ever listed. A
+  // directory that refuses an inbox is left out; with none at all, the claim is refused.
+  async #claimName(session, owner, identity, name) {
+    const refused = (text) => claimRefusal("inbox-unavailable", text, { name, kind: "hermes" });
+    if ([...this.#routes.values()].some((route) => route.session === session && route.name !== identity)) {
+      return refused("this conversation already belongs to a different Hermes identity");
+    }
+    this.#conversation(session);
+    let failure;
+    const directories = socketDirectories().slice(0, NAME_INBOXES_MAX);
+    for (const directory of directories.length ? directories : [socketDir()]) {
+      try { await this.#bind(session, identity, directory); }
+      catch (error) { failure ??= error; }
+    }
+    const claimant = this.#claimant(session, owner, identity);
+    if (!claimant.holder.addresses.length) return refused(failure?.message ?? "no socket directory is available for an inbox");
+    return claim(name, claimant);
+  }
+
+  async #claimRequest(method, session, params) {
+    const owner = requiredString(params.owner, "owner", 512), identity = requiredString(params.identity, "identity", 80);
+    if (!IDENTITY.test(identity)) throw new Error("identity must identify a Hermes profile as hermes:<profile>");
+    const name = requiredString(params.name, "name", 200);
+    if (!this.#profile) return claimRefusal("scope-denied", "this agent-peers bridge was started without a Hermes profile, so it claims no names");
+    try {
+      // The scope is the profile, enforced here as well as in the plugin.
+      const parsed = parseName(name, "hermes");
+      await this.#touch(session, params);
+      if (method === "release_name") {
+        // Not even a dead name of another profile: it may be one that profile takes back after a restart.
+        if (parsed.kind !== "hermes" || parsed.scope !== this.#profile) {
+          return claimRefusal("scope-denied", `This Hermes profile releases only hermes:${this.#profile}/<claim> names, not ${parsed.name}.`,
+            { name: parsed.name, kind: parsed.kind });
+        }
+        return release(name, this.#claimant(session, owner, identity));
+      }
+      if (parsed.kind !== "hermes" || parsed.scope !== this.#profile) return claim(name, this.#claimant(session, owner, identity));
+      return await this.#claimName(session, owner, identity, parsed.name);
+    } catch (error) {
+      if (error instanceof SendFailure) return claimRefusal(error.reason, error.message);
+      throw error;
     }
   }
 
@@ -156,11 +262,14 @@ export class HermesBridge {
       }
     }
     if (session) this.#conversation(session).pins.noteRows(peers);
+    // Claimed names are the one way Hermes conversations appear here, with every other claim.
+    const { rows, names } = inDiscoveryScope(() => ({ rows: withClaims(peers), names: claimRows() }));
     return {
-      peers: peers.map((p) => ({
+      peers: rows.map((p) => ({
         name: p.name, kind: p.kind, cwd: p.cwd ?? null,
-        status: live.get(p.threadId)?.status?.type ?? p.status ?? null, address: p.address, generation: p.generation,
+        status: live.get(p.threadId)?.status?.type ?? p.status ?? null, address: p.address, generation: p.generation, claims: p.claims,
       })),
+      names,
       ...(note ? { note } : {}),
     };
   }
@@ -232,7 +341,9 @@ export class HermesBridge {
         const key = `${session}\0${target.address}`;
         if (this.#introduced.has(key)) return undefined;
         introducing = key;
-        return "(Hermes profile; notify_when_idle unavailable.)";
+        const names = heldBy("hermes", generation("hermes", session));
+        return "(Hermes profile; notify_when_idle unavailable.)" +
+          (names.length ? ` (Stable name${names.length > 1 ? "s" : ""}: ${names.join(", ")}.)` : "");
       },
     }).finally(() => { conversation.sending--; });
     // Claude saw the introduction only if the message was not refused or dropped.
@@ -252,6 +363,8 @@ export class HermesBridge {
     if (route.closed) return drop("closed");
     if (!line || typeof line !== "object") return drop("malformed");
     if (line.type === "control") {
+      const resolved = readNameResolved(line);
+      if (resolved) return this.#nameResolved(route, resolved);
       if (!route.outbox.receive(line)) drop("malformed");
       return;
     }
@@ -261,14 +374,22 @@ export class HermesBridge {
     const id = message.id ?? randomUUID();
     const fields = { sessionId, messageId: logIdentity(id), targetId: logIdentity(message.from), bytes: Buffer.byteLength(message.body) };
     const reply = (status, reason) => this.#receipts.send({ to: message.from, from: route.address, id: message.id, status, reason, optIn: message.ext.receipts });
-    // Only peers this conversation wrote to may write to it; the sender learns it was refused.
+    // Only peers this conversation wrote to may write to it (issue #28), and senders that used a name
+    // it holds: they join its reply targets. Anyone else found the inbox in the socket directory.
     const conversation = this.#conversations.get(route.session);
     if (!conversation?.contacts.has(message.from)) {
-      reply("dropped", "not-a-reply-target");
-      return drop("not_a_reply_target", fields);
+      if (!conversation || !message.ext.toName || !holds(message.ext.toName, generation("hermes", route.session))) {
+        reply("dropped", "not-a-reply-target");
+        return drop("not_a_reply_target", fields);
+      }
+      this.#contact(route.session, message.from);
     }
+    // Only a claim this bridge verifies names the sender; a name the sender asserts is never shown.
+    // Read only for a sender this conversation accepts.
+    message.replyName = inDiscoveryScope(() => claimAt(message.from));
     const notification = { method: "peer_message", params: {
       session: route.session, message_id: id, from: message.from, from_name: message.sender, message: message.body,
+      ...(message.replyName ? { reply_name: message.replyName } : {}),
       ...(message.ext.inReplyTo ? { in_reply_to: message.ext.inReplyTo } : {}),
     } };
     // The host reads at most MAX_LINE per line and restarts the bridge on a longer one; a frame
@@ -308,6 +429,17 @@ export class HermesBridge {
       this.#log(`incoming message delivery failed: ${safeError(error)}`);
     })
       .finally(() => { route.queued--; this.#queued--; });
+  }
+
+  // `agent-peers resolve`, run by the Claude session at `from` for a name this conversation holds:
+  // that session may write first, as a send_peer to the name may. Nothing answers it.
+  #nameResolved(route, { from, name }) {
+    const sessionId = logIdentity(route.session), conversation = this.#conversations.get(route.session);
+    const valid = conversation && inDiscoveryScope(() => from !== route.address && peerSocket(from) &&
+      claudeSessions().some((session) => session.address === from) && holds(name, generation("hermes", route.session)));
+    if (!valid) return event("receive.dropped", { sessionId, reason: "malformed" });
+    this.#contact(route.session, from);
+    event("receive.name_resolved", { sessionId, targetId: logIdentity(from) });
   }
 
   // The receipt callback for a message handed to the plugin, removed so it answers once. A
@@ -370,7 +502,7 @@ export class HermesBridge {
 // The subprocess protocol is newline-delimited JSON. Stdout is reserved for protocol
 // messages and respects stream backpressure; diagnostic text goes to stderr. Requests run
 // concurrently (HermesBridge keeps each conversation in order) and responses carry their id.
-export function runHermesBridge() {
+export function runHermesBridge({ profile } = {}) {
   const write = (message) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       event("bridge.error", { reason: "timeout" });
@@ -382,7 +514,7 @@ export function runHermesBridge() {
       if (error) reject(error); else resolve();
     });
   });
-  const bridge = new HermesBridge({ emit: write });
+  const bridge = new HermesBridge({ emit: write, profile });
   const inFlight = new Set();
   let buffer = "", stopping = false, requests = 0;
   const stop = async (code = 0) => {

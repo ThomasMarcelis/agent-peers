@@ -4,11 +4,12 @@ import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { app, bind, inboxFor, ownsSocket, roots, serverInfo } from "./codex-binding.mjs";
+import { app, bind, claimantOf, inboxFor, ownsRegistry, ownsSocket, roots, serverInfo } from "./codex-binding.mjs";
 import { outboxOf, pinsOf } from "./codex-inbox.mjs";
-import { codexDiscovery, formatCodexPeer, nativeRouteError } from "./discovery.mjs";
+import { codexDiscovery, formatCodexPeer, formatName, nativeRouteError } from "./discovery.mjs";
 import { coordinationGuidance } from "./guidance.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
+import { claim, claimRefusal, claimRows, heldBy, release, withClaims } from "./names.mjs";
 import { Outbox, sendPeer } from "./outbox.mjs";
 import { SendFailure, isError, sendResult, validMessageId } from "./status.mjs";
 import { MAX_LINE, allPeers, codexPeers, inDiscoveryScope, peerSocket } from "./wire.mjs";
@@ -32,10 +33,11 @@ function selfRow(caller) {
   if (!caller) return null;
   const root = caller.subagent ? roots.get(caller.rootId) : caller;
   const registered = root ? undefined : codexPeers().find((peer) => peer.threadId === caller.rootId);
+  const generation = root?.generation ?? registered?.generation ?? null;
   return {
     name: caller.name, kind: "codex", address: root?.address ?? registered?.address ?? null,
     addresses: root ? [...root.inboxes.values()].map((inbox) => inbox.address) : registered?.addresses ?? [],
-    generation: root?.generation ?? registered?.generation ?? null, threadId: caller.threadId, subagent: caller.subagent,
+    generation, threadId: caller.threadId, subagent: caller.subagent, claims: generation ? heldBy("codex", generation) : [],
   };
 }
 
@@ -57,16 +59,17 @@ async function listPeers(caller) {
       note = `Native discovery unavailable: ${e.message}. Check list_agents.`;
     }
   }
-  const peers = codexDiscovery(allPeers(), threads, caller);
-  const self = inDiscoveryScope(() => selfRow(caller));
+  const { peers, self, names } = inDiscoveryScope(() => ({ peers: codexDiscovery(withClaims(allPeers()), threads, caller), self: selfRow(caller),
+    names: claimRows() }));
   const rows = peers.map(formatCodexPeer);
   return {
     // Worded as in 0.3.0; the caller's address is in structuredContent.self.
     text: [`You are ${caller?.name ?? "codex (not bound yet)"}.`,
       ...(rows.length ? rows : ["No other agents found."]),
       ...(peers.some((p) => p.native.reachable) ? ["Native send_message does not start an idle turn; followup_task can wake non-root agents."] : []),
+      ...(names.length ? ["Claimed names:", ...names.map((row) => `  ${formatName(row, { sendPeer: true })}`)] : []),
       ...(note ? [note] : [])].join("\n"),
-    peers, self,
+    peers, self, names,
     degraded: Boolean(note),
   };
 }
@@ -98,7 +101,9 @@ async function send(caller, to, message, inReplyTo) {
       const key = `${caller.threadId}\0${target.address}`;
       if (introduced.has(key)) return undefined;
       introducing = key;
-      return `(Codex CLI ${caller.subagent ? "subagent; replies reach root" : "peer"}; notify_when_idle unavailable.)`;
+      const names = root ? heldBy("codex", root.generation) : [];
+      return `(Codex CLI ${caller.subagent ? "subagent; replies reach root" : "peer"}; notify_when_idle unavailable.)` +
+        (names.length ? ` (Stable name${names.length > 1 ? "s" : ""}: ${names.join(", ")}.)` : "");
     },
   });
   // Claude saw the introduction only if the message was not refused or dropped.
@@ -142,8 +147,52 @@ mcp.registerTool(
     if (caller) pinsOf(caller.subagent ? roots.get(caller.rootId) : caller, caller.rootId).noteRows(result.peers);
     log("tool.call", { ...trace, outcome: note || result.degraded ? "degraded" : "succeeded", count: result.peers.length,
       durationMs: performance.now() - started });
-    return { content: [{ type: "text", text: result.text + note }], structuredContent: { peers: result.peers, self: result.self } };
+    return { content: [{ type: "text", text: result.text + note }], structuredContent: { peers: result.peers, self: result.self, names: result.names } };
   },
+);
+
+// claim_name and release_name for the root session making the call. A subagent sends under its
+// root's address, so it holds no names of its own.
+const nameTool = (action) => async ({ name }, extra) => {
+  const started = performance.now();
+  const trace = { operationId: randomUUID(), method: `${action}_name`, threadId: logIdentity(extra._meta?.threadId), targetId: logIdentity(name) };
+  log("tool.call", { ...trace, outcome: "started" });
+  let caller, result;
+  try { caller = await bind(extra._meta); }
+  catch (error) {
+    result = claimRefusal("no-session", error.message);
+    log("inbox.bind", { ...trace, outcome: "failed", ...errorFields(error) });
+  }
+  if (caller?.subagent) result = claimRefusal("no-session", "a subagent sends under its root session and holds no names; ask the root agent to claim it.");
+  else if (caller && !ownsRegistry(caller)) result = claimRefusal("no-session", "this inbox was replaced; restart this MCP connection");
+  try { result ??= action === "claim" ? claim(name, claimantOf(caller)) : release(name, claimantOf(caller)); }
+  catch (error) {
+    if (!(error instanceof SendFailure)) throw error;
+    result = claimRefusal(error.reason, error.message);
+  }
+  log("tool.call", { ...trace, outcome: result.status === "refused" ? "failed" : "succeeded",
+    ...(result.reason ? { reason: code(result.reason) } : {}), durationMs: performance.now() - started });
+  return { content: [{ type: "text", text: result.text }], structuredContent: result, ...(result.status === "refused" ? { isError: true } : {}) };
+};
+
+mcp.registerTool(
+  "claim_name",
+  {
+    description: "Claim a stable name, codex:<scope>/<claim> or <scope>/<claim>, so peers reach this session by it with send_peer. " +
+      "Lowercase letters, digits, - and _ (and . in the claim). A running holder keeps its name; one that stopped is taken over. " +
+      "This session takes its names back after an MCP restart.",
+    inputSchema: { name: z.string().min(1).max(200) },
+  },
+  nameTool("claim"),
+);
+
+mcp.registerTool(
+  "release_name",
+  {
+    description: "Release a name this session holds, or one whose holder is no longer running.",
+    inputSchema: { name: z.string().min(1).max(200) },
+  },
+  nameTool("release"),
 );
 
 mcp.registerTool(
