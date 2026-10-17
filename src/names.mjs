@@ -103,11 +103,15 @@ function hermesInboxes(h) {
 // is gone, or its PID now belongs to a process with another start time; a Hermes conversation has
 // also stopped when none of its recorded inboxes exists. What this process can see of the holder
 // (its CLAUDE_CONFIG_DIR, its socket directories, a registry file Claude is rewriting) is never
-// evidence, or one process could take over a name another still routes to.
+// evidence, or one process could take over a name another still routes to. A Claude record without
+// a start time (rc.2 wrote them for older Claude Code builds) cannot tell its holder from a later
+// session that reused the PID and socket, so it counts as stopped.
 function stopped(record) {
   const h = record.holder;
   if (!alive(h.pid)) return true;
-  if (h.procStart !== undefined) {
+  if (h.procStart === undefined) {
+    if (record.kind === "claude") return true;
+  } else {
     const start = processStarts([h.pid]).get(h.pid);
     if (start !== undefined && start !== h.procStart) return true;
   }

@@ -322,6 +322,25 @@ test("the conflict table: dead and reused holders are taken over, the same owner
   assert.equal(claim("proj/x", f.me()).name, "claude:proj/x");
 });
 
+test("a Claude record without a start time counts as stopped: it is taken over and released, and never resolves", async (t) => {
+  const f = fixture(t), socket = join(f.sockets, `${process.pid}.sock`);
+  // What rc.2 wrote for an older Claude Code build at this PID and socket, which records no start.
+  const legacy = { v: 1, name: NAME, kind: "claude", owner: generation("claude", process.pid, undefined),
+    generation: generation("claude", process.pid, undefined, socket), claimedAt: 1,
+    holder: { pid: process.pid, autoName: "claude:old", socket, addresses: [address(socket)] } };
+  mkdirSync(join(f.peers, "names"), { recursive: true, mode: 0o700 });
+  writeFileSync(fileOf(f.dir, NAME), JSON.stringify(legacy), { mode: 0o600 });
+  // A later session at the same PID and socket, also without a start time.
+  f.record(process.pid, "new", socket);
+  assert.throws(() => resolveClaim(NAME), (error) => error.reason === "not-running");
+  assert.deepEqual(claimRows().map((row) => [row.name, row.running, row.holder]), [[NAME, false, null]]);
+  assert.equal(release(NAME, undefined, "claude").status, "released");
+  writeFileSync(fileOf(f.dir, NAME), JSON.stringify(legacy), { mode: 0o600 });
+  const other = await f.session("other");
+  const took = claim(NAME, other.claimant());
+  assert.deepEqual([took.status, took.previous.running], ["taken-over", false]);
+});
+
 test("at most 8 names per owner", (t) => {
   const f = fixture(t);
   for (let i = 0; i < 8; i++) assert.equal(claim(`proj/n${i}`, f.me()).status, "claimed");
