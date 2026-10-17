@@ -19,7 +19,7 @@ const KINDS = ["claude", "codex", "hermes"];
 export const SCOPE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const CLAIM = /^[a-z0-9][a-z0-9_.-]{0,63}$/, HEX16 = /^[a-f0-9]{16}$/, FILE = /^n-[a-f0-9]{32}\.json$/;
 const HERMES_SOCKET = /^hermes-[a-f0-9]{32}\.sock$/;
-const LEFTOVER = /^\.(?:reap|t)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
+const LEFTOVER = /^\.(?:reap|rel|t)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
 // NAMES_MAX bounds the directory, so a scan reads every record: a new record is refused past it.
 const NAMES_PER_OWNER = 8, NAMES_MAX = 1024, SWEEP_MAX = 1024, ATTEMPTS = 3, LEFTOVER_MS = 60_000;
 const GRAMMAR = "<kind>:<scope>/<claim>, with kind claude, codex or hermes, scope [a-z0-9][a-z0-9_-]{0,63} and claim [a-z0-9][a-z0-9_.-]{0,63}";
@@ -199,10 +199,11 @@ function temporaryRecord(dir, record) {
 
 // Clear up after a claim or release that died midway, once its file is unchanged for a minute:
 // renaming a file aside sets its ctime (test/names.mjs checks this on each CI filesystem), so a
-// swap still in progress is never touched. A record moved aside (.reap-) whose name file is gone
-// goes back in place: it may be a running holder's record that a swap had not put back yet.
-// Otherwise it is removed, as is a record never published (.t-); a .reap- record a newer
-// agent-peers wrote is left for that version. Only this user's regular files are touched.
+// swap still in progress is never touched. A record a claim moved aside (.reap-) whose name file is
+// gone goes back in place: it may be a running holder's record that a swap had not put back yet.
+// Otherwise it is removed, as is a record a release moved aside (.rel-: that release meant to
+// remove it) and one never published (.t-); a .reap- record a newer agent-peers wrote is left for
+// that version. Only this user's regular files are touched.
 function sweep(dir) {
   let files;
   try { files = readdirSync(dir).filter((f) => LEFTOVER.test(f)).slice(0, SWEEP_MAX); } catch { return; }
@@ -243,9 +244,12 @@ function replace(file, record) {
 }
 
 // Replace (or, without `next`, remove) the file that was read as `expected`. "retry" when it is
-// gone; "conflict" when someone replaced it after it was read, whose record is put back.
+// gone; "conflict" when someone replaced it after it was read, whose record is put back. A removal
+// moves the file aside under its own prefix, so a sweep never puts back a record a release that
+// died midway was removing.
 function swap(file, expected, next) {
-  const dir = dirname(file), reaped = join(dir, `.reap-${randomUUID()}.json`), temporary = next && temporaryRecord(dir, next);
+  const dir = dirname(file), reaped = join(dir, `.${next ? "reap" : "rel"}-${randomUUID()}.json`);
+  const temporary = next && temporaryRecord(dir, next);
   try {
     try { renameSync(file, reaped); }
     catch (error) { if (error.code === "ENOENT") return "retry"; throw error; }

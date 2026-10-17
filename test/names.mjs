@@ -133,7 +133,7 @@ function interleave(t, file, replacement) {
   const rename = fs.renameSync;
   let injected = false;
   fs.renameSync = (source, destination) => {
-    if (!injected && source === file && String(destination).includes(".reap-")) {
+    if (!injected && source === file && /\.(?:reap|rel)-/.test(String(destination))) {
       injected = true;
       const temporary = `${file}.other`;
       writeFileSync(temporary, JSON.stringify(replacement), { mode: 0o600 });
@@ -233,6 +233,28 @@ test("a record left aside by a claim that died is put back while its name is fre
   assert.equal(resolveClaim("claude:proj/second").holder, "claude:other", "a name claimed again is kept");
   assert.deepEqual(readdirSync(names).filter((name) => name.startsWith(".")), [future]);
   assert.ok(![orphan, stale].some((name) => readdirSync(names).includes(name)));
+});
+
+test("a release moves its record aside under its own prefix, which the sweep removes and never puts back", async (t) => {
+  const f = fixture(t), names = join(f.peers, "names"), gone = await f.session("gone");
+  claim(NAME, gone.claimant());
+  claim("claude:proj/second", gone.claimant());
+  await gone.stop();
+  const rename = fs.renameSync, aside = [];
+  fs.renameSync = (source, destination) => { aside.push(basename(String(destination))); return rename(source, destination); };
+  syncBuiltinESMExports();
+  t.after(() => { fs.renameSync = rename; syncBuiltinESMExports(); });
+  assert.equal(release(NAME, undefined, "claude").status, "released");
+  assert.ok(aside.some((name) => /^\.rel-[0-9a-f-]{36}\.json$/.test(name)), JSON.stringify(aside));
+  // A release that died after moving the second name aside: it meant to remove it.
+  const left = join(names, `.rel-${randomUUID()}.json`);
+  rename(fileOf(f.dir, "claude:proj/second"), left);
+  const now = Date.now;
+  Date.now = () => now() + 61_000;
+  t.after(() => { Date.now = now; });
+  assert.equal(release("proj/missing", f.me()).reason, "not-found");
+  assert.throws(() => resolveClaim("claude:proj/second"), (error) => error.reason === "not-found");
+  assert.deepEqual(readdirSync(names), []);
 });
 
 // The sweep above tells a swap in progress by its ctime, which rename(2) must update. Linux
