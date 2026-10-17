@@ -4,12 +4,13 @@ From 1.0.0, agent-peers follows [semantic versioning](https://semver.org) for th
 
 ## Covered
 
-- **CLI:** command names (`list`, `whoami`, `doctor`, `logs`, `hermes-bridge`, plus the `codex-peer` binary), flags, exit codes (`0` success, `1` runtime or diagnostic failure, `2` invalid usage), and the `--json` schemas of `list`, `whoami` and `doctor`. For `logs --json`, only the top-level summary.
-- **Codex MCP server:** the server name `agent-peers`, the tool names `list_peers` and `send_peer`, their input schemas, their `structuredContent` schemas (`peers[]`, `self`, and the send result), the rule for `isError`, and the delivery status and reason vocabularies.
+- **CLI:** command names (`list`, `whoami`, `claim`, `release`, `resolve`, `doctor`, `logs`, `hermes-bridge`, plus the `codex-peer` binary), flags, exit codes (`0` success, `1` runtime or diagnostic failure or a refused claim, `2` invalid usage), the `--json` schemas of `list` (`peers[]` and `names[]`), `whoami`, `claim`, `release`, `resolve` and `doctor`, and the single `uds:` line `resolve` prints. For `logs --json`, only the top-level summary.
+- **Codex MCP server:** the server name `agent-peers`, the tool names `list_peers`, `send_peer`, `claim_name` and `release_name`, their input schemas, their `structuredContent` schemas (`peers[]`, `self`, `names[]`, the send result and the claim result), the rule for `isError`, and the delivery status, claim status and reason vocabularies.
 - **Hermes plugin:** tool names, input schemas and JSON results, and the plugin setting `bridge_command`.
-- **Wire format emitted and read by agent-peers:** the message-line fields, the `agent_peers` v1 extension, the receipt format, and the peer-frame element and attribute names (`peer_message`, `from`, `reply_to`, `id`, `in_reply_to`).
-- **Registry:** its location, file permissions, and the record fields `name`, `address`, `addresses`, `cwd`, `threadId`, `pid`, `procStart`, `generation` and `startedAt`. The `names/` directory is reserved for name claims.
-- **Addressing:** the `uds:` address encoding; the name grammar, including the reserved `/` and the claim form `<kind>:<scope>/<claim>`; and `generation` as an opaque string compared only for equality.
+- **Wire format emitted and read by agent-peers:** the message-line fields, the `agent_peers` v1 extension (including `to_name`), the receipt format, the `name_resolved` control line, and the peer-frame element and attribute names (`peer_message`, `from`, `reply_to`, `reply_name`, `id`, `in_reply_to`).
+- **Registry:** its location, file permissions, and the record fields `name`, `address`, `addresses`, `cwd`, `threadId`, `pid`, `procStart`, `generation` and `startedAt`.
+- **Claimed names:** the `names/` directory under the registry, its file naming and permissions, and the record fields `v`, `name`, `kind`, `owner`, `generation`, `claimedAt` and `holder` (`pid`, `procStart`, `autoName`, `socket`, `threadId`, `addresses`); the rules for who may claim, refresh, take over and release a name; and the rule that a Hermes conversation admits a first message only from senders that used its name.
+- **Addressing:** the `uds:` address encoding; the name grammar, automatic `<kind>:<label>` and claimed `<kind>:<scope>/<claim>`; and `generation` as an opaque string compared only for equality.
 - **Environment variables** listed in the [reference](reference.md#environment).
 
 ## Not covered

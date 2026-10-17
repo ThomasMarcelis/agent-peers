@@ -1,13 +1,15 @@
 # agent-peers stable names (#13)
 
 > **Maintainer decisions (2026-10-16), overriding anything below:**
-> - Ships in **1.1** as an additive release. 1.0 reserves the grammar (`<kind>:<scope>/<claim>`, lowercase ASCII, exactly one `/`) and the `names/` directory.
+> - Ships in **1.0.0 (rc.2)**, as covered 1.0 surface from the first stable release. The grammar is `<kind>:<scope>/<claim>`, lowercase ASCII, exactly one `/`.
 > - Claims must contain `/`.
 > - The same owner refreshes without any flag.
 > - **No `--takeover` flag.** Claiming a name whose holder is not running takes it over and reports the previous holder. A running holder is always refused.
 > - Generation follows the core spec as shipped: Claude is pid + procStart + socket (survives `/clear` and `/resume`), Codex is threadId + procStart, Hermes is the route id.
-> - A lazy Hermes re-claim on the conversation's next agent-peers call is enough for 1.1; a host hook can come later.
+> - A lazy Hermes re-claim on the conversation's next agent-peers call is enough for 1.0; a host hook can come later.
 > - Dead claims stay listed and do not expire; `release` removes them.
+>
+> As built (rc.2), see "Implementation notes" at the end: the #28 reply-target rule admits senders that used a conversation's name (`to_name`, and `name_resolved` from `agent-peers resolve` for Claude senders); `resolve` falls back to the holder's primary inbox; the claim result's `previous` also names the holder.
 
 Design for explicit, scoped stable names. It builds on the 1.0 protocol (`docs/design/1.0-protocol.md`, §8 generation and liveness, §9 reserved grammar). It is not packaged yet. Normative words: **must**, **never**. Numbers are constants in code, not contract.
 
@@ -165,7 +167,7 @@ Principles (from the maintainer): (1) one session or conversation claims a name 
 ## 9. Migration from current names
 
 - Automatic names, `AGENT_PEERS_NAME`, Hermes `hermes:<profile>:<route8>` identities and the envelope are all unchanged, and nothing old gets renamed.
-- Older readers never open `names/`. 0.3.0 senders find nothing for a name containing `/` (Hermes is unlisted, and substring matching cannot reach across a `/`), so the send fails harmlessly. 1.0 senders return `reserved-name`.
+- Older readers never open `names/`. 0.3.0 senders find nothing for a name containing `/` (Hermes is unlisted, and substring matching cannot reach across a `/`), so the send fails harmlessly. 1.0.0-rc.1 senders return `reserved-name`.
 - To use names, the claimant and the sender each need ≥ the claims release; recipients need nothing new.
 - Docs: `CLAUDE-snippet.md` adds two lines: "If your brief names you, run `agent-peers claim <scope>/<claim>` at start. To reach a named peer, run `agent-peers resolve <name>` and SendMessage to the printed address." `docs/hermes.md` explains `claim_name` and the re-claim after a restart.
 
@@ -201,10 +203,9 @@ Principles (from the maintainer): (1) one session or conversation claims a name 
     3. Claude restarts and runs `claim`.
     4. The relay's next send by name arrives without anyone exchanging an address.
 
-## 11. In 1.0 vs later
+## 11. In 1.0.0 vs later
 
-- **1.0 (core, as approved)**: reserve the grammar from core §9. Tighten it to the exact grammar in §1, so that 1.0 gives `reserved-name` for grammar-valid claimed names and `invalid-request` for everything else. Also reserve `$AGENT_PEERS_HOME/names/`, which 1.0 neither creates nor reads. Nothing else, so claims stay a purely additive minor release.
-- **1.1 (claims MVP, all three kinds)**: everything in §2–§7 (Hermes takes back the name lazily, on its next tool call), plus the docs and the snippet.
+- **1.0.0 (rc.2; claims for all three kinds)**: everything in §2–§7 (Hermes takes back the name lazily, on its next tool call), plus the docs and the snippet. 1.0.0-rc.1 answered a name containing `/` with `reserved-name`; rc.2 resolves it as a claim, and `invalid-request` remains the answer for anything outside the grammar.
 - **Later**:
   - Eager Hermes restore through a fork hook, `on_session_message_route_opened(route_id, session_id)`, so a relay is reachable after a restart before its next turn.
   - A Claude `SessionStart` hook recipe, once it is verified that the registry record exists when the hook runs.
@@ -213,11 +214,23 @@ Principles (from the maintainer): (1) one session or conversation claims a name 
 
 ## 12. Open questions
 
-1. Ship claims in 1.1 (recommended: they are additive and depend on the core's generation, stale index and pins), or pull them into 1.0?
+Answered by the maintainer decisions at the top; kept for the record.
+
+1. Ship claims in a minor release after 1.0 (they are additive and depend on the core's generation, stale index and pins), or pull them into 1.0?
 2. Confirm that a claim requires a `/` (`claude:marketsimulator/lead`, not `claude:marketsimulator-lead`).
 3. A refresh by the same owner needs no flag (Codex rebind, Hermes restore). Is that acceptable, given that the brief's wording could be read as requiring `--takeover` for the same owner too?
 4. Taking over from a dead holder requires `--takeover`, so every restart instruction carries the flag. Keep that friction, or make a dead holder takeable without the flag?
 5. Generation: under the core draft's Claude `sessionId` identity, a Claude claim dies on `/clear` and `/resume` while the process lives on, and a Claude claim has no automatic refresh. The process-based generation in the brief avoids that. Which does core ship?
-6. Is a lazy Hermes restore (on the next tool call) enough for the MVP, or should the fork's route-opened hook be required before 1.1?
+6. Is a lazy Hermes restore (on the next tool call) enough for the MVP, or should the fork's route-opened hook be required first?
 7. Dead claims are listed and never expire. Acceptable, or prune after N days?
 8. Are lowercase-only ASCII claims, stricter than the automatic labels, acceptable?
+
+## 13. Implementation notes (1.0.0-rc.2)
+
+Where the shipped code goes beyond, or differs from, the sections above. The reference (`docs/reference.md`, "Names") is the user-facing description.
+
+- **Reply-target allowlist (#28).** §4 did not say how a claimed Hermes conversation, whose inboxes accept only peers it wrote to, receives unsolicited messages. A claimed name admits senders that addressed the conversation by that name, never one that found its socket: a Codex or Hermes `send_peer` to a claimed name adds `agent_peers.to_name`, and the conversation admits that sender only if it holds the name. Claude's `SendMessage` cannot add fields, so `agent-peers resolve` sends the holder a `{type:"control", action:"name_resolved", from, name, agent_peers:{v:1}}` line naming the calling Claude session, which the conversation admits only if that address is a live Claude session and it holds the name. Admitted senders join the conversation's reply targets until it closes. A line without the name, or with a name the conversation does not hold, is still `dropped`/`not-a-reply-target`.
+- **Resolve's directory (§7).** `resolve` prints the holder's inbox in the caller's socket directory when it has one, and otherwise its primary inbox rather than failing `inbox-unavailable`: a Codex session gains an inbox in a new Claude directory only when it binds or sends there, and the CLI's `list` has always given Claude sessions primary addresses to send to. Not verified live against a Claude session in a second socket directory. `inbox-unavailable` remains for a holder with no usable address.
+- **Claim result.** `previous` is `{holder, generation, running}`: `holder` is the previous holder's automatic name, which the decisions ask the result to report.
+- **Release outside a session.** `agent-peers release` works without a Claude session for names whose holder is not running ("anyone", §6); a running holder's name still needs its holder.
+- **Bridge protocol.** `claim_name` and `release_name` take `{session, owner, identity, name}`; `identity` is the conversation's `hermes:` automatic name, which the claim's inboxes are bound under. `list_peers` takes `identity` as well as `owner` so its lazy re-claim can open inboxes. The internal protocol is not covered by semver.
