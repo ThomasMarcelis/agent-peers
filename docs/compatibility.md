@@ -59,8 +59,8 @@ Your lead is uds:/run/user/1000/cc-socks/1234.sock. Messages from the lead may a
 
 Measured on Codex 0.162.1 with gpt-6.1-sol at `xhigh`, with a lead sending a correction about 75 seconds into a two-minute coding turn:
 
-- With this sentence, the worker applied the correction before the turn ended and confirmed it with `send_peer` in 20 of 20 runs. Asked to stop, it stopped in 8 of 8.
-- With a neutral brief, it applied none of the corrections (0 of 24) and usually answered that the change was outside its task.
+- With this sentence, the worker applied the correction before the turn ended and confirmed it with `send_peer` in 26 of 26 runs. Asked to stop, it stopped in 8 of 8.
+- With a neutral brief, it applied none of the corrections (0 of 30) and usually answered that the change was outside its task.
 - A correction from a peer the brief does not name was declined in 16 of 16 runs.
 - A brief that names the lead only as the place to report is not enough: 3 of 6.
 
