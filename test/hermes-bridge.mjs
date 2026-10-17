@@ -3,19 +3,20 @@ import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { connect, createServer } from "node:net";
+import { Socket, connect, createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { HermesBridge } from "../src/hermes-bridge.mjs";
 import { claim, claudeClaimant, resolveClaim } from "../src/names.mjs";
-import { MAX_LINE, address, allPeers, claudeSessionAt, generation, messageLine, parseEnvelope, peerSocket, post, readLines } from "../src/wire.mjs";
+import { MAX_LINE, address, allPeers, claudeSessionAt, exchange, generation, messageLine, parseEnvelope, peerSocket, post, processStart, readLines } from "../src/wire.mjs";
+import { nameResolvedLine, readNameResolvedStatus } from "../src/status.mjs";
 import { closeServer, listen } from "./listeners.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function until(check, description = "condition") {
-  for (let i = 0; i < 200; i++) {
+async function until(check, description = "condition", tries = 200) {
+  for (let i = 0; i < tries; i++) {
     const value = check();
     if (value) return value;
     await delay(10);
@@ -62,7 +63,7 @@ async function fixture(t, options = {}) {
     servers.push(server);
     await listen(server, socket);
     if (kind === "claude") writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({
-      pid: process.pid, name: "test", cwd: dir, status: "busy", messagingSocketPath: socket,
+      pid: process.pid, name: "test", cwd: dir, status: "busy", messagingSocketPath: socket, procStart: processStart(process.pid),
     }));
     else writeFileSync(join(peers, "codex-test.json"), JSON.stringify({
       pid: process.pid, name: "codex:test", address: address(socket), cwd: dir, threadId: "live-thread",
@@ -140,7 +141,7 @@ test("private sessions send, receive replies, and remain absent from every regis
   assert.notEqual(first.from, second.from);
   assert.deepEqual(first, { status: "accepted", reason: null, message_id: f.messages[0].line.msg_id, in_reply_to: null,
     to: address(join(f.sockets, "claude-test.sock")), name: "claude:test",
-    generation: generation("claude", process.pid, undefined, join(f.sockets, "claude-test.sock")), from: first.from, text: "Accepted by claude:test." });
+    generation: generation("claude", process.pid, processStart(process.pid), join(f.sockets, "claude-test.sock")), from: first.from, text: "Accepted by claude:test." });
   assert.equal(second.text, "Accepted by codex:test.");
   assert.deepEqual(f.messages[0].line.agent_peers, { v: 1, receipts: ["queued", "accepted"], generation: generation("hermes", "conversation-a") });
   const outbound = f.messages.map((entry) => parseEnvelope(entry.line.message.content));
@@ -747,6 +748,32 @@ test("a claim is scoped to the bridge's Hermes profile and opens an inbox in eve
   assert.equal((await f.bridge.request("list_peers")).names[0].running, false);
 });
 
+test("a refused claim closes the inboxes it opened and keeps those the conversation already had", async (t) => {
+  const f = await fixture(t, { profile: "jd" }), otherDir = join(f.dir, "other");
+  mkdirSync(otherDir, { mode: 0o700 });
+  // A second live Claude session makes its socket directory a verified one.
+  const other = spawn("sleep", ["60"], { stdio: "ignore" });
+  t.after(() => other.kill());
+  await once(other, "spawn");
+  writeFileSync(join(f.claude, "sessions", `${other.pid}.json`), JSON.stringify({ pid: other.pid, name: "other", messagingSocketPath: join(otherDir, "c.sock") }));
+  const inboxes = () => [f.sockets, otherDir].flatMap((dir) => readdirSync(dir).filter((name) => name.startsWith("hermes-")).map((name) => join(dir, name))).sort();
+  assert.equal((await named(f.bridge, "claim_name", "holder", "conversation-1", "jd/relay")).status, "claimed");
+  const held = inboxes();
+  assert.equal(held.length, 2);
+  // A conversation with no inbox yet: everything its claim opened is closed again.
+  const fresh = await named(f.bridge, "claim_name", "fresh", "conversation-2", "jd/relay");
+  assert.deepEqual([fresh.status, fresh.reason], ["refused", "name-held"]);
+  assert.deepEqual(inboxes(), held);
+  // A conversation that wrote to a peer keeps that inbox; the one its claim added is closed.
+  const sent = await f.send("writer", "codex:test", "hello");
+  const written = inboxes();
+  assert.equal(written.length, 3);
+  assert.equal((await named(f.bridge, "claim_name", "writer", "conversation-3", "jd/relay")).reason, "name-held");
+  assert.deepEqual(inboxes(), written);
+  await post(peerSocket(sent.from), messageLine({ from: address(join(f.sockets, "codex-test.sock")), body: "reply" }));
+  await until(() => f.events.some((e) => e.params.session === "writer" && e.params.message === "reply"), "the reply on the kept inbox");
+});
+
 test("after a restart the conversation's next call takes its names back, they follow compression, and nobody else takes a live one", async (t) => {
   const f = await fixture(t, { profile: "jd" }), name = "hermes:jd/relay";
   assert.equal((await named(f.bridge, "claim_name", "route-1", "conversation-1", name)).status, "claimed");
@@ -767,6 +794,58 @@ test("after a restart the conversation's next call takes its names back, they fo
   assert.throws(() => resolveClaim(name), notRunning, "the old conversation id no longer owns it");
   await third.request("send_peer", { session: "route-5", owner: "conversation-1b", name: "hermes:JD", to: "codex:test", message: "back" });
   assert.equal(resolveClaim(name).generation, generation("hermes", "route-5"));
+});
+
+test("a Hermes holder runs while any recorded inbox exists, and its record follows the inboxes it opens", async (t) => {
+  const f = await fixture(t, { profile: "jd" }), name = "hermes:jd/relay", otherDir = join(f.dir, "other");
+  mkdirSync(otherDir, { mode: 0o700 });
+  const touch = () => f.bridge.request("list_peers", { session: "route-1", owner: "conversation-1", identity: "hermes:JD" });
+  assert.equal((await named(f.bridge, "claim_name", "route-1", "conversation-1", name)).status, "claimed");
+  assert.deepEqual(JSON.parse(readFileSync(nameFile(f, name), "utf8")).holder.addresses.map((addr) => dirname(peerSocket(addr))), [f.sockets]);
+  // A Claude session in a second directory appears, and the conversation writes to it.
+  const other = spawn("sleep", ["60"], { stdio: "ignore" });
+  t.after(() => other.kill());
+  await once(other, "spawn");
+  const otherSocket = join(otherDir, "c.sock");
+  await listen(createServer((conn) => readLines(conn, () => {})), otherSocket, t);
+  writeFileSync(join(f.claude, "sessions", `${other.pid}.json`), JSON.stringify({ pid: other.pid, name: "other", messagingSocketPath: otherSocket,
+    procStart: processStart(other.pid) }));
+  assert.equal((await f.bridge.request("send_peer", { session: "route-1", name: "hermes:JD", to: "claude:other", message: "hi" })).status, "unconfirmed");
+  // Its next call records the inbox that send opened, so a sender in that directory gets it.
+  await touch();
+  const addresses = JSON.parse(readFileSync(nameFile(f, name), "utf8")).holder.addresses;
+  assert.deepEqual(addresses.map((addr) => dirname(peerSocket(addr))).sort(), [f.sockets, otherDir].sort());
+  assert.equal(dirname(resolveClaim(name, { directory: otherDir }).socket), otherDir);
+  // One inbox gone (its directory was cleaned) leaves the holder running at the other.
+  unlinkSync(peerSocket(addresses.find((addr) => dirname(peerSocket(addr)) === f.sockets)));
+  assert.equal(dirname(resolveClaim(name).socket), otherDir);
+  assert.equal((await named(f.bridge, "claim_name", "route-2", "conversation-2", name)).reason, "name-held");
+  await f.bridge.request("close_session", { session: "route-1" });
+  assert.throws(() => resolveClaim(name), notRunning, "with none left it is not running");
+});
+
+test("a name whose refresh keeps being refused is tried again at most once a minute", async (t) => {
+  const f = await fixture(t, { profile: "jd", logging: true }), name = "hermes:jd/relay";
+  assert.equal((await named(f.bridge, "claim_name", "route-1", "conversation-1", name)).status, "claimed");
+  await f.bridge.close();
+  // A record this version will not replace (a newer agent-peers rewrote it), so every refresh is refused.
+  writeFileSync(nameFile(f, name), JSON.stringify({ ...JSON.parse(readFileSync(nameFile(f, name), "utf8")), v: 2 }), { mode: 0o600 });
+  const next = f.restart();
+  const events = (event) => readFileSync(f.logPath, "utf8").trim().split("\n").map(JSON.parse)
+    .filter((record) => record.component === "hermes-bridge" && record.event === event);
+  const before = { bound: events("inbox.bound").length, closed: events("inbox.closed").length };
+  // The conversation has no inbox after the restart: each refused refresh would open one and close it.
+  for (let i = 0; i < 4; i++) await next.request("list_peers", { session: "route-2", owner: "conversation-1", identity: "hermes:JD" });
+  assert.deepEqual([events("inbox.bound").length - before.bound, events("inbox.closed").length - before.closed], [1, 1]);
+  for (let i = 0; i < 2; i++) {
+    await next.request("send_peer", { session: "route-2", owner: "conversation-1", name: "hermes:JD", to: "codex:test", message: `m${i}` });
+  }
+  assert.equal(events("names.refresh").filter((record) => record.outcome === "failed").length, 1);
+  const now = Date.now;
+  Date.now = () => now() + 61_000;
+  t.after(() => { Date.now = now; });
+  await next.request("list_peers", { session: "route-2", owner: "conversation-1", identity: "hermes:JD" });
+  assert.equal(events("names.refresh").filter((record) => record.outcome === "failed").length, 2, "a minute later it is tried again");
 });
 
 // The reply-target allowlist (issue #28) with claims: a sender that addressed the conversation by
@@ -791,6 +870,44 @@ test("a claimed name admits senders that used the name, never one that found the
   assert.deepEqual([sent.status, sent.name, sent.generation], ["queued", "hermes:jd/relay", generation("hermes", "named")]);
   await until(() => f.events.length === 3);
   assert.deepEqual([f.events[2].params.session, f.events[2].params.message], ["named", "from another conversation"]);
+  // A line marked with a name this conversation does not hold is for that name's holder, even from a
+  // sender it admits, and from a peer it wrote to.
+  await f.send("named", "codex:test", "a question");
+  const misdirected = { ...messageLine({ from: codex, body: "for another holder" }), agent_peers: { v: 1, to_name: "hermes:jd/other" } };
+  await post(inbox, misdirected);
+  await until(() => refusedIds().includes(misdirected.msg_id), "the misdirected line refused");
+  assert.equal(f.events.length, 3);
+});
+
+test("senders admitted by name are bounded and have their own buckets, apart from the peers the conversation wrote to", { timeout: 30_000 }, async (t) => {
+  const f = await fixture(t, { profile: "jd" });
+  const inbox = peerSocket((await named(f.bridge, "claim_name", "named", "conversation", "jd/relay")).address);
+  const codex = address(join(f.sockets, "codex-test.sock")), claude = address(join(f.sockets, "claude-test.sock"));
+  const byName = (from, body) => ({ ...messageLine({ from, body }), agent_peers: { v: 1, to_name: "hermes:jd/relay" } });
+  // A peer this conversation wrote to, which has not answered yet.
+  await f.send("named", "codex:test", "hello");
+  // An address nobody listens at proves no sender, so it is never admitted by name.
+  for (let i = 0; i < 300; i++) await post(inbox, byName(address(join(f.sockets, `ghost-${i}.sock`)), `ghost ${i}`));
+  // The first sender admitted by name, then more than the 64 by name, each a live socket.
+  await post(inbox, byName(claude, "first by name"));
+  await until(() => f.events.length === 1, "the first message by name");
+  const drops = [];
+  for (let i = 0; i < 70; i++) {
+    const socket = join(f.sockets, `named-${i}.sock`);
+    await listen(createServer((conn) => readLines(conn, (line) => { if (line.type === "control") drops.push(line.drop_reason); })), socket, t);
+    await post(inbox, byName(address(socket), `by name ${i}`));
+  }
+  // 64 sets of buckets for senders by name: the first sender and 63 more are admitted, the rest wait.
+  await until(() => f.events.length === 64 && drops.filter((reason) => reason === "queue-full").length === 7, "the bound on senders by name");
+  // The reply target's first reply still has buckets of its own.
+  await post(inbox, messageLine({ from: codex, body: "the answer" }));
+  await until(() => f.events.some((e) => e.params.message === "the answer"), "the reply target's message");
+  assert.ok(!f.events.some((e) => /^ghost/.test(e.params.message)));
+  // The latest 64 senders by name are remembered; the first one now needs the name again.
+  const forgotten = messageLine({ from: claude, body: "forgotten" });
+  await post(inbox, forgotten);
+  await until(() => f.controls.some(({ kind, line }) => kind === "claude" && line.drop_reason === "not-a-reply-target" &&
+    line.dropped_msg_ids.includes(forgotten.msg_id)), "the oldest sender by name forgotten");
 });
 
 test("a Claude session that ran agent-peers resolve may write first; another Claude session may not", async (t) => {
@@ -815,6 +932,77 @@ test("a Claude session that ran agent-peers resolve may write first; another Cla
   await until(() => f.controls.some(({ kind, line }) => kind === "claude" && line.drop_reason === "not-a-reply-target"), "the refusal");
   assert.deepEqual(f.events.map((e) => e.params.message), ["from the lead"]);
   shell.stdin.end();
+});
+
+// Runs the CLI from a shell that is a Claude session (its record in `config`), as Claude's Bash tool
+// does, without blocking this process, which hosts the bridge.
+async function claudeShell(t, config, socket, args) {
+  const shell = execFile("sh", ["-c", `read go; "${process.execPath}" "${join(root, "bin", "agent-peers.mjs")}" ${args}; echo "@@$?"; true`],
+    { encoding: "utf8", env: { ...process.env, CLAUDE_CONFIG_DIR: config } });
+  t.after(() => shell.kill());
+  let out = "";
+  shell.stdout.on("data", (data) => { out += data; });
+  writeFileSync(join(config, "sessions", `${shell.pid}.json`), JSON.stringify({ pid: shell.pid, name: "lead", messagingSocketPath: socket,
+    procStart: processStart(shell.pid) }));
+  const started = performance.now();
+  shell.stdin.end("go\n");
+  await once(shell, "close");
+  const [stdout, status] = out.split("@@");
+  return { stdout, status: Number(status), ms: performance.now() - started };
+}
+
+test("resolve hears whether the holder admits its Claude session, and takes an older bridge's silence as admitted", async (t) => {
+  const f = await fixture(t, { profile: "jd" });
+  const inbox = peerSocket((await named(f.bridge, "claim_name", "named", "conversation", "jd/relay")).address);
+  const ask = async (from, name) => {
+    const line = nameResolvedLine({ from, name });
+    return readNameResolvedStatus(await exchange(inbox, line, (reply) => readNameResolvedStatus(reply, line.msg_id)), line.msg_id);
+  };
+  // The answer comes on the same connection.
+  const claude = address(join(f.sockets, "claude-test.sock"));
+  assert.deepEqual(await ask(claude, "hermes:jd/relay"), { admitted: true, reason: null });
+  assert.deepEqual(await ask(claude, "hermes:jd/other"), { admitted: false, reason: "not-holder" });
+  assert.deepEqual(await ask(address(join(f.sockets, "nobody.sock")), "hermes:jd/relay"), { admitted: false, reason: "unknown-sender" });
+  // A Claude session under another CLAUDE_CONFIG_DIR: the bridge cannot see it, so resolve fails.
+  const elsewhere = join(f.dir, "claude-b"), lead = join(f.sockets, "lead.sock");
+  mkdirSync(join(elsewhere, "sessions"), { recursive: true, mode: 0o700 });
+  await listen(createServer((conn) => readLines(conn, () => {})), lead, t);
+  const refused = await claudeShell(t, elsewhere, lead, "resolve hermes:jd/relay --json");
+  const result = JSON.parse(refused.stdout);
+  assert.deepEqual([refused.status, result.status, result.reason], [1, "failed", "unknown-sender"]);
+  assert.match(result.text, /did not admit this session \(unknown-sender\): .*same CLAUDE_CONFIG_DIR\. Nothing was sent/);
+  // A holder whose inbox reads the line and answers nothing, as bridges before this one.
+  const old = join(f.sockets, `hermes-${"c".repeat(32)}.sock`), start = processStart(process.pid);
+  await listen(createServer((conn) => readLines(conn, () => {})), old, t);
+  claim("hermes:jd/old", { kind: "hermes", scope: "jd", owner: generation("hermes", "jd", "old"), generation: generation("hermes", "old-route"),
+    address: address(old), holder: { pid: process.pid, procStart: start, autoName: "hermes:jd:oldroute", addresses: [address(old)] } });
+  const silent = await claudeShell(t, f.claude, lead, "resolve hermes:jd/old");
+  assert.deepEqual([silent.status, silent.stdout], [0, `${address(old)}\n`]);
+  assert.ok(silent.ms >= 1000, "it waited for an answer");
+});
+
+test("a sender that floods name_resolved and reads no answer cannot make the bridge buffer more than 64 KiB of them", { timeout: 30_000 }, async (t) => {
+  const f = await fixture(t, { profile: "jd" });
+  const inbox = peerSocket((await named(f.bridge, "claim_name", "named", "conversation", "jd/relay")).address);
+  // The bridge's side of each connection: how much it has written that the peer has not read.
+  let peak = 0;
+  const write = Socket.prototype.write;
+  Socket.prototype.write = function (...args) {
+    const result = write.apply(this, args);
+    if (this.server) peak = Math.max(peak, this.writableLength);
+    return result;
+  };
+  t.after(() => { Socket.prototype.write = write; });
+  const line = JSON.stringify(nameResolvedLine({ from: address(join(f.sockets, "claude-test.sock")), name: "hermes:jd/relay" })) + "\n";
+  const flood = connect(inbox);
+  t.after(() => flood.destroy());
+  flood.pause();
+  await once(flood, "connect");
+  flood.write(line.repeat(20_000));
+  // Each line costs the bridge a registry scan, which takes seconds for 20,000 lines on macOS CI.
+  await until(() => flood.writableLength === 0, "the bridge reading every line", 2000);
+  await delay(200);
+  assert.ok(peak > 0 && peak <= 64 * 1024 + 1024, `peak ${peak} bytes`);
 });
 
 test("arrivals carry reply_name only for a verified claim, and first messages to Claude name this conversation", async (t) => {

@@ -36,7 +36,7 @@ codex mcp add agent-peers -- codex-peer
 
 Start a new Codex session; its inbox opens within seconds, without a tool call, and it is listed as `codex:<folder>-<id>`. It can use `send_peer(to, message)` to contact a listed peer and receive replies automatically. Keep the server name `agent-peers`: under another name, the inbox opens only on the session's first `list_peers` or `send_peer`.
 
-A Codex session is reachable on the app-server agent-peers uses: Codex's shared daemon by default, or a [private app-server](docs/compatibility.md#headless-codex-on-a-private-app-server) for headless workers. `codex exec`, `-c` overrides and `--no-daemon` run an embedded server that peers cannot reach.
+A Codex session is reachable on the app-server agent-peers uses: Codex's shared daemon by default, or a [private app-server](docs/compatibility.md#headless-codex-on-a-private-app-server) for headless workers. `codex exec`, `-c` overrides and `--no-daemon` run an embedded server that peers cannot reach. A worker answers peers on its own; to let a lead change its task mid-turn, put [one sentence](docs/compatibility.md#headless-codex-on-a-private-app-server) in its brief.
 
 ### Claude Code
 
@@ -61,7 +61,7 @@ A native plugin lets Hermes contact Claude and Codex, with private replies to th
 hermes plugins install ThomasMarcelis/agent-peers --enable
 ```
 
-Complete the [dependency setup and injection grant](docs/hermes.md). A Hermes conversation stays unlisted and opens a private reply inbox on its first send; it becomes reachable by others only through a [stable name](docs/reference.md) it claims, scoped to its profile. Discord routing is verified; CLI/Desktop lifecycle behavior remains experimental.
+Complete the [dependency setup and injection grant](docs/hermes.md). A Hermes conversation stays unlisted and opens a private reply inbox on its first send; it becomes reachable by others only through a [stable name](docs/reference.md#names) it claims (experimental), scoped to its profile. Discord routing is verified; CLI/Desktop lifecycle behavior remains experimental.
 
 ## Scope
 

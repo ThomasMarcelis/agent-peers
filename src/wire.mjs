@@ -268,6 +268,17 @@ export function socketPath(addr) {
   try { return decodeURIComponent(addr.slice(4)); } catch { return undefined; }
 }
 
+// The path behind a peer address when a socket of this user exists there now. peerSocket also
+// accepts a missing path, which is a valid reply address but proves no sender is there.
+export function existingSocket(addr) {
+  const path = peerSocket(addr);
+  if (!path) return undefined;
+  try {
+    const st = lstatSync(path);
+    return st.isSocket() && st.uid === uid ? path : undefined;
+  } catch { return undefined; }
+}
+
 // Automatic names never contain the characters reserved for explicit claims (`/`) or patterns.
 export const nameLabel = (s) => String(s).replace(/[^\p{L}\p{N}_.:-]/gu, "-").slice(0, 128);
 
@@ -350,6 +361,42 @@ function parentPid(pid) {
     const out = execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
     return Number(out.trim());
   } catch { return NaN; }
+}
+
+// The agent a process runs, as "claude", "codex" or "hermes", or undefined: its command name or
+// argv[0] is one of them (claude.exe included), or it is an interpreter whose script is (npm's
+// codex.js, Claude Code's cli.js, a hermes console script, python -m hermes_cli). Linux reads
+// /proc; elsewhere ps. Shells, wrappers and agent-peers itself are never agents.
+const AGENTS = new Set(["claude", "codex", "hermes"]);
+// Interpreters as distributions name them: node, nodejs, node-22, python3.12.
+const INTERPRETER = /^(?:node|nodejs|bun|deno|python)(?:-?[0-9][0-9.]*)?$/;
+const stem = (path) => basename(String(path)).toLowerCase().replace(/\.(?:exe|js|mjs|cjs|py)$/, "");
+export function agentProcess(pid) {
+  const { comm, argv } = processCommand(pid);
+  const names = [comm, argv[0]].filter(Boolean).map(stem);
+  const direct = names.find((name) => AGENTS.has(name));
+  if (direct || !names.some((name) => INTERPRETER.test(name))) return direct;
+  const args = argv.slice(1), module = args.indexOf("-m");
+  if (module >= 0 && /^hermes(?:_cli|_agent)?(?:\.|$)/.test(args[module + 1] ?? "")) return "hermes";
+  const script = args.find((arg) => !arg.startsWith("-"));
+  if (!script) return undefined;
+  if (/(?:^|\/)claude-code\/cli\.m?js$/.test(script)) return "claude";
+  return AGENTS.has(stem(script)) ? stem(script) : undefined;
+}
+
+function processCommand(pid) {
+  try {
+    const comm = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+    return { comm, argv: readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean) };
+  } catch {}
+  if (process.platform === "linux") return { comm: undefined, argv: [] };
+  const ps = (field) => {
+    try {
+      return execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch { return ""; }
+  };
+  // ps shows argv joined by spaces, so a path with a space splits; the command name is exact.
+  return { comm: ps("comm") || undefined, argv: ps("args").split(/\s+/).filter(Boolean) };
 }
 
 // The calling session: the nearest ancestor that owns a live Claude registry record, else a
@@ -455,6 +502,42 @@ export function post(socket, line) {
     // before the "error" event; ignoring it would report an undelivered line as delivered.
     c.on("connect", () => { ended = true; c.end(data, (error) => finish(error)); });
     c.on("close", () => finish(failed("peer inbox closed before accepting the message", "ERR_SOCKET_CLOSED")));
+  });
+}
+
+// Write one line and wait up to `answerMs` after the write completes for an answer on the same
+// connection that `accept` recognises. Resolves with that answer, or with undefined when none came
+// (older peers answer nothing); rejects with a coded error, as post does, when the write fails.
+export function exchange(socket, line, accept, { answerMs = 1000 } = {}) {
+  if (typeof socket !== "string" || inDiscoveryScope(() => peerSocket(address(socket))) !== socket) {
+    return Promise.reject(new Error("invalid peer inbox socket"));
+  }
+  const data = JSON.stringify(line) + "\n";
+  if (Buffer.byteLength(data) > MAX_LINE) return Promise.reject(Object.assign(new Error("message too large"), { code: "E2BIG" }));
+  return new Promise((resolve, reject) => {
+    const c = connect(socket);
+    let settled = false, written = false, timer;
+    const finish = (error, answer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      c.destroy();
+      error ? reject(error) : resolve(answer);
+    };
+    const failed = (message, code) => Object.assign(new Error(message), { code });
+    timer = setTimeout(() => finish(failed("peer inbox did not accept the line within 5 s", "ETIMEDOUT")), 5000);
+    // Once the line is written, a closed or failed connection only means no answer is coming.
+    c.on("error", (error) => (written ? finish(undefined, undefined) : finish(error)));
+    c.on("close", () => (written ? finish(undefined, undefined) : finish(failed("peer inbox closed before accepting the line", "ERR_SOCKET_CLOSED"))));
+    c.on("connect", () => {
+      readLines(c, (answer) => { if (accept(answer)) finish(undefined, answer); });
+      c.write(data, (error) => {
+        if (error) return finish(error);
+        written = true;
+        clearTimeout(timer);
+        timer = setTimeout(() => finish(undefined, undefined), answerMs);
+      });
+    });
   });
 }
 

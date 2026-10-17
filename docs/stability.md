@@ -9,8 +9,7 @@ From 1.0.0, agent-peers follows [semantic versioning](https://semver.org) for th
 - **Hermes plugin:** tool names, input schemas and JSON results, and the plugin setting `bridge_command`.
 - **Wire format emitted and read by agent-peers:** the message-line fields, the `agent_peers` v1 extension (including `to_name`), the receipt format, the `name_resolved` control line, and the peer-frame element and attribute names (`peer_message`, `from`, `reply_to`, `reply_name`, `id`, `in_reply_to`).
 - **Registry:** its location, file permissions, and the record fields `name`, `address`, `addresses`, `cwd`, `threadId`, `pid`, `procStart`, `generation` and `startedAt`.
-- **Claimed names:** the `names/` directory under the registry, its file naming and permissions, and the record fields `v`, `name`, `kind`, `owner`, `generation`, `claimedAt` and `holder` (`pid`, `procStart`, `autoName`, `socket`, `threadId`, `addresses`); the rules for who may claim, refresh, take over and release a name; and the rule that a Hermes conversation admits a first message only from senders that used its name.
-- **Addressing:** the `uds:` address encoding; the name grammar, automatic `<kind>:<label>` and claimed `<kind>:<scope>/<claim>`; and `generation` as an opaque string compared only for equality.
+- **Addressing:** the `uds:` address encoding; the automatic `<kind>:<label>` names, and that names containing `/` are reserved for claimed names; and `generation` as an opaque string compared only for equality.
 - **Environment variables** listed in the [reference](reference.md#environment).
 
 ## Not covered
@@ -24,7 +23,12 @@ From 1.0.0, agent-peers follows [semantic versioning](https://semver.org) for th
 
 ## Experimental
 
-Hermes support remains experimental in 1.x: its plugin surface follows this policy, but compatibility depends on the host fork. Experimental features are labelled as such in the reference and changelog, and may change in a minor release.
+Experimental features are labelled as such in the reference and changelog, and may change in a minor release. Each change is listed in the changelog.
+
+- **Hermes support:** its plugin surface follows this policy, but compatibility depends on the host fork.
+- **Claimed names** (`<kind>:<scope>/<claim>`): the `claim`, `release` and `resolve` commands and their `--json` output, the `claim_name` and `release_name` tools, the `names[]`, `claims` and `reply_name` fields, the `agent_peers.to_name` extension, the `name_resolved` control line and its `name_resolved_status` answer, and the `names/` directory under the registry. The rules a later version must keep are the safety ones: a name never reaches anyone but its current holder, a running holder is never displaced, a Hermes name stays inside its profile, and a Hermes conversation admits a first message only from senders that used its name or that it contacted. Claimed names are new in 1.0 and are expected to settle with use; a minor release may change their commands, fields or storage.
+
+Sessions that do not claim names use only covered surfaces.
 
 ## Deprecation
 

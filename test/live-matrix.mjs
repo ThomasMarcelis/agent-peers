@@ -16,6 +16,8 @@ import { address } from "../src/wire.mjs";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const codexOnly = process.argv.includes("--codex-only");
 const coordinationOnly = process.argv.includes("--coordination-only");
+// Only the stable-name check, after the four sessions start.
+const namesOnly = process.argv.includes("--names-only");
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const output = join(root, "artifacts", `live-${stamp}`);
 const tmp = mkdtempSync(join(tmpdir(), "agent-peers-live-"));
@@ -29,9 +31,12 @@ const processes = [], participants = [], codexEvents = [], checks = [];
 const completed = new Map(), active = new Map();
 let cancelled;
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => { cancelled = signal; });
-const report = { startedAt: new Date().toISOString(), mode: codexOnly ? "codex-only" : "four-session", coordinationOnly, output, versions: {}, participants: [], checks, passed: false };
+const report = { startedAt: new Date().toISOString(), mode: codexOnly ? "codex-only" : "four-session", coordinationOnly, namesOnly, output, versions: {}, participants: [], checks, passed: false };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const quote = (s) => `'${s.replaceAll("'", "'\\''")}'`;
+// The agent-peers CLI from this checkout, on the isolated registries, as a Claude Bash command.
+const cliCommand = (...args) => `CLAUDE_CONFIG_DIR=${quote(claudeRegistry)} AGENT_PEERS_HOME=${quote(registry)} ` +
+  `${quote(process.execPath)} ${quote(join(root, "bin/agent-peers.mjs"))} ${args.join(" ")}`;
 const log = (s) => console.log(`${new Date().toISOString()} ${s}`);
 const saveReport = () => writeFileSync(join(output, "report.json"), JSON.stringify(report, null, 2) + "\n");
 mkdirSync(output, { recursive: true });
@@ -165,6 +170,34 @@ async function coordinationCheck() {
   saveReport();
 }
 
+// A Claude session claims claude:<scope>/<claim> with agent-peers claim, and a Codex session reaches
+// it by that name with send_peer (docs/reference.md, "Names").
+async function namesCheck() {
+  const holder = participants.find((p) => p.label === "H1"), sender = participants.find((p) => p.label === "C1");
+  const name = `claude:live-${nonce}/h1`, token = `${nonce}-NAMED`, start = holder.events.length;
+  await turn(holder, `Stable-name test: run this exact command with Bash: ${cliCommand("claim", name)}. Then reply CLAIMED ${holder.label}.`);
+  await until(`${holder.label} claimed ${name}`, () => assistantText(holder).includes(`CLAIMED ${holder.label}`));
+  const listed = JSON.parse(execFileSync(process.execPath, [join(root, "bin/agent-peers.mjs"), "list", "--json", "--no-probe"],
+    { cwd: tmp, encoding: "utf8", env: { ...process.env, CLAUDE_CONFIG_DIR: claudeRegistry, AGENT_PEERS_HOME: registry } }));
+  const row = listed.names.find((r) => r.name === name);
+  assert.ok(row?.running && row.kind === "claude" && row.address === holder.address, `${name} names ${holder.label}'s inbox`);
+  assert.ok(listed.peers.find((p) => p.address === holder.address)?.claims.includes(name), `${holder.label}'s row lists its name`);
+  await until(`${sender.label} idle before the name check`, () => !active.has(sender.id));
+  const sendTurn = await turn(sender, `Stable-name test: call send_peer once with to set to ${name} and message NAMED ${token}. ` +
+    `That peer does not need to reply. Then print NAMED_SENT ${token}.`);
+  await until(`${sender.label} sent by name`, () => completed.has(sendTurn));
+  const sent = toolSends(sender).find((s) => s.message?.includes(`NAMED ${token}`));
+  assert.equal(sent?.to, name, `${sender.label} addressed the stable name`);
+  const result = sent.result?.structuredContent;
+  // Claude sends no receipt on acceptance, so a send to a Claude holder stays unconfirmed.
+  assert.deepEqual([result?.status, result?.reason, result?.name, result?.to], ["unconfirmed", "no-receipt", name, holder.address], "send_peer resolved the name");
+  assert.equal(result.generation, row.generation, "the result names the holder's generation");
+  await until(`${holder.label} received the message sent to its name`, () => JSON.stringify(holder.events.slice(start)).includes(`NAMED ${token}`));
+  checks.push({ test: "claude-name", holder: holder.label, sender: sender.label, name, token, passed: true });
+  log(`PASS ${sender.label} -> ${name} (${holder.label})`);
+  saveReport();
+}
+
 async function run() {
   report.versions = {
     node: process.version,
@@ -260,8 +293,14 @@ async function run() {
     report.passed = true;
     return;
   }
+  if (namesOnly) {
+    if (codexOnly) throw new Error("--names-only needs the Claude sessions");
+    await namesCheck();
+    report.passed = true;
+    return;
+  }
 
-  const discoveryCommand = `CLAUDE_CONFIG_DIR=${quote(claudeRegistry)} AGENT_PEERS_HOME=${quote(registry)} ${quote(process.execPath)} ${quote(join(root, "bin/agent-peers.mjs"))} list`;
+  const discoveryCommand = cliCommand("list");
   const routes = participants.flatMap((from) => participants.filter((to) => to !== from)
     .map((to) => ({ from, to, token: `${nonce}-${from.label}-${to.label}` })));
   log(`${participants.length} real sessions are live; starting all ${routes.length} directed routes concurrently`);
@@ -303,6 +342,7 @@ async function run() {
     checks.push({ test: "discovery", participant: p.label, native: 4, passed: true });
   }
   log("PASS discovery routes from every test session");
+  if (!codexOnly) await namesCheck();
 
   const parent = participants.find((p) => p.label === "C1");
   await until("Codex C1 idle before native-agent check", () => !active.has(parent.id));

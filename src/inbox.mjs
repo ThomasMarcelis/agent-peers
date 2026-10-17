@@ -36,7 +36,8 @@ export async function listenInbox(socket, { takeover = false, maxConnections, on
     }
     connections.add(conn);
     conn.once("close", () => connections.delete(conn));
-    readLines(conn, (line) => onLine(line, inbox));
+    // The connection lets a handler answer on it (Hermes answers name_resolved there).
+    readLines(conn, (line) => onLine(line, inbox, conn));
   });
   inbox.server.maxConnections = maxConnections;
   inbox.server.on("error", (error) => onError?.(error));

@@ -189,7 +189,7 @@ mcp.registerTool(
 mcp.registerTool(
   "release_name",
   {
-    description: "Release a name this session holds, or one whose holder is no longer running.",
+    description: "Release a codex: name this session holds, or one whose holder is no longer running.",
     inputSchema: { name: z.string().min(1).max(200) },
   },
   nameTool("release"),
