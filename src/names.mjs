@@ -323,8 +323,7 @@ export function claim(text, claimant) {
       }
       // Only a new file counts against the directory bound; refreshes and takeovers replace one.
       if (!current && readdirSync(dirname(file)).filter((f) => FILE.test(f)).length >= NAMES_MAX) {
-        return claimRefusal("too-many-names", `There are already ${NAMES_MAX} claimed names on this machine; release names whose holder ` +
-          "stopped (agent-peers list shows them as not running) before claiming a new one.", fields);
+        return claimRefusal("too-many-names", fullDirectory(claimant), fields);
       }
       if (ours && record.owner === next.owner && record.generation === next.generation &&
           JSON.stringify(record.holder) === JSON.stringify(next.holder)) {
@@ -342,6 +341,20 @@ export function claim(text, claimant) {
     }
     return claimRefusal("conflict", `${parsed.name} changed while this claim ran; try again.`, fields);
   });
+}
+
+// The too-many-names text for a full directory, naming only what this claimant can do: release
+// names of its own kind (and profile) that it holds or whose holder stopped, or ask its user.
+function fullDirectory(claimant) {
+  const own = (r) => r.kind === claimant.kind && (claimant.scope === undefined || r.name.startsWith(`hermes:${claimant.scope}/`));
+  const releasable = scan().filter((r) => own(r) && (r.owner === claimant.owner || stopped(r))).map((r) => r.name);
+  const tool = claimant.kind === "claude" ? "agent-peers release <name>" : "release_name";
+  if (releasable.length) {
+    return `There are already ${NAMES_MAX} claimed names on this machine. This session can make room by releasing ${releasable.length === 1
+      ? "one" : `some of ${releasable.length}`} with ${tool}: ${releasable.slice(0, 3).join(", ")}${releasable.length > 3 ? ", …" : ""}. Nothing changed.`;
+  }
+  return `There are already ${NAMES_MAX} claimed names on this machine, and none is one this session may release. Ask your user to ` +
+    `release names in the sessions that hold them, or to remove the files of names that will never be released from ${directory()}. Nothing changed.`;
 }
 
 // Remove a name: its holder (the same owner or generation) may, and once the holder is not running

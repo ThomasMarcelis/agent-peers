@@ -480,6 +480,13 @@ test("scans read every record, and a new record is refused once 1024 exist while
   // Another owner: no new file past the bound, but a dead record is taken over.
   const refused = claim("codex:proj/new", owner("other"));
   assert.deepEqual([refused.reason, /1024 claimed names/.test(refused.text)], ["too-many-names", true]);
+  // The text names only what the caller can do: this Codex session can release dead codex: names.
+  assert.match(refused.text, /can make room by releasing some of 1109 with release_name: codex:old\/worker-/);
+  // A Claude session can release none of them, so it is sent to its user, with the directory.
+  const claude = claim("proj/new", f.me());
+  assert.equal(claude.reason, "too-many-names");
+  assert.match(claude.text, /none is one this session may release\. Ask your user/);
+  assert.ok(claude.text.includes(names), claude.text);
   assert.equal(claim("codex:old/worker-1", owner("other")).status, "taken-over");
   assert.equal(readdirSync(names).filter((name) => name.startsWith("n-")).length, 1109);
 });
