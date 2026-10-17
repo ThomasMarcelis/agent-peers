@@ -96,6 +96,9 @@ function cleanup() {
   for (const socket of ownedSockets) rmSync(socket, { force: true });
   rmSync(tmp, { recursive: true, force: true });
   rmSync(socketRoot, { recursive: true, force: true });
+  // codex-peer runs in the app-server's MCP process group, outlives the kill by a moment and writes
+  // its exit log, recreating tmp. Remove both again once it has gone.
+  spawn("sh", ["-c", 'sleep 5; rm -rf -- "$1" "$2"', "sh", tmp, socketRoot], { detached: true, stdio: "ignore" }).unref();
 }
 process.on("exit", cleanup);
 process.on("SIGINT", () => process.exit(130));
