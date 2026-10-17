@@ -52,7 +52,7 @@ A conversation that peers should reach without first hearing from it, such as a 
 - **Another conversation.** A different conversation in the same profile cannot take a name while its holder runs (`name-held`). Once the holder's route closes, the name stays listed as not running, and a new conversation (after `/new` or a reset) takes it over with `claim_name`; the result names the previous holder.
 - **Gateway restarts.** Route ids change at every restart, so a claimed name is `not-running` after one. The same conversation takes its names back on its next agent-peers tool call (`list_peers`, `send_peer`, `claim_name` or `release_name`). A relay that should be reachable right after a restart needs one such call; there is no host hook for this yet.
 - **Compression** keeps the route and changes the conversation id; the names follow the new id.
-- `release_name({name})` removes a name this conversation holds, or any name whose holder is not running. Dead names are listed until then; they never expire.
+- `release_name({name})` removes a name this conversation holds, or one of this profile's names whose holder is not running. Another profile's name is `scope-denied`, even when dead, because that profile takes it back after a restart. Dead names are listed until then; they never expire.
 
 ## Configuration
 

@@ -107,6 +107,19 @@ class PeerTools:
         return ("hermes:" + re.sub(r"[^A-Za-z0-9:_-]", "-", self.profile)[:40] + ":"
                 + re.sub(r"[^A-Za-z0-9_-]", "-", route_id[-8:]))
 
+    def _route_id(self, session_id):
+        """This conversation's route id, or (None, (reason, text)) when there is none."""
+        try:
+            route = self.ctx.session_message_route(session_id)
+        except Exception:
+            return None, ("conversation-closed", "Hermes could not resolve this conversation; no message was sent.")
+        if not route:
+            return None, ("conversation-closed", "This conversation is no longer reachable for automatic peer replies.")
+        route_id = route.get("route_id") if isinstance(route, dict) else None
+        if not isinstance(route_id, str) or not 1 <= len(route_id) <= 512:
+            return None, ("conversation-closed", "Hermes returned an invalid conversation route; no message was sent.")
+        return route_id, None
+
     def _open_route(self, session_id):
         """This conversation's route as (route_id, state), or (None, (reason, text)) when there is none."""
         with self._lock:
@@ -114,15 +127,9 @@ class PeerTools:
                 return None, ("bridge-unavailable", "agent-peers plugin has been unloaded")
             # Hold our lock through lookup + registration: a host retirement
             # either makes lookup fail or marks this exact in-flight state closed.
-            try:
-                route = self.ctx.session_message_route(session_id)
-            except Exception:
-                return None, ("conversation-closed", "Hermes could not resolve this conversation; no message was sent.")
-            if not route:
-                return None, ("conversation-closed", "This conversation is no longer reachable for automatic peer replies.")
-            route_id = route.get("route_id") if isinstance(route, dict) else None
-            if not isinstance(route_id, str) or not 1 <= len(route_id) <= 512:
-                return None, ("conversation-closed", "Hermes returned an invalid conversation route; no message was sent.")
+            route_id, failure = self._route_id(session_id)
+            if failure:
+                return None, failure
             if route_id not in self._sessions and len(self._sessions) >= _MAX_ROUTES:
                 return None, ("inbox-unavailable", "agent-peers has too many active conversations; close one before sending.")
             state = self._sessions.setdefault(route_id, _RouteState(session_id))
@@ -144,9 +151,13 @@ class PeerTools:
         # back the names it claimed.
         params, opened = {}, None
         if session_id and self._supports_replies():
-            opened, _ = self._open_route(session_id)
+            opened, failure = self._open_route(session_id)
             if opened:
                 params = {"session": opened[0], "owner": session_id, "identity": self._identity(opened[0])}
+            elif failure[0] == "inbox-unavailable":
+                # At the route limit the listing still pins, but takes no names back.
+                route_id, _ = self._route_id(session_id)
+                params = {"session": route_id} if route_id else {}
         try:
             result = self._client().call("list_peers", params)
             if opened:
@@ -210,8 +221,10 @@ class PeerTools:
         full = self._full_name(name)
         if full is None:
             return _claim_result("invalid-request", f"{json.dumps(name[:200])} is not a claimed name; {_GRAMMAR}")
-        if method == "claim_name" and not full.startswith(f"hermes:{self.scope}/"):
-            return _claim_result("scope-denied", f"Names claimed in this Hermes profile are hermes:{self.scope}/<claim>, not {full}.", full)
+        if not full.startswith(f"hermes:{self.scope}/"):
+            return _claim_result("scope-denied", (
+                f"Names claimed in this Hermes profile are hermes:{self.scope}/<claim>, not {full}." if method == "claim_name" else
+                f"This Hermes profile releases only hermes:{self.scope}/<claim> names, not {full}."), full)
         if not session_id or not self._supports_replies():
             return _claim_result("no-session", "No conversation-addressed route is available, so this conversation cannot hold a name.", full)
         opened, failure = self._open_route(session_id)

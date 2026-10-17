@@ -99,7 +99,8 @@ export class HermesBridge {
     event("tool.request", fields);
     try {
       const result = await this.#request(method, params, operationId);
-      const failed = result.status === "failed" || result.status === "refused";
+      // A send Claude refused is a warning, as before; a refused claim or release failed.
+      const failed = result.status === "failed" || (named && result.status === "refused");
       event("tool.result", {
         ...fields, durationMs: performance.now() - started,
         outcome: failed ? "error" : result.note || isError(result.status) ? "warning" : "success",
@@ -217,7 +218,14 @@ export class HermesBridge {
       // The scope is the profile, enforced here as well as in the plugin.
       const parsed = parseName(name, "hermes");
       await this.#touch(session, params);
-      if (method === "release_name") return release(name, this.#claimant(session, owner, identity));
+      if (method === "release_name") {
+        // Not even a dead name of another profile: it may be one that profile takes back after a restart.
+        if (parsed.kind !== "hermes" || parsed.scope !== this.#profile) {
+          return claimRefusal("scope-denied", `This Hermes profile releases only hermes:${this.#profile}/<claim> names, not ${parsed.name}.`,
+            { name: parsed.name, kind: parsed.kind });
+        }
+        return release(name, this.#claimant(session, owner, identity));
+      }
       if (parsed.kind !== "hermes" || parsed.scope !== this.#profile) return claim(name, this.#claimant(session, owner, identity));
       return await this.#claimName(session, owner, identity, parsed.name);
     } catch (error) {

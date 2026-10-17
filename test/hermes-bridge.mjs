@@ -721,8 +721,10 @@ test("a claim is scoped to the bridge's Hermes profile and opens an inbox in eve
   writeFileSync(join(f.claude, "sessions", `${other.pid}.json`), JSON.stringify({ pid: other.pid, name: "other", messagingSocketPath: join(otherDir, "c.sock") }));
   const hermesSockets = () => [f.sockets, otherDir].flatMap((dir) => readdirSync(dir).filter((name) => name.startsWith("hermes-")));
   for (const name of ["hermes:gaming/relay", "codex:jd/relay"]) {
-    const denied = await named(f.bridge, "claim_name", "route-alpha", "conversation-alpha", name);
-    assert.deepEqual([denied.status, denied.reason], ["refused", "scope-denied"], name);
+    for (const method of ["claim_name", "release_name"]) {
+      const denied = await named(f.bridge, method, "route-alpha", "conversation-alpha", name);
+      assert.deepEqual([denied.status, denied.reason], ["refused", "scope-denied"], `${method} ${name}`);
+    }
   }
   assert.deepEqual(hermesSockets(), [], "a refused claim opens no inbox");
   const claimed = await named(f.bridge, "claim_name", "route-alpha", "conversation-alpha", "jd/relay");

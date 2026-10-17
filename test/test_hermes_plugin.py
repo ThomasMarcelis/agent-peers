@@ -117,6 +117,11 @@ def test_route_state_is_bounded_and_unloaded_calls_fail(monkeypatch):
     peers = plugin.PeerTools(Context())
     peers._sessions.update({"one": plugin._RouteState("a"), "two": plugin._RouteState("b")})
     assert "too many active" in peers.send_peer({"to": "x", "message": "body"}, session_id="chat-a")["error"]
+    # A listing at the limit still pins what this conversation saw, without opening a route.
+    peers._bridge = bridge = FakeBridge({"peers": []})
+    peers.list_peers({}, session_id="chat-a")
+    assert (bridge.calls[-1], len(peers._sessions)) == ({"session": "route-a"}, 2)
+    peers._bridge = None
     for index in range(5):
         peers.route_closed(route_id=str(index))
     assert len(peers._sessions) == 2
@@ -294,10 +299,12 @@ def test_claims_are_scoped_to_the_profile_and_need_a_live_route():
             assert (result["status"], result["reason"], result["error"]) == ("refused", reason, result["text"]), name
         for kwargs in ({"session_id": "missing"}, {}):
             assert peers.claim_name({"name": "relay"}, **kwargs)["reason"] == "no-session"
+        # Nor release one: a dead name in another profile may be one that profile takes back after a restart.
+        for name in ("hermes:gaming/relay", "codex:test-profile/x"):
+            assert peers.release_name({"name": name}, session_id="chat-a")["reason"] == "scope-denied", name
         assert len(bridge.calls) == calls, "the model can never choose another profile's scope"
-        # Anyone may release a claim whose holder stopped, so release takes any full name.
-        peers.release_name({"name": "hermes:gaming/relay"}, session_id="chat-a")
-        assert bridge.calls[-1]["name"] == "hermes:gaming/relay"
+        peers.release_name({"name": "relay"}, session_id="chat-a")
+        assert bridge.calls[-1]["name"] == "hermes:test-profile/relay"
     finally:
         peers.close()
 
