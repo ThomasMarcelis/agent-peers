@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-rc.3 — 2026-10-17
+
+Third release candidate for 1.0.0, on the npm `next` tag. Claimed names are now [experimental](docs/stability.md#experimental) and hardened after an independent review, and peer frames are reworded so Codex workers answer peers. To let a lead steer a headless Codex worker, put the [brief sentence](docs/compatibility.md#headless-codex-on-a-private-app-server) in the worker's brief. Changes since 1.0.0-rc.2:
 
 ### Changed
 

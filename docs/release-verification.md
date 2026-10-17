@@ -2,7 +2,7 @@
 
 Raw live transcripts are excluded from the repository and package.
 
-## Unreleased
+## 1.0.0-rc.3
 
 Verified on 2026-10-17 on Linux with Node 22.23.1, Claude Code 2.1.302 and Codex CLI 0.162.1.
 
