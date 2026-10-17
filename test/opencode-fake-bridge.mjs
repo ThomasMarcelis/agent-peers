@@ -62,6 +62,11 @@ const handle = async (message) => {
       write({ id: message.id, result: { text: JSON.stringify(answer), structuredContent: answer, isError: false } });
       return;
     }
+    if (mode === "host-missing") {
+      const answer = await request("host.session", { instance: message.params.instance, sessionID: "ses_missing" });
+      write({ id: message.id, result: { text: JSON.stringify(answer.error ?? answer.result), structuredContent: answer.error ?? answer.result, isError: true } });
+      return;
+    }
     write({ id: message.id, result: { text: "echo", structuredContent: { status: "failed", reason: "invalid-request" }, isError: true } });
     return;
   }

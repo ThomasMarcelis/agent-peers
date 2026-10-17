@@ -424,7 +424,7 @@ export function resolveClaim(to, { directory: preferred } = {}) {
     const [record] = found;
     if (!record) {
       throw new SendFailure("not-found", `No session has claimed ${parsed.name ?? `"${to}"`}. Its holder must claim it ` +
-        "(Claude: agent-peers claim; Codex or Hermes: claim_name). Nothing was sent.");
+        "(Claude: agent-peers claim; Codex, Hermes or opencode: claim_name). Nothing was sent.");
     }
     const holder = holderOf(record);
     if (!holder.running) {

@@ -68,7 +68,7 @@ Complete the [dependency setup and injection grant](docs/hermes.md). A Hermes co
 opencode **2.x** can load a plugin that exposes the same four tools, `list_peers`, `send_peer`, `claim_name` and `release_name`, with the same names and input schemas as Codex:
 
 ```sh
-opencode plugin add agent-peers
+opencode plugin add agent-peers@next
 ```
 
 Restart opencode after installation. The plugin registers the tools immediately and starts one bridge child per opencode server; every project location in that server shares it. A session becomes reachable after its first prompt or after its first tool call, even if it never calls agent-peers itself. After an opencode or bridge restart, its record is gone and it is unreachable until its next prompt or tool call; peers see a dead `opencode:` name as `not-running` until then.

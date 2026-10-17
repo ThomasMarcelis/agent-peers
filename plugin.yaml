@@ -1,6 +1,6 @@
 name: agent-peers
 version: "1.0.0-rc.6"
-description: "Discover and message local Claude Code and Codex sessions with private conversation reply inboxes."
+description: "Discover and message local Claude Code, Codex and opencode sessions with private conversation reply inboxes."
 manifest_version: 1
 license: MIT
 homepage: https://github.com/ThomasMarcelis/agent-peers

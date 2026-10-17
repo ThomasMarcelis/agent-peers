@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -69,7 +69,7 @@ function opencodeBinary() {
   const path = opencodeExecutable();
   if (!path) return { status: "warning", message: "opencode not found; install opencode 2.x to load the agent-peers plugin" };
   const result = spawnSync(path, ["--version"], { encoding: "utf8", timeout: 2000 });
-  const version = /v?(\d+\.\d+\.\d+)/.exec(String(result.stdout ?? result.stderr ?? ""));
+  const version = /v?(\d+\.\d+\.\d+)/.exec(String(result.stdout || result.stderr || ""));
   if (!version) return { status: "warning", message: `${path} did not report a version` };
   const major = Number(version[1].split(".")[0]);
   if (major < 2) return { status: "warning", message: `${path} is opencode ${version[1]}; agent-peers supports opencode 2.x only` };
@@ -82,7 +82,8 @@ function opencodeConfigPath(env = process.env) {
 
 function localPackageVersion(entry) {
   let directory;
-  try { directory = dirname(entry); } catch { return undefined; }
+  try { directory = statSync(entry).isDirectory() ? entry : dirname(entry); }
+  catch { try { directory = dirname(entry); } catch { return undefined; } }
   for (let depth = 0; depth < 8; depth++) {
     try {
       const pkg = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
@@ -95,22 +96,51 @@ function localPackageVersion(entry) {
   return undefined;
 }
 
-// The installed plugin package, resolved the way opencode's loader sees the config entry. A local
-// path is walked up to its package.json; a package name resolves from the config's directory.
+// The installed plugin package. A local path is walked up to its package.json; a package entry
+// checks the config-local node_modules, then opencode's npm cache. It never walks parent
+// node_modules and reports an unrelated global copy.
+function cachedOpencodePackageVersion(env = process.env) {
+  const home = env.HOME || homedir();
+  const cache = env.XDG_CACHE_HOME || join(home, ".cache");
+  const root = join(cache, "opencode", "npm");
+  let best;
+  try {
+    for (const key of readdirSync(root)) {
+      for (const generation of readdirSync(join(root, key))) {
+        const manifest = join(root, key, generation, "node_modules", "agent-peers", "package.json");
+        try {
+          const stat = statSync(manifest);
+          if (!best || stat.mtimeMs > best.mtime) {
+            const pkg = JSON.parse(readFileSync(manifest, "utf8"));
+            if (pkg?.name === "agent-peers" && typeof pkg.version === "string") best = { version: pkg.version, mtime: stat.mtimeMs };
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+  return best?.version;
+}
+
+const isLocalPluginEntry = (entry) =>
+  typeof entry === "string" && (entry.endsWith(".mjs") || entry.endsWith(".js") || entry.startsWith(".") || entry.startsWith("/"));
+
+function configuredPackageVersion(configPath) {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dirname(configPath), "node_modules", "agent-peers", "package.json"), "utf8"));
+    if (pkg?.name === "agent-peers" && typeof pkg.version === "string") return pkg.version;
+  } catch {}
+  return undefined;
+}
+
 function installedPluginVersion(entries, configPath) {
   for (const entry of entries) {
-    if (entry !== "agent-peers" && !entry.startsWith("agent-peers@") && !entry.endsWith(".mjs") && !entry.endsWith(".js") && !entry.startsWith(".") && !entry.startsWith("/")) continue;
-    if (entry.endsWith(".mjs") || entry.endsWith(".js") || entry.startsWith(".") || entry.startsWith("/")) {
-      const local = localPackageVersion(entry);
-      if (local) return local;
-      continue;
+    if (entry === "agent-peers" || entry.startsWith("agent-peers@")) {
+      return configuredPackageVersion(configPath) ?? cachedOpencodePackageVersion();
     }
-    try {
-      const require = createRequire(configPath);
-      const path = require.resolve("agent-peers/package.json");
-      const pkg = JSON.parse(readFileSync(path, "utf8"));
-      if (typeof pkg.version === "string") return pkg.version;
-    } catch {}
+    if (isLocalPluginEntry(entry)) {
+      const local = localPackageVersion(isAbsolute(entry) ? entry : join(dirname(configPath), entry));
+      if (local) return local;
+    }
   }
   return undefined;
 }
@@ -120,13 +150,14 @@ function opencodePlugin() {
   let config;
   try { config = JSON.parse(readFileSync(path, "utf8")); }
   catch (error) {
-    if (error.code === "ENOENT") return { status: "warning", message: `${path} is absent; install the plugin with "opencode plugin add agent-peers"` };
-    return { status: "warning", message: `${path} could not be read as JSON; install the plugin with "opencode plugin add agent-peers"` };
+    if (error.code === "ENOENT") return { status: "warning", message: `${path} is absent; install the plugin with "opencode plugin add agent-peers@next"` };
+    return { status: "warning", message: `${path} could not be read as JSON; install the plugin with "opencode plugin add agent-peers@next"` };
   }
   const plugins = Array.isArray(config?.plugins) ? config.plugins : [];
   const entries = plugins.map((entry) => Array.isArray(entry) ? entry[0] : entry).filter((entry) => typeof entry === "string");
-  const listed = entries.some((entry) => entry === "agent-peers" || entry.startsWith("agent-peers@"));
-  if (!listed) return { status: "warning", message: `agent-peers is not in ${path}'s plugins; run "opencode plugin add agent-peers"` };
+  const listed = entries.some((entry) => entry === "agent-peers" || entry.startsWith("agent-peers@") ||
+    (isLocalPluginEntry(entry) && localPackageVersion(isAbsolute(entry) ? entry : join(dirname(path), entry))));
+  if (!listed) return { status: "warning", message: `agent-peers is not in ${path}'s plugins; run "opencode plugin add agent-peers@next"` };
   const installed = installedPluginVersion(entries, path);
   if (!installed) return { status: "warning", message: `agent-peers is listed; its installed package version is unknown (CLI ${VERSION})` };
   if (installed !== VERSION) {

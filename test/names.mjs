@@ -613,7 +613,7 @@ test("file safety: unsafe, foreign or mismatched files are never read as claims;
 test("resolution: precise not-found and not-running texts, and the holder's inbox in the caller's directory", async (t) => {
   const f = fixture(t);
   assert.throws(() => resolveClaim(NAME), (error) => error.reason === "not-found" &&
-    error.message === "No session has claimed claude:proj/lead. Its holder must claim it (Claude: agent-peers claim; Codex or Hermes: claim_name). Nothing was sent.");
+    error.message === "No session has claimed claude:proj/lead. Its holder must claim it (Claude: agent-peers claim; Codex, Hermes or opencode: claim_name). Nothing was sent.");
   const gone = await f.session("gone");
   claim(NAME, gone.claimant());
   await gone.stop();

@@ -8,10 +8,10 @@
 // version-keyed globalThis handle. The child's stdin is its lifecycle: the last instance closes
 // it, and a killed server closes the pipe.
 
-import { spawn, spawnSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { claimRefusal } from "../src/names.mjs";
@@ -66,7 +66,8 @@ export class BridgeClient {
       if (text) log("bridge.stderr", { outcome: "failed", reason: "other" });
     });
     child.once("error", (error) => this.#exit(error));
-    child.once("exit", (code, signal) => this.#exit(Object.assign(new Error(`bridge exited (${code ?? signal})`), { code: "bridge-closed" })));
+    // "close" fires after the child's stdio is closed too, so no buffered response is lost.
+    child.once("close", (code, signal) => this.#exit(Object.assign(new Error(`bridge exited (${code ?? signal})`), { code: "bridge-closed" })));
     child.stdin.on("error", () => {});
     return this;
   }
@@ -115,18 +116,35 @@ export class BridgeClient {
     });
   }
 
-  request(method, params, timeoutMs = TOOL_TIMEOUT_MS) {
+  request(method, params, timeoutMs = TOOL_TIMEOUT_MS, { signal } = {}) {
     const id = `p-${++this.#sequence}`;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(pending.timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         this.#pending.delete(id);
-        reject(Object.assign(new Error(`the opencode bridge did not answer ${method}`), { code: "bridge-unavailable" }));
+        fn(value);
+      };
+      const onAbort = () => settle(reject, new BridgeUnavailable("the tool call was aborted after the request was written", "bridge-lost"));
+      const pending = {
+        resolve: (value) => settle(resolve, value),
+        reject: (error) => settle(reject, error),
+        timer: undefined,
+      };
+      pending.timer = setTimeout(() => {
+        settle(reject, Object.assign(new Error(`the opencode bridge did not answer ${method}`), { code: "bridge-timeout" }));
       }, timeoutMs);
-      this.#pending.set(id, { resolve, reject, timer });
+      if (signal?.aborted) return onAbort();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.#pending.set(id, pending);
       this.#write({ v: PROTOCOL, id, method, params }).catch((error) => {
-        clearTimeout(timer);
-        this.#pending.delete(id);
-        reject(new BridgeUnavailable(error?.message ?? "the opencode bridge is not running"));
+        settle(reject, new BridgeUnavailable(error?.message ?? "the opencode bridge is not running"));
       });
     });
   }
@@ -142,7 +160,7 @@ export class BridgeClient {
     await new Promise((resolve) => {
       if (!this.#child || this.#child.exitCode !== null) return resolve();
       const timer = setTimeout(() => { try { this.#child.kill("SIGKILL"); } catch {} resolve(); }, 2000);
-      this.#child.once("exit", () => { clearTimeout(timer); resolve(); });
+      this.#child.once("close", () => { clearTimeout(timer); resolve(); });
     });
   }
 
@@ -193,14 +211,19 @@ export function nodeCandidates(env = process.env) {
   const home = env.HOME || homedir();
   const candidates = [];
   if (env.AGENT_PEERS_NODE) candidates.push(env.AGENT_PEERS_NODE);
+  // Resolve PATH without a child process: this runs during plugin setup, so it must not block the
+  // opencode event loop.
   const onPath = (() => {
     try {
       if (typeof Bun !== "undefined" && typeof Bun.which === "function") return Bun.which("node");
     } catch {}
-    try {
-      const result = spawnSync("sh", ["-c", "command -v node"], { encoding: "utf8", timeout: 1000, env });
-      return result.status === 0 ? result.stdout.trim() : undefined;
-    } catch { return undefined; }
+    const name = process.platform === "win32" ? "node.exe" : "node";
+    for (const directory of String(env.PATH ?? "").split(delimiter)) {
+      if (!directory) continue;
+      const candidate = join(directory, name);
+      try { if (statSync(candidate).isFile()) return candidate; } catch {}
+    }
+    return undefined;
   })();
   if (onPath) candidates.push(onPath);
   const versioned = (root) => {
@@ -223,28 +246,49 @@ export function nodeCandidates(env = process.env) {
 }
 
 export function probeNode(path, env = process.env) {
-  try {
-    const result = spawnSync(path, ["--version"], { encoding: "utf8", timeout: 1000, env });
-    if (result.status !== 0) return undefined;
-    const match = /^v(\d+)\./.exec(String(result.stdout).trim());
-    return match && Number(match[1]) >= 22 ? path : undefined;
-  } catch { return undefined; }
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(path, ["--version"], { stdio: ["ignore", "pipe", "ignore"], env });
+    } catch {
+      resolve(undefined);
+      return;
+    }
+    let output = "", done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish(undefined);
+    }, 1000);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (data) => { output += data; });
+    child.once("error", () => finish(undefined));
+    child.once("close", (code) => {
+      const match = /^v(\d+)\./.exec(output.trim());
+      finish(code === 0 && match && Number(match[1]) >= 22 ? path : undefined);
+    });
+  });
 }
 
-export function findNode({ env = process.env, probe = probeNode } = {}) {
+export async function findNode({ env = process.env, probe = probeNode } = {}) {
   for (const candidate of nodeCandidates(env)) {
-    if (probe(candidate, env)) return candidate;
+    if (await probe(candidate, env)) return candidate;
   }
   throw new BridgeUnavailable(`no working Node 22+ executable found; ${HINT}`);
 }
 
 // Success is cached for the server lifetime. A failure is retried at most every 30 s, so a
 // missing Node never makes every tool call rerun the probes.
-export function cachedNode(state, { env = process.env, probe = probeNode, now = Date.now } = {}) {
+export async function cachedNode(state, { env = process.env, probe = probeNode, now = Date.now } = {}) {
   if (state.node) return state.node;
   if (state.nodeFailure && now() - state.nodeFailure.at < NODE_FAILURE_MS) throw new BridgeUnavailable(state.nodeFailure.message);
   try {
-    state.node = findNode({ env, probe });
+    state.node = await findNode({ env, probe });
     state.nodeFailure = undefined;
     return state.node;
   } catch (error) {
@@ -253,7 +297,7 @@ export function cachedNode(state, { env = process.env, probe = probeNode, now = 
   }
 }
 
-function commandFor(state, env) {
+async function commandFor(state, env) {
   const configured = state.options?.bridge_command;
   if (configured !== undefined) {
     if (!Array.isArray(configured) || !configured.length || configured.some((part) => typeof part !== "string" || !part)) {
@@ -261,7 +305,7 @@ function commandFor(state, env) {
     }
     return { command: configured[0], args: configured.slice(1) };
   }
-  const node = cachedNode(state, { env });
+  const node = await cachedNode(state, { env });
   return { command: node, args: [join(PACKAGE, "bin", "agent-peers.mjs"), "opencode-bridge"] };
 }
 
@@ -271,7 +315,7 @@ function ensureBridge(state) {
   state.starting = (async () => {
     if (!state.instances.size) throw new BridgeUnavailable("no opencode plugin instance is registered");
     const env = bridgeEnvironment();
-    const { command, args } = commandFor(state, env);
+    const { command, args } = await commandFor(state, env);
     const client = new BridgeClient({
       command, args, env,
       onRequest: (message) => hostRequest(state, message),
@@ -338,10 +382,10 @@ async function hostRequest(state, message) {
     const sessionID = message.params?.sessionID;
     if (typeof sessionID !== "string") throw Object.assign(new Error("sessionID is required"), { code: "invalid-request" });
     let value;
-    try { value = await target.ctx.session.get(sessionID); }
+    try { value = await target.ctx.session.get({ sessionID }); }
     catch (error) {
       throw Object.assign(new Error(error?.message ?? "the opencode host does not have this session"),
-        { code: hostErrorCode(error, "not-found") });
+        { code: hostErrorCode(error, "host-lost") });
     }
     const info = value?.session ?? value?.data ?? value;
     if (!info || info.id !== sessionID) throw Object.assign(new Error("the opencode host does not have this session"), { code: "not-found" });
@@ -360,23 +404,30 @@ async function hostRequest(state, message) {
       });
     } catch (error) {
       throw Object.assign(new Error(error?.message ?? "the opencode host refused the synthetic input"),
-        { code: hostErrorCode(error, "host-rejected") });
+        { code: hostErrorCode(error, "host-lost") });
     }
     return { admitted: true, delivery: delivery ?? "steer" };
   }
   throw Object.assign(new Error(`unknown host method ${String(message.method).slice(0, 80)}`), { code: "unknown-method" });
 }
 
-const isNotFound = (error) => /not.?found|no such session|session.*(?:does not exist|missing|deleted)/i.test(String(error?.message ?? ""));
+// opencode's protocol errors are tagged Effect errors. Classify them by tag; message matching
+// hid a wrong session.get call and would turn unrelated failures into "no session".
 function hostErrorCode(error, fallback) {
-  if (error?.code === "not-found" || isNotFound(error)) return "not-found";
-  if (error?.code === "too-large" || /too.?large/i.test(String(error?.message ?? ""))) return "too-large";
+  const tag = error?._tag ?? error?.tag;
+  if (tag === "SessionNotFoundError" || tag === "NotFoundError") return "not-found";
+  if (tag === "ConflictError" || tag === "SyntheticConflictError" || tag === "SessionBusyError" ||
+      tag === "InvalidRequestError" || tag === "MessageNotFoundError") return "host-rejected";
+  if (tag === "ServiceUnavailableError" || tag === "UnknownError" || tag === "AbortError") return "host-lost";
+  log("host.error", { outcome: "failed", reason: tag ? "other" : "unknown" });
   return fallback;
 }
 
-function toolsOf(ctx, instance) {
+async function toolsOf(ctx, instance) {
   if (!ctx?.tool?.transform) throw new Error("opencode v2 plugin context has no tool.transform");
-  ctx.tool.transform((editor) => {
+  // v2's transform is synchronous inside an async registration. Await the registration so setup
+  // does not finish (and opencode does not serve the agent) before the four tools exist.
+  await ctx.tool.transform((editor) => {
     for (const definition of Object.values(DEFINITIONS)) {
       editor.add({
         name: definition.name,
@@ -390,9 +441,9 @@ function toolsOf(ctx, instance) {
 
 function resultOf(text, structuredContent, isError) {
   // No output schema and no output key: opencode's tool runtime treats output on a schema-less
-  // tool as a defect. The model sees the first text; the second carries the structured result.
+  // tool as a defect. The model sees both text blocks: the human result and a JSON mirror.
   return {
-    content: [{ type: "text", text: String(text ?? "") }, { type: "text", text: JSON.stringify(structuredContent) }],
+    content: [{ type: "text", text: String(text ?? "") }, { type: "text", text: JSON.stringify(structuredContent ?? null) }],
     metadata: { structuredContent, isError: Boolean(isError) },
   };
 }
@@ -412,12 +463,14 @@ async function executeTool(instance, name, args, tool) {
     await helloInstance(state, client, instance);
   } catch (error) { return failure(name, "bridge-unavailable", `${error.message}; ${HINT}`); }
   try {
-    const result = await client.request("tool", { instance, name, sessionID: tool?.sessionID, args: args ?? {} });
+    const result = await client.request("tool", { instance, name, sessionID: tool?.sessionID, args: args ?? {} },
+      TOOL_TIMEOUT_MS, { signal: tool?.signal });
     return resultOf(result?.text, result?.structuredContent ?? null, result?.isError);
   } catch (error) {
-    // The request reached the bridge but its answer did not: a send may already have landed.
-    if (name === "send_peer" && error?.code === "bridge-lost") {
-      return resultOf("Delivery is unknown: the opencode bridge was lost after the request was written; it is not retried.",
+    // Once the request is written, a lost bridge, timeout or host abort leaves delivery unknown.
+    // A send that may have landed must not be retried by the model as a definite failure.
+    if (name === "send_peer" && ["bridge-lost", "bridge-timeout"].includes(error?.code)) {
+      return resultOf("Delivery is unknown: the opencode bridge did not confirm the send; it is not retried.",
         sendResult({ status: "unconfirmed", reason: "bridge-lost" }), false);
     }
     return failure(name, "bridge-unavailable", `the opencode bridge is unavailable: ${error.message}; ${HINT}`);
@@ -429,16 +482,30 @@ async function closeInstance(state, instance) {
   state.helloed.delete(instance);
   if (state.starting) await state.starting.catch(() => {});
   const client = state.client;
-  if (!client?.alive) return;
+  if (!client?.alive) {
+    if (state.instances.size === 0) {
+      state.options = undefined;
+      state.node = undefined;
+      state.nodeFailure = undefined;
+      state.helloed.clear();
+    }
+    return;
+  }
   try { client.notify("event", { instance, type: "closed" }); } catch {}
   if (state.instances.size === 0) {
     state.client = null;
     await client.stop();
+    // The last instance defines the server lifetime. A later instance reload may carry new
+    // options and must not reuse a stale Node success or a bridge_command from the old setup.
+    state.options = undefined;
+    state.node = undefined;
+    state.nodeFailure = undefined;
+    state.helloed.clear();
   }
 }
 
-// Event shapes differ slightly between opencode builds; only the four surfaces this plugin needs
-// are read. A prompt binds; deleted/moved unbind. closed is this plugin's own lifecycle event.
+// Event shapes differ slightly between opencode builds; only the surfaces this plugin needs are
+// read. A user prompt binds; deleted/moved unbind. Synthetic peer input does not bind or loop.
 export function forwardEvent(state, instance, event) {
   const type = event?.type ?? event?.event?.type;
   const data = event?.data ?? event?.event?.data ?? event?.properties ?? {};
@@ -446,32 +513,69 @@ export function forwardEvent(state, instance, event) {
   if (type === "session.deleted") forwarded = "deleted";
   else if (type === "session.moved") forwarded = "moved";
   else if (type === "session.inbox.enqueued" && data.item?.type === "user") forwarded = "prompt";
-  else if (type === "session.prompt") forwarded = "prompt";
   if (!forwarded || typeof data.sessionID !== "string") return;
   if (!state.instances.has(instance)) return;
+  // Never await bridge I/O inside the event stream: a slow bridge would overflow opencode's
+  // volatile event stream. It is enough to start the child and write the notification.
   void ensureBridge(state)
     .then((client) => client.notify("event", { instance, type: forwarded, sessionID: data.sessionID }))
     .catch((error) => log("bridge.event", { outcome: "failed", reason: error.code === "bridge-unavailable" ? "bridge_unavailable" : "other" }));
 }
 
+// opencode's EventDomain.subscribe returns an AsyncIterable, not a callback registration. Keep
+// one loop per plugin instance, abort it on cleanup, and resubscribe if the volatile stream ends.
+function subscribeEvents(state, instance, disposers) {
+  if (!state.instances.get(instance)?.ctx?.event?.subscribe) return;
+  const controller = new AbortController();
+  const loop = (async () => {
+    while (!controller.signal.aborted && state.instances.has(instance)) {
+      try {
+        const stream = state.instances.get(instance)?.ctx.event.subscribe({ signal: controller.signal });
+        for await (const event of stream) {
+          if (controller.signal.aborted || !state.instances.has(instance)) break;
+          forwardEvent(state, instance, event);
+        }
+        if (!controller.signal.aborted && state.instances.has(instance)) {
+          log("bridge.event", { outcome: "closed", reason: "stream-ended" });
+        }
+      } catch (error) {
+        if (controller.signal.aborted) break;
+        log("bridge.event", { outcome: "failed", reason: "stream" });
+      }
+      if (controller.signal.aborted || !state.instances.has(instance)) break;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  })();
+  disposers.push(async () => {
+    controller.abort();
+    await loop.catch(() => {});
+  });
+}
+
 export const plugin = {
   id: PLUGIN_ID,
-  // Registration happens synchronously, before the bridge is started: if Node or the bridge is
-  // missing the tools still exist and report bridge-unavailable.
-  setup(ctx) {
+  // Registration completes before the bridge is started: if Node or the bridge is missing the
+  // tools still exist and report bridge-unavailable.
+  async setup(ctx) {
     const state = handle();
     const instance = randomUUID();
     state.instances.set(instance, { ctx, location: normalizeLocation(ctx?.location) });
     const options = ctx?.options ?? {};
     if (state.options === undefined) state.options = options;
     else if (state.options.bridge_command === undefined && options.bridge_command !== undefined) state.options = { ...state.options, ...options };
-    toolsOf(ctx, instance);
-    const disposers = [];
-    if (ctx?.event?.subscribe) {
-      const off = ctx.event.subscribe((event) => forwardEvent(state, instance, event));
-      if (typeof off === "function") disposers.push(off);
-      else if (typeof off?.dispose === "function") disposers.push(() => off.dispose());
+    try {
+      await toolsOf(ctx, instance);
+    } catch (error) {
+      state.instances.delete(instance);
+      if (state.instances.size === 0) {
+        state.options = undefined;
+        state.node = undefined;
+        state.nodeFailure = undefined;
+      }
+      throw error;
     }
+    const disposers = [];
+    subscribeEvents(state, instance, disposers);
     // Start in the background. A missing Node leaves the tools registered.
     void ensureBridge(state)
       .then((client) => {
@@ -486,7 +590,7 @@ export const plugin = {
     return async () => {
       if (closed) return;
       closed = true;
-      for (const dispose of disposers) { try { dispose(); } catch {} }
+      for (const dispose of disposers) { try { await dispose(); } catch {} }
       await closeInstance(state, instance);
     };
   },

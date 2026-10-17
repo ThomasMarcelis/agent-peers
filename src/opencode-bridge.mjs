@@ -32,6 +32,11 @@ export const PROTOCOL_MAX_LINE = 4 * 1024 * 1024;
 const CONNECTION_MAX = 32, QUEUE_MAX = 50, QUEUE_BYTES_MAX = 8_000_000, DEFAULT_HOST_TIMEOUT_MS = 20_000;
 const START = processStart(process.pid);
 
+// bridge token -> root, for bridges in this process. A record owned by this pid/start is stale
+// only when its token is not in this map; another live bridge in the same process (tests, or a
+// future host that loads two plugin servers in one process) is never mistaken for stale.
+const liveBridges = new Map();
+
 const log = (event, fields = {}) => logEvent("opencode-bridge", event, fields);
 const code = (reason) => reason?.replaceAll("-", "_");
 const shortHash = (id) => createHash("sha256").update(id).digest("hex");
@@ -62,6 +67,10 @@ function slug(text) {
 const idle = (info) => {
   const time = info?.time;
   return Number.isFinite(time?.updated) && Number.isFinite(time?.idle) && time.idle >= time.updated;
+};
+const sameInode = (path, identity) => {
+  try { const stat = lstatSync(path); return stat.dev === identity.dev && stat.ino === identity.ino; }
+  catch { return false; }
 };
 
 // The plugin returns Session.Info; tolerate the SDK's small wrappers, but never guess a session.
@@ -117,15 +126,17 @@ export class OpencodeBridge {
   #sequence = 0;
   #definitions = loadToolDefinitions();
   #log;
+  #publishHook;
 
   constructor({ send = async () => ({ result: undefined }), log: logger = log, hostTimeoutMs = DEFAULT_HOST_TIMEOUT_MS,
-    admission = {}, queueMax = QUEUE_MAX, queueBytesMax = QUEUE_BYTES_MAX } = {}) {
+    admission = {}, queueMax = QUEUE_MAX, queueBytesMax = QUEUE_BYTES_MAX, publishHook } = {}) {
     this.#send = send;
     this.#log = logger;
     this.#hostTimeoutMs = hostTimeoutMs;
     this.#admissionOptions = admission;
     this.#queueMax = queueMax;
     this.#queueBytesMax = queueBytesMax;
+    this.#publishHook = publishHook;
     this.#receipts = new Receipts(this.#log);
   }
 
@@ -277,21 +288,39 @@ export class OpencodeBridge {
         await this.#unbind(root);
         root = undefined;
       }
-      // The room check and insertion are serialized across roots, so the cap is exact. Publishing
-      // happens outside the lock; a root being published is never an eviction candidate.
+      // Validate the deterministic path before evicting anything; a bad path must not cost
+      // another root its bind.
+      let socket;
+      try {
+        socket = opencodeSocket(rootID);
+        checkSocketPath(socket);
+      } catch (error) {
+        throw new BridgeError("inbox-unavailable", error?.message ?? "the opencode inbox path is unusable");
+      }
+      // Host reads for eviction happen before the room lock; the lock then re-checks the cap and
+      // only inserts, so a hung host never blocks every bind. Eviction itself uses the candidate
+      // root's bind task and never holds the room lock while waiting for it.
+      if (this.#roots.size >= ROOTS_MAX) {
+        for (const candidate of await this.#findEviction(rootID)) {
+          if (await this.#evictPrepared(candidate)) break;
+        }
+      }
       root = await this.#roomLock(async () => {
         if (this.#closed) throw new BridgeError("bridge-closed", "the opencode bridge is closing");
         const existing = this.#roots.get(rootID);
         if (existing) return existing;
-        if (this.#roots.size >= ROOTS_MAX) await this.#makeRoom(rootID);
+        if (this.#roots.size >= ROOTS_MAX) {
+          throw new BridgeError("inbox-unavailable",
+            `this agent-peers bridge already serves ${ROOTS_MAX} opencode sessions and none is idle without claimed names; ` +
+            "close idle sessions or release names, then retry");
+        }
         const again = this.#roots.get(rootID);
         if (again) return again;
-        const socket = opencodeSocket(rootID);
-        checkSocketPath(socket);
         const created = {
           sessionID: rootID, instance, name: opencodeName(rootID, info), cwd: info.location.directory, info,
           socket, address: address(socket), registry: registryPath(rootID), procStart: START,
           generation: generation("opencode", rootID, START), owner: generation("opencode", rootID), startedAt: Date.now(),
+          token: randomUUID(),
           lastActivity: Math.max(Date.now(), Number(info.time?.updated) || 0), inbox: undefined, closing: undefined,
           publishing: true, admission: new Admission(this.#admissionOptions), pins: new Pins(), chain: Promise.resolve(),
           queued: 0, queuedBytes: 0,
@@ -343,17 +372,21 @@ export class OpencodeBridge {
   // only after its bridge is confirmed dead. The record is read back after publishing, and again
   // after the inbox is created; the socket exists only while this bridge's record does.
   async #publish(root) {
-    ensurePrivateDir(peersHome());
     const record = {
       name: root.name, address: root.address, addresses: [root.address], cwd: root.cwd, threadId: root.sessionID,
-      pid: process.pid, procStart: root.procStart, generation: root.generation, startedAt: root.startedAt,
+      pid: process.pid, procStart: root.procStart, token: root.token, generation: root.generation, startedAt: root.startedAt,
     };
     const temporary = join(peersHome(), `.opencode-${randomUUID()}.json`);
-    let published = false;
+    let published = false, recordIdentity;
+    liveBridges.set(root.token, root);
     try {
+      ensurePrivateDir(peersHome());
       writeFileSync(temporary, JSON.stringify(record), { mode: 0o600, flag: "wx" });
-      const predecessor = this.#publishRecord(root, temporary);
+      const temporaryStat = lstatSync(temporary);
+      const publication = await this.#publishRecord(root, temporary, temporaryStat);
       published = true;
+      recordIdentity = publication;
+      const predecessor = publication.predecessor;
       if (!this.#owns(root)) throw new BridgeError("inbox-unavailable", "another bridge published this opencode session first; nothing was bound");
       let socketExists = false;
       try {
@@ -386,9 +419,11 @@ export class OpencodeBridge {
       }
       root.inbox = inbox;
     } catch (error) {
-      // Only this bridge's own published record is removed; a live owner's is never touched.
-      if (published && this.#owns(root)) rmSync(root.registry, { force: true });
-      throw error;
+      // Remove only the exact inode this bridge linked; a replacement record is never touched.
+      if (published && recordIdentity && sameInode(root.registry, recordIdentity)) rmSync(root.registry, { force: true });
+      if (liveBridges.get(root.token) === root) liveBridges.delete(root.token);
+      if (error instanceof BridgeError) throw error;
+      throw new BridgeError("inbox-unavailable", error?.message ?? "the opencode inbox could not be published");
     } finally {
       rmSync(temporary, { force: true });
     }
@@ -398,7 +433,7 @@ export class OpencodeBridge {
   // link(); a dead record is moved aside and only replaced if its inode is still the one read,
   // then the replacement is linked in, which cannot overwrite a record another bridge published
   // meanwhile. A conflict leaves the other record in place and refuses.
-  #publishRecord(root, temporary) {
+  async #publishRecord(root, temporary, identity) {
     for (let attempt = 0; attempt < 3; attempt++) {
       let existing, dev, ino, exists = false;
       try {
@@ -412,13 +447,23 @@ export class OpencodeBridge {
           throw new BridgeError("inbox-unavailable", "another process owns this opencode record and it cannot be verified; nothing was bound");
         }
       }
+      // Test hook: lets a deterministic test hold two binders between the read and the link.
+      if (this.#publishHook) await this.#publishHook({ root, existing, attempt });
       if (!exists) {
-        try { linkSync(temporary, root.registry); return false; }
+        try { linkSync(temporary, root.registry); }
         catch (error) { if (error.code === "EEXIST") continue; throw error; }
+        return { predecessor: false, dev: identity.dev, ino: identity.ino };
       }
       if (recordRunning(existing)) {
-        throw new BridgeError("inbox-unavailable",
-          "this opencode session is already served by another opencode server; stop the other server or let it exit, then retry");
+        const sameProcess = existing.pid === process.pid && String(existing.procStart) === String(root.procStart);
+        const liveOwner = sameProcess ? liveBridges.get(existing.token) : undefined;
+        const anotherLiveBridge = liveOwner && liveOwner !== root && !liveOwner.closing;
+        // This bridge's own live record may be replaced on a retry. A record from another live
+        // bridge in this process is not stale, even though pid and procStart match.
+        if (anotherLiveBridge || !sameProcess) {
+          throw new BridgeError("inbox-unavailable",
+            "this opencode session is already served by another opencode server; stop the other server or let it exit, then retry");
+        }
       }
       const aside = join(peersHome(), `.opencode-${randomUUID()}.json`);
       try { renameSync(root.registry, aside); }
@@ -445,7 +490,7 @@ export class OpencodeBridge {
         throw error;
       }
       try { rmSync(aside, { force: true }); } catch {}
-      return true;
+      return { predecessor: true, dev: identity.dev, ino: identity.ino };
     }
     throw new BridgeError("inbox-unavailable", "the opencode registry changed while this bridge was binding; nothing was bound");
   }
@@ -453,7 +498,7 @@ export class OpencodeBridge {
   #owns(root) {
     try {
       const entry = readPeerRecord(root.registry);
-      return entry.pid === process.pid && String(entry.procStart) === String(root.procStart) &&
+      return entry.pid === process.pid && String(entry.procStart) === String(root.procStart) && entry.token === root.token &&
         entry.threadId === root.sessionID && entry.generation === root.generation && entry.address === root.address;
     } catch { return false; }
   }
@@ -465,10 +510,18 @@ export class OpencodeBridge {
     let files;
     try { files = readdirSync(peersHome()); } catch { return; }
     for (const file of files.filter((name) => /^(?:\.opencode-[0-9a-f-]{36}|opencode-[A-Za-z0-9_-]+)\.json$/.test(name))) {
+      const path = join(peersHome(), file);
       try {
-        const entry = readPeerRecord(join(peersHome(), file));
+        const read = readPeerFile(path);
+        const entry = read.record;
         if (!validSessionId(entry.threadId) || recordRunning(entry)) continue;
         if (!file.startsWith(".") && file !== `opencode-${entry.threadId}.json`) continue;
+        // Re-check this exact inode before removing anything. Another server starting at the same
+        // time may have replaced the dead record after the read above.
+        const stillOurs = () => {
+          try { const stat = lstatSync(path); return stat.dev === read.dev && stat.ino === read.ino; }
+          catch { return false; }
+        };
         // A live registry for the same root owns the deterministic socket; an old aside copy must
         // not remove it.
         let liveRegistry = false;
@@ -479,11 +532,11 @@ export class OpencodeBridge {
         if (!liveRegistry) {
           const addresses = [entry.address, ...(Array.isArray(entry.addresses) ? entry.addresses.slice(0, 16) : [])];
           for (const addr of addresses) {
-            const path = peerSocket(addr);
-            if (path && basename(path) === expected) rmSync(path, { force: true });
+            const socket = peerSocket(addr);
+            if (socket && basename(socket) === expected && stillOurs()) rmSync(socket, { force: true });
           }
         }
-        rmSync(join(peersHome(), file), { force: true });
+        if (stillOurs()) rmSync(path, { force: true });
       } catch {}
     }
   }
@@ -515,39 +568,44 @@ export class OpencodeBridge {
     root.closing = (async () => {
       if (root.inbox) await closeInbox(root.inbox);
       try { if (this.#owns(root)) rmSync(root.registry, { force: true }); } catch {}
+      if (liveBridges.get(root.token) === root) liveBridges.delete(root.token);
       root.admission.clear();
       this.#log("inbox.unbound", { sessionId: logIdentity(root.sessionID), outcome: "closed" });
     })();
     return root.closing;
   }
 
-  // At the cap, only a root that is idle (time.idle is present and >= time.updated) and holds no
-  // claimed names is evictable. Eviction runs through the root's own bind task, re-checks before
-  // closing, and never touches a busy root. With no candidate, the new bind is refused.
-  async #makeRoom(incoming) {
+  // At the cap, only an idle root (time.idle is present and >= time.updated), with no claimed
+  // names and no queued delivery, is evictable. Host state is read outside the room lock; the
+  // candidate's own bind task performs the final re-check and close.
+  async #findEviction(incoming) {
     const candidates = [...this.#roots.values()].filter((root) => root.sessionID !== incoming && !root.closing && !root.publishing)
       .sort((a, b) => a.lastActivity - b.lastActivity);
-    for (const candidate of candidates) if (await this.#evict(candidate)) return;
-    throw new BridgeError("inbox-unavailable",
-      `this agent-peers bridge already serves ${ROOTS_MAX} opencode sessions and none is idle without claimed names; ` +
-      "close idle sessions or release names, then retry");
+    const prepared = [];
+    for (const candidate of candidates) {
+      if (candidate.queued > 0 || heldBy("opencode", candidate.generation).length) continue;
+      try {
+        const info = await this.#session(candidate.instance, candidate.sessionID);
+        if (idle(info)) prepared.push({ candidate, info });
+      } catch (error) {
+        // A session the host no longer has is safe to close; an unanswered host is not evidence.
+        if (error instanceof BridgeError && error.code === "not-found") prepared.push({ candidate, gone: true });
+      }
+    }
+    return prepared;
   }
 
-  #evict(candidate) {
+  #evictPrepared({ candidate, info, gone }) {
     const previous = this.#bindTasks.get(candidate.sessionID) ?? Promise.resolve();
     const task = previous.catch(() => {}).then(async () => {
       if (this.#roots.get(candidate.sessionID) !== candidate || candidate.closing) return false;
       if (this.#roots.size < ROOTS_MAX) return true;
-      let info;
-      try { info = await this.#session(candidate.instance, candidate.sessionID); }
-      catch (error) {
-        // A session the host no longer has is safe to close; an unanswered host is not evidence.
-        if (error instanceof BridgeError && error.code === "not-found") { await this.#unbind(candidate); return true; }
-        return false;
+      if (candidate.queued > 0 || heldBy("opencode", candidate.generation).length) return false;
+      if (!gone && !idle(info)) return false;
+      if (!gone) {
+        candidate.info = info;
+        candidate.lastActivity = Math.max(candidate.lastActivity, Number(info.time?.updated) || 0);
       }
-      if (!idle(info) || heldBy("opencode", candidate.generation).length) return false;
-      candidate.info = info;
-      candidate.lastActivity = Math.max(candidate.lastActivity, Number(info.time?.updated) || 0);
       await this.#unbind(candidate);
       this.#log("opencode.bind.cap", { sessionId: logIdentity(candidate.sessionID), outcome: "evicted" });
       return true;

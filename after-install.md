@@ -15,7 +15,7 @@ No profile permissions are changed automatically. The standalone Codex/Claude se
 Requires opencode **2.x** (tested against 2.0.32). Install the plugin and restart opencode:
 
 ```sh
-opencode plugin add agent-peers
+opencode plugin add agent-peers@next
 ```
 
 The plugin registers `list_peers`, `send_peer`, `claim_name` and `release_name` immediately. A session becomes reachable after its first prompt or its first tool call; after an opencode or bridge restart, its next prompt or tool call binds it again. Peers see a dead record as `not-running` until then.

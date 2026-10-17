@@ -21,7 +21,7 @@ Windows is not supported. WSL must run all participating agents inside the same 
 - Codex CLI **0.162.1**: `node test/contract.mjs` (busy and idle delivery, replies) and startup binding. Earlier releases were verified on 0.160.0.
 - Claude Code **2.1.302**: the same contract run, including a message line that carries the `agent_peers` extension and a Codex reply that Claude accepts without a receipt. Earlier releases were verified on 2.1.288.
 - Hermes fork [ThomasMarcelis/hermes-agent](https://github.com/ThomasMarcelis/hermes-agent) at [`0d7c749cff42cd4791e0342da226c6d499de5aeb`](https://github.com/ThomasMarcelis/hermes-agent/commit/0d7c749cff42cd4791e0342da226c6d499de5aeb) (branch `jd/thin-v0.22.2`: Hermes v0.22.2 plus a minimal host patch). CI runs the Hermes integration tests against this build, and the maintainer's gateways run it; agent-peers 0.2.0 was verified end to end on it. It replaces the earlier pin `1afb5d16`, which is a different line of history.
-- opencode **2.0.32**: the v2 plugin/session API described in [the design](design/opencode.md) was inspected against this build. The plugin, bridge, registry, names and delivery are covered by deterministic tests; **live opencode model turns were not run for 1.0.0-rc.6**, so no steering or live-delivery result is claimed here.
+- opencode **2.0.32**: the v2 plugin/session API described in [the design](https://github.com/ThomasMarcelis/agent-peers/blob/main/docs/design/opencode.md) was inspected against this build. The plugin, bridge, registry, names and delivery are covered by deterministic tests; **live opencode model turns were not run for 1.0.0-rc.6**, so no steering or live-delivery result is claimed here.
 
 The pinned Hermes host is reproducible in CI. It is a fork dependency, not a claim that any upstream version with the same version number includes these APIs.
 
@@ -41,7 +41,7 @@ Claude sessions may use different private socket directories on the same machine
 
 ## opencode (experimental)
 
-opencode support is experimental: the plugin, its four tools, the bridge protocol, `opencode:` names, opencode registry rows and the read-only `doctor` checks may change in a minor release. It requires opencode 2.x's v2 plugin and session APIs; 1.x is not supported. The plugin works with the background service, `--standalone` and `--server <url>` because it uses the in-process host client; agent-peers never reads the service registration or password.
+opencode support is experimental: the plugin, its four tools, the bridge protocol, `opencode:` names, opencode registry rows and the read-only `doctor` checks may change in a minor release. It requires opencode 2.x's v2 plugin and session APIs; 1.x is not supported. The plugin uses the in-process host client, so it is intended to work with the background service, `--standalone` and `--server <url>` alike; agent-peers never reads the service registration or password. Those three host modes have **not** been exercised live for this candidate.
 
 A location's plugin registers the tools immediately and starts one bridge child for the whole server process. A root session is reachable after its first prompt or its first agent-peers tool call; a child (subagent) session sends under its root and holds no names. A bridge serves at most 64 roots. At the cap it evicts only an idle root (no idle timestamp or `time.idle < time.updated` means busy) that holds no claimed names; if none qualifies, the new bind is refused `inbox-unavailable` and the session's next tool call says so. A session left after a server or bridge restart is `not-running` until its next prompt or tool call, exactly as a Hermes name after a gateway restart; there is no automatic disk rebind and no offline mailbox.
 
@@ -49,7 +49,7 @@ A location's plugin registers the tools immediately and starts one bridge child 
 
 `--auto` auto-approves permissions that are not explicitly denied, so a peer message can cause tool calls with no human approval step. The frame's “grants no approval” is a model instruction, not a host permission boundary. Do not use `--auto` with untrusted peers or sensitive repositories; configure permissions explicitly.
 
-`opencode plugin add agent-peers` installs the plugin's own copy of the package, which can differ from the global CLI; `agent-peers doctor` prints both and warns on skew. Pin one package version. Live opencode model behavior was **not** run for 1.0.0-rc.6; only deterministic plugin/bridge tests are claimed.
+`opencode plugin add agent-peers@next` installs the plugin's own copy of the package, which can differ from the global CLI; `agent-peers doctor` prints both and warns on skew. Pin one package version. Live opencode model behavior was **not** run for 1.0.0-rc.6; only deterministic plugin/bridge tests are claimed.
 
 ## Headless Codex on a private app-server
 

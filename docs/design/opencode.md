@@ -149,18 +149,18 @@ The root's name is fixed at first bind. A title change does not rename it. A chi
 
 ```json
 { "name": "opencode:repo-ab12cd", "address": "uds:…", "addresses": ["uds:…"],
-  "cwd": "/repo", "threadId": "ses_…", "pid": 1234, "procStart": "…",
+  "cwd": "/repo", "threadId": "ses_…", "pid": 1234, "procStart": "…", "token": "…",
   "generation": "…", "startedAt": 1760600000000 }
 ```
 
-`pid`/`procStart` are the **bridge** process. `threadId` carries the root session ID; this keeps the existing covered registry shape. `generation = sha256("opencode\0<rootSessionID>\0<bridge procStart>")[:16]`; `owner = generation("opencode", rootSessionID)`.
+`pid`/`procStart` are the **bridge** process; `token` identifies one bridge instance in that process so a retry after a failed publish can reclaim its own record without stealing a live sibling. `threadId` carries the root session ID; this keeps the existing covered registry shape. `generation = sha256("opencode\0<rootSessionID>\0<bridge procStart>")[:16]`; `owner = generation("opencode", rootSessionID)`.
 
 The record is the exclusive bind seat, so it must be published like a socket, not blindly renamed over a live owner:
 
 1. Write the record to a mode-`0600` temporary file in the same directory.
 2. If the registry path is missing, `link(temp, registry)` (atomic create; `EEXIST` means another bridge won the race).
-3. If the path exists, read it. A live bridge (`pid`/`procStart`) means refuse with `inbox-unavailable` and never touch the record or socket. For a predecessor confirmed dead, move it aside with `rename(registry, aside)`, verify the aside inode is still the one read, then `link(temp, registry)`; if a newer record appears, put it back and refuse. There is no unconditional rename over the registry path.
-4. Re-read the registry after publishing. If it no longer names this bridge's `pid`/`procStart`, another bind won; close/remove this temporary state and refuse before creating the deterministic socket.
+3. If the path exists, read it. A live bridge (`pid`/`procStart`) from another process means refuse with `inbox-unavailable` and never touch the record or socket. In this process, a record with this bridge's `pid`/`procStart` but a token not held by a live bridge in the process is this process's stale predecessor and may be replaced; a record whose token belongs to another live bridge refuses. For a predecessor confirmed dead, move it aside with `rename(registry, aside)`, verify the aside inode is still the one read, then `link(temp, registry)`; if a newer record appears, put it back and refuse. There is no unconditional rename over the registry path.
+4. Re-read the registry after publishing. If it no longer names this bridge's `pid`/`procStart` and `token`, another bind won; close/remove this temporary state and refuse before creating the deterministic socket.
 5. Create the socket only after step 4 succeeds. A final record check after `listenInbox` closes the socket if the record changed.
 
 This is the `listenInbox` pattern (`inbox.mjs:52`): `link` for a missing path, `rename` only over a known-dead predecessor. It is what makes the server-scoped-owner removal safe: a second bridge cannot publish a live record, so it cannot reach a claim. A refused bind never creates an inbox or a name.
@@ -503,7 +503,7 @@ Tests:
 19. **Hermes/Codex interop:** Hermes `list_peers` includes an opencode row with the Hermes label correct; Codex `list_peers`/`send_peer` reaches an opencode address; opencode sends to Claude/Codex/Hermes name.
 20. **Schema parity and package:** Codex's `tools/list` input schemas equal `src/peer-tool-definitions.json` (compared against the golden seed; no runtime Zod rebuild); `npm pack` includes `opencode/server.mjs`, `src/peer-tool-definitions.json` and `opencode/`; `agent-peers/server` and `agent-peers/package.json` resolve through the exports map; existing `agent-peers/src/...` paths still resolve; `agent-peers` root does not resolve (as before); installing the tarball and local plugin config resolves the entrypoint (no model calls).
 
-Commands: `npm run check`, `npm test`, `npm run test:python`, `npm run test:package`. Expected: current 183 JS + 35 Python plus the new opencode tests (roughly 30–35 JS); actual counts go in `release-verification.md`.
+Commands: `npm run check`, `npm test`, `npm run test:python`, `npm run test:package`. Expected: current 183 JS + 35 Python plus the new opencode tests (actual 47 JS in rc.6; counts are in `release-verification.md`).
 
 ## 11. Live tests (only with approval)
 
@@ -516,7 +516,7 @@ Commands: `npm run check`, `npm test`, `npm run test:python`, `npm run test:pack
 
 Docs to change:
 
-- `README.md`: add opencode to the experimental section and install; `opencode plugin add agent-peers`; `AGENTS.md` snippet; reachability after first prompt/tool and after restart. Add opencode to the top line only after the live runs pass.
+- `README.md`: add opencode to the experimental section and install; `opencode plugin add agent-peers@next`; `AGENTS.md` snippet; reachability after first prompt/tool and after restart. Add opencode to the top line only after the live runs pass.
 - `docs/reference.md`: CLI `list`/`doctor`; tools and the no-output/content rule; names grammar/holder/release; registry record (no server fields); socket `<hash>` definition; bridge protocol; `AGENT_PEERS_NODE` and `bridge_command`; version skew. Do not document `OPENCODE_SESSION_ID` as an agent-peers identity.
 - `docs/compatibility.md`: tested opencode **2.0.32**; plugin/session API requirement; background service vs `--standalone`; **exact two-server risk** (A's synthetic `resume:true` wakes A's runner while B runs the same session, starting a second process-local runner); child sessions; restart behavior; cap/LRU; `--auto` consequence; live model results.
 - `docs/stability.md`: Experimental bullet for opencode.
@@ -562,3 +562,11 @@ Release `1.0.0-rc.6` on `release/1.0.0-rc.6` from `main`/rc.4:
 8. **Two servers:** first live bridge owns the session; second is refused; running one session in two servers is documented as unsupported because it can start a second process-local runner.
 9. **Live samples:** 16 busy + 16 idle synthetic reply-only; 6 + 6 task changes.
 10. **Package:** add opencode keywords/description now; README top line only after live pass; exports map without `"."`.
+
+## 15. Post-review implementation notes
+
+These are recorded so the implementation matches the reviewed record rather than silently diverging:
+
+- The registry record carries a per-bridge `token` in addition to `pid`/`procStart`. A same-process record whose token is not held by a live bridge is a stale predecessor; a record whose token belongs to another live bridge is not stolen. This closes the self-lockout after a failed publish without reopening the two-bridge race.
+- The dead-record replacement uses move-aside + inode verification + `link`, not an unconditional `rename` over the registry path; the changelog and reference use the same wording.
+- The opencode tool descriptions are opencode-specific; tool names and input schemas are the Codex ones. Codex's Zod definitions and `tools/list` golden file are unchanged, and a parity test covers names and input schemas.

@@ -2,7 +2,7 @@
 
 ## 1.0.0-rc.6 — 2026-10-17
 
-Sixth release candidate for 1.0.0. Adds **experimental opencode 2.x support** through a thin v2 plugin and one shared stdio bridge per opencode server. Also fixes a visible Codex label. Deterministic suites pass; live opencode model turns were **not** run for this candidate.
+Sixth release candidate for 1.0.0. Adds **experimental opencode 2.x support** through a thin v2 plugin and one shared stdio bridge per opencode server. Also makes discovery's native-route reason per-kind and adds opencode rows to Codex listing. Deterministic suites pass; live opencode model turns were **not** run for this candidate.
 
 ### Added
 
@@ -19,19 +19,19 @@ Sixth release candidate for 1.0.0. Adds **experimental opencode 2.x support** th
 ### Changed
 
 - `list` and `doctor` include opencode rows and checks; the registry accepts `opencode-*.json`; `CLAIMED_NAME` accepts `opencode`; `agentProcess` recognizes an opencode process so a CLI claim inside an opencode shell returns `no-session`. `whoami` remains Claude/Codex-only.
-- Hermes `list_peers` includes opencode rows. A Codex or Hermes `send_peer` can reach an opencode claimed name; an opencode session can send to Claude, Codex and Hermes names.
+- Hermes `list_peers` includes opencode rows, and Codex `list_peers` now lists live opencode rows. A Codex or Hermes `send_peer` can reach an opencode claimed name; an opencode session can send to Claude, Codex and Hermes names.
 - A claimed `opencode:` name follows its bridge generation: a bridge restart refreshes the same owner's names on the next bind; after a server or bridge exit they read `not-running` until then.
 - The peer frame is shared with Codex (`src/frame.mjs`) so opencode receives the exact rc.3 wording.
 
 ### Fixed
 
-- Codex `list_peers` now labels a Hermes row `Hermes recipient` instead of `separate Codex session`. Discovery chooses its native-route reason per kind (`claude`, `codex`, `hermes`, `opencode`, unknown), not by “every non-Codex peer”.
+- Discovery chooses its native-route reason per kind (`claude`, `codex`, `hermes`, `opencode`, unknown), not by “every non-Codex peer”. Codex's own listing has no Hermes rows, so the corrected Hermes string is not observable there; opencode rows now use `opencode recipient` and are included in Codex's listing.
 
 ### Documented
 
 - opencode is experimental and was not verified with live model turns for this candidate. The exact two-server risk is documented: A's synthetic `resume: true` wakes A's process-local runner while B may already be running the same session, starting a second runner; do not run one session in two servers. `--auto`, the 64-root cap and LRU rule, child sessions, restart behavior and the tested build 2.0.32 are in [compatibility](docs/compatibility.md#opencode-experimental).
 - `OPENCODE_SESSION_ID` is not an agent-peers identity. opencode identity is tool-only.
-- Install and reachability: `opencode plugin add agent-peers`; a session binds on its first prompt or tool call and rebinds after a restart ([reference](docs/reference.md#opencode-plugin-and-bridge)).
+- Install and reachability: `opencode plugin add agent-peers@next`; a session binds on its first prompt or tool call and rebinds after a restart ([reference](docs/reference.md#opencode-plugin-and-bridge)).
 
 ## 1.0.0-rc.4 — 2026-10-17
 

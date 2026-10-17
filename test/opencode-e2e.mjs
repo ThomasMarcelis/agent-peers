@@ -20,11 +20,49 @@ function context(dir, host) {
     options: { bridge_command: [process.execPath, bridge, "opencode-bridge"] },
     tools: [], synth: [],
     session: {
-      get: async (id) => { const info = host.sessions.get(id); if (!info) throw new Error("session not found"); return info; },
+      get: async ({ sessionID } = {}) => {
+        const info = host.sessions.get(sessionID);
+        if (!info) throw Object.assign(new Error(`session ${sessionID} not found`), { _tag: "SessionNotFoundError", sessionID });
+        return info;
+      },
       synthetic: async (params) => { ctx.synth.push(params); return { admitted: true }; },
     },
-    tool: { transform(fn) { const tools = []; fn({ add: (definition) => tools.push(definition) }); ctx.tools = tools; } },
-    event: { subscribe(fn) { ctx.emit = (event) => fn(event); return () => {}; } },
+    tool: {
+      transform(fn) {
+        const tools = [];
+        fn({ add: (definition) => tools.push(definition) });
+        ctx.tools = tools;
+        return Promise.resolve({ dispose() {} });
+      },
+    },
+    event: {
+      subscribe({ signal } = {}) {
+        let queue = [], waiting = [], ended = false;
+        const close = () => {
+          if (ended) return;
+          ended = true;
+          for (const resolve of waiting) resolve({ done: true, value: undefined });
+          waiting = [];
+        };
+        signal?.addEventListener("abort", close, { once: true });
+        if (signal?.aborted) close();
+        const iterator = {
+          next() {
+            if (queue.length) return Promise.resolve({ done: false, value: queue.shift() });
+            if (ended) return Promise.resolve({ done: true, value: undefined });
+            return new Promise((resolve) => waiting.push(resolve));
+          },
+          return() { close(); return Promise.resolve({ done: true, value: undefined }); },
+        };
+        ctx.emit = (event) => {
+          if (ended) return;
+          const waiter = waiting.shift();
+          if (waiter) waiter({ done: false, value: event });
+          else queue.push(event);
+        };
+        return { [Symbol.asyncIterator]() { return iterator; } };
+      },
+    },
   };
   return ctx;
 }
@@ -35,8 +73,8 @@ test("the real plugin and bridge list, claim, send, receive and clean up through
   host.add(session({ id: "ses_root", directory: join(f.dir, "repo"), title: "Root", updated: 1, idle: 1 }));
   host.add(session({ id: "ses_two", directory: join(f.dir, "repo-two"), title: "Two", updated: 1, idle: 1 }));
   const first = context(f.dir, host), second = context(f.dir, host);
-  const closeFirst = plugin.setup(first);
-  const closeSecond = plugin.setup(second);
+  const closeFirst = await plugin.setup(first);
+  const closeSecond = await plugin.setup(second);
   t.after(async () => {
     await closeFirst(); await closeSecond();
     delete globalThis[KEY];
@@ -90,7 +128,7 @@ test("a staged revert through the real bridge drops host-rejected and leaves the
   const info = host.add(session({ id: "ses_root", directory: join(f.dir, "repo"), updated: 1, idle: 1 }));
   info.revert = { messageID: "staged" };
   const ctx = context(f.dir, host);
-  const close = plugin.setup(ctx);
+  const close = await plugin.setup(ctx);
   t.after(async () => { await close(); delete globalThis[KEY]; });
   const listed = await ctx.tools[0].execute({}, { sessionID: "ses_root" });
   const self = listed.metadata.structuredContent.self;

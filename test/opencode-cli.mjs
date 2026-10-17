@@ -72,7 +72,7 @@ test("list shows opencode rows and the OpenCode bridge route, and doctor reports
   writeFileSync(join(installed, "package.json"), JSON.stringify({ name: "agent-peers", version: "1.0.0-rc.6" }));
   const env = { ...f.env, PATH: `${bin}:${process.env.PATH}` };
   const doctor = await run(["doctor", "--json"], env);
-  assert.equal(doctor.status, 0, doctor.stderr);
+  assert.equal(doctor.status, 0, `${doctor.stdout}\n${doctor.stderr}`);
   const checks = Object.fromEntries(JSON.parse(doctor.stdout).checks.map((check) => [check.name, check]));
   assert.equal(checks["opencode binary"].status, "ok");
   assert.match(checks["opencode binary"].message, /2\.0\.32/);

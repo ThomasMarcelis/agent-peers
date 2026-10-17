@@ -12,7 +12,19 @@ import { VERSION } from "../src/version.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const definitions = JSON.parse(readFileSync(join(root, "src", "peer-tool-definitions.json"), "utf8"));
+const golden = JSON.parse(readFileSync(join(root, "test", "fixtures", "codex-tools.json"), "utf8"));
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+
+test("Codex's tools/list is unchanged from the rc.4 surface", async (t) => {
+  const client = new Client({ name: "tools-golden", version: "1.0.0" });
+  t.after(() => client.close());
+  await client.connect(new StdioClientTransport({
+    command: process.execPath, args: [join(root, "src", "codex-peer.mjs")],
+    env: { ...process.env, AGENT_PEERS_CODEX_APP_SERVER: join(root, "missing.sock") }, stderr: "pipe",
+  }));
+  const { tools } = await client.listTools();
+  assert.deepEqual(tools, golden);
+});
 
 test("Codex's tools/list input schemas equal src/peer-tool-definitions.json", async (t) => {
   const client = new Client({ name: "schema-parity", version: "1.0.0" });
@@ -48,7 +60,7 @@ test("the package exports ./server, ./package.json and ./*, and never the packag
 test("the plugin definition exposes no output schema and keeps the two text blocks contract", () => {
   const server = readFileSync(join(root, "opencode", "server.mjs"), "utf8");
   assert.match(server, /Symbol\.for\("agent-peers\.opencode\.bridge\.v1"\)/);
-  assert.match(server, /return \{[^}]*content: \[\{ type: "text", text: String\(text \?\? ""\) \}, \{ type: "text", text: JSON\.stringify\(structuredContent\) \}\],/s);
+  assert.match(server, /return \{[^}]*content: \[\{ type: "text", text: String\(text \?\? ""\) \}, \{ type: "text", text: JSON\.stringify\(structuredContent \?\? null\) \}\],/s);
   assert.doesNotMatch(server, /^\s*output:/m);
   for (const definition of Object.values(definitions)) {
     assert.equal("output" in definition, false, `${definition.name} has no output`);

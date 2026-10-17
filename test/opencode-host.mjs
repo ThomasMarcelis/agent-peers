@@ -115,10 +115,10 @@ export class FakeHost {
         // A late notice: no wake, and never a commit.
       } else if (info.revert) {
         info.wakesSuppressed++;
-      } else if (Number.isFinite(info.time.idle) && info.time.idle >= info.time.updated) {
-        info.wakes++;
       } else {
-        info.steers++;
+        // session.synthetic wakes unless resume:false or a revert is staged. It does not choose
+        // wake vs steer from the idle timestamp; the runner coalesces or steers a busy session.
+        info.wakes++;
       }
       return { v: 1, id: message.id, result: { admitted: true, delivery: message.params.delivery ?? "steer" } };
     }
@@ -135,7 +135,7 @@ export class FakeHost {
   count(method) { return this.calls.filter((call) => call.method === method).length; }
 }
 
-export function bridgeFor(host, { instance = "i-1", location = { directory: "/tmp" }, timeoutMs = 500, admission, queueMax, queueBytesMax } = {}) {
+export function bridgeFor(host, { instance = "i-1", location = { directory: "/tmp" }, timeoutMs = 500, admission, queueMax, queueBytesMax, publishHook } = {}) {
   const logs = [];
   const bridge = new OpencodeBridge({
     send: (message) => Promise.race([
@@ -147,6 +147,7 @@ export function bridgeFor(host, { instance = "i-1", location = { directory: "/tm
     ...(admission ? { admission } : {}),
     ...(queueMax === undefined ? {} : { queueMax }),
     ...(queueBytesMax === undefined ? {} : { queueBytesMax }),
+    ...(publishHook ? { publishHook } : {}),
   });
   bridge.hello({ instance, location });
   return { bridge, logs };
