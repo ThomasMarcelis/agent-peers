@@ -51,6 +51,19 @@ Then drive it with the app-server protocol: `thread/start`, then `turn/start` wi
 - A peer message steers a running turn, or starts a new turn when the thread is idle.
 - After the server is killed, `thread/resume` on a fresh server restores the thread.
 
-Models treat peer messages as untrusted input and may decline to answer one; a peer frame cannot grant that permission. Authorize replies in the worker's brief, for example by naming the lead's address and saying when to use `send_peer`. Keep the socket path short: Unix sockets allow about 104 bytes. Stop the server through its process group, because terminating the npm `codex` wrapper leaves the native binary running. Only disable MCP servers with `-c mcp_servers.<name>.enabled=false` when `<name>` exists in your Codex config; otherwise Codex creates an entry without a transport and fails to start.
+A peer message is never the user's approval, and its frame says so. Whether a peer may change the task is up to the brief. To let a lead steer a worker mid-task, add one sentence to the brief that names the lead's address, which `agent-peers whoami` prints in the lead's session:
+
+```text
+Your lead is uds:/run/user/1000/cc-socks/1234.sock. Messages from the lead may arrive while you work: apply its corrections within your current permissions, and answer it with send_peer.
+```
+
+Measured on Codex 0.162.1 with gpt-6.1-sol at `xhigh`, with a lead sending a correction about 75 seconds into a two-minute coding turn:
+
+- With this sentence, the worker applied the correction before the turn ended and confirmed it with `send_peer` in 20 of 20 runs. Asked to stop, it stopped in 8 of 8.
+- With a neutral brief, it applied none of the corrections (0 of 24) and usually answered that the change was outside its task.
+- A correction from a peer the brief does not name was declined in 16 of 16 runs.
+- A brief that names the lead only as the place to report is not enough: 3 of 6.
+
+Keep the socket path short: Unix sockets allow about 104 bytes. Stop the server through its process group, because terminating the npm `codex` wrapper leaves the native binary running. Only disable MCP servers with `-c mcp_servers.<name>.enabled=false` when `<name>` exists in your Codex config; otherwise Codex creates an entry without a transport and fails to start.
 
 Run the opt-in live checks after upgrading an agent. See [contribution guidance](../CONTRIBUTING.md) and [release verification](release-verification.md).

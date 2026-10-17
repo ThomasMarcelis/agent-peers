@@ -183,7 +183,7 @@ The plugin sends one notification, an id-less line with no response: `delivery_r
 
 `peer_message` notifications identify the private session, message ID, sender name, reply address (`from`), body and optional `in_reply_to`. Hermes creates no public registry entry. EOF and termination remove owned sockets. Standard output carries protocol data only; diagnostics go to standard error.
 
-Messages use Claude's `<cross-session-message>` envelope. Incoming agent input is reframed as `<peer_message from="…" reply_to="…" id="…" in_reply_to="…">`, with a reminder that it carries no user approval. Closing tags in message bodies are escaped. A frame is bounded to 1,000,000 bytes. Resource bounds, per-sender token buckets and duplicate-id suppression limit accidental floods; see the source constants for precise limits.
+Messages use Claude's `<cross-session-message>` envelope. Incoming agent input is reframed as `<peer_message from="…" reply_to="…" id="…" in_reply_to="…">`, with a reminder that it carries no user approval. A Codex frame also says that it comes from another agent, not the user, and that the brief decides whether a peer may adjust the task ([steering a worker](compatibility.md#headless-codex-on-a-private-app-server)). Closing tags in message bodies are escaped. A frame is bounded to 1,000,000 bytes. Resource bounds, per-sender token buckets and duplicate-id suppression limit accidental floods; see the source constants for precise limits.
 
 ## Troubleshooting
 

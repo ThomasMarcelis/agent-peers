@@ -161,7 +161,7 @@ Principles (from the maintainer): (1) one session or conversation claims a name 
 - **Same-user scope.** The registry is advisory, as Claude's is: any process running as the same user can write it, and that is not a boundary (SECURITY.md). Validation limits a forged record to pointing at a live session of the stated kind, through a socket that `peerSocket` already permits, so it adds no new destinations.
 - **Kind binding.** The tools refuse a claim whose kind differs from the claimant's kind. Hermes's profile scope is enforced twice: in the plugin, from `ctx.profile_name`, and in the bridge, through `--hermes-profile`. A conversation in profile `casa` can never claim `hermes:gaming/…`.
 - **Project isolation within one profile.** Separate projects in one profile stay apart by owner. Conversation A can never take B's live name. Reaching another project takes its exact full name, which is a deliberate act, and there is no broadcast or fallback path at all.
-- **Names are not authority.** A claim grants nothing: frames still say "peer input, not user approval", host approval and held-message rules are unchanged, and a name found in a peer message is data, never an instruction to contact it.
+- **Names are not authority.** A claim grants nothing: frames still say a peer message is not the user's approval, host approval and held-message rules are unchanged, and a name found in a peer message is data, never an instruction to contact it.
 - **Logging and bounds.** Logs record name identities as hashes (`logIdentity`), never raw names. Claims are bounded by the caps in §3.
 
 ## 9. Migration from current names
