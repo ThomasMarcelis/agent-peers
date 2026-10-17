@@ -16,7 +16,14 @@ Verified on 2026-10-17 on Linux with Node 22.23.1, opencode 2.0.32, Claude Code 
   - **Three-host run (`--trio`, before the review round): passed.** Claude Code on `claude-haiku-5-5` (`claude -p`), Codex on `gpt-6-luna` (private app-server with codex-peer) and opencode on `deepseek/deepseek-flash`, with no other participants. Each session discovered the other two. All six directed request/reply routes were delivered and answered (Claude→Codex, Claude→opencode, Codex→Claude, Codex→opencode, opencode→Claude, opencode→Codex) within 28 s of the combined turn; sends to Claude reported `unconfirmed`/`no-receipt`, the normal Claude result, and sends to Codex and opencode `accepted`. Codex reached the claimed `opencode:trio-<nonce>/oc` by name. Model turns: Claude 4, Codex 1, opencode 4; no permission approvals were needed. On one route (Codex→Claude) the PING text was not seen verbatim in Claude's stream; its PONG proves delivery.
 - **Not run:** the design's 16+16 busy/idle and 6+6 task-change opencode steering runs (kept minimal by the maintainer's choice; `--steering` exists in the harness), the two-server run, an opencode participant in `test/live-matrix.mjs`, and the background service, `--standalone` and TUI host modes. No opencode steering rate is claimed. Token cost of the live runs was not measured.
 - Independent review: an Opus reviewer and a Codex `gpt-6-astra` reviewer read the whole change from rc.4 read-only, and both said fix first. Their confirmed findings are fixed with the regressions above; the remaining ones are documented in [compatibility](compatibility.md#opencode-experimental) and the design's §15.
-- The candidate is on `release/1.0.0-rc.7` (PR #35); no tag, GitHub release or npm publish yet.
+- Published from CI to npm `next` after merge (#35) and tag `v1.0.0-rc.7`.
+- **Background service, after publishing.** The published package, extracted from the npm tarball and checked byte-identical to `main`, was installed as a local plugin directory on the maintainer's opencode 2.0.32 background service, and the service was restarted. `doctor` reported the plugin listed with installed 1.0.0-rc.7. With three locations loaded (two scratch directories and a real project in use), on `deepseek/deepseek-flash`:
+  - the bridge child ran as a child of `opencode serve --service`;
+  - each session bound through its own location, and `list_peers` and `claim_name` were called directly;
+  - the bind tokens of the other two sessions were unchanged after a prompt in the third location, which is the multi-location rebind the review round fixed;
+  - a Claude Code `SendMessage` to an idle session whose `opencode run` had already exited woke it, and it answered with `send_peer` and `in_reply_to`; no approval was needed;
+  - a claimed `opencode:` name resolved from the CLI, and `agent-peers list` showed all three sessions.
+  A service restart rebind was not repeated on the service, because a real session was active; it passed on the private server.
 
 ## 1.0.0-rc.4
 
