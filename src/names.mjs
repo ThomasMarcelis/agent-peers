@@ -161,6 +161,8 @@ function swap(file, expected, next) {
 }
 
 // One result for claims and releases: status is claimed, refreshed, taken-over, released or refused.
+// `generation` and `address` are the holder after the call (the claimant, or null); `previous` is
+// the record that was there.
 export const claimResult = (status, fields = {}) => ({ status, reason: null, name: null, kind: null, generation: null, address: null,
   previous: null, text: "", ...fields });
 export const claimRefusal = (reason, text, fields = {}) => claimResult("refused", { ...fields, reason, text });
@@ -199,7 +201,7 @@ export function claim(text, claimant) {
       const previous = record ? previousOf(record) : null;
       if (record && !ours && previous.running) {
         return claimRefusal("name-held", `${parsed.name} is held by ${previous.holder}, which is running; only its holder can release it.`,
-          { ...fields, generation: record.generation, previous });
+          { ...fields, previous });
       }
       if (!ours && scan().filter((r) => r.owner === claimant.owner && r.name !== parsed.name).length >= NAMES_PER_OWNER) {
         return claimRefusal("too-many-names", `This session already holds ${NAMES_PER_OWNER} names; release one before claiming another.`, fields);
@@ -235,12 +237,12 @@ export function release(text, claimant, kind = claimant?.kind) {
       const previous = record ? previousOf(record) : null;
       if (record && !ours && previous.running) {
         return claimRefusal("not-holder", `${parsed.name} is held by ${previous.holder}, which is running; only its holder can release it.`,
-          { ...fields, generation: record.generation, previous });
+          { ...fields, previous });
       }
       const outcome = swap(file, current, undefined);
       if (outcome === "retry") continue;
       if (outcome === "conflict") break;
-      return claimResult("released", { ...fields, generation: record?.generation ?? null, previous, text: `Released ${parsed.name}.` });
+      return claimResult("released", { ...fields, previous, text: `Released ${parsed.name}.` });
     }
     return claimRefusal("conflict", `${parsed.name} changed while this release ran; nothing was removed. Try again.`, fields);
   });

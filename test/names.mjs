@@ -184,7 +184,8 @@ test("the conflict table: dead and reused holders are taken over, the same owner
   assert.equal(claim(name, live.claimant()).text, `${name} already names this session.`, "an unchanged refresh writes nothing");
   // A running holder with another owner is always refused.
   const held = claim(name, f.me());
-  assert.deepEqual([held.status, held.reason, held.previous.holder, held.previous.running], ["refused", "name-held", "claude:live", true]);
+  assert.deepEqual([held.status, held.reason, held.generation, held.address, held.previous.holder, held.previous.running],
+    ["refused", "name-held", null, null, "claude:live", true]);
   assert.equal(resolveClaim(name).holder, "claude:live");
   // Kinds bind: a Claude session claims only claude: names, and elision fills in its own kind.
   assert.equal(claim("codex:proj/x", f.me()).reason, "scope-denied");
@@ -211,7 +212,7 @@ test("release: only the holder of a running claim, anyone once the holder stoppe
   claim(NAME, other.claimant());
   await other.stop();
   const released = release(NAME, undefined, "claude");
-  assert.deepEqual([released.status, released.previous.running], ["released", false]);
+  assert.deepEqual([released.status, released.generation, released.previous.running], ["released", null, false]);
   // A release that loses to a takeover keeps the takeover.
   const old = await f.session("old"), next = await f.session("next");
   claim(NAME, old.claimant());
