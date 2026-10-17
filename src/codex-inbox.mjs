@@ -32,12 +32,7 @@ export const outboxOf = (root) => root.outbox ??= new Outbox({ onLate: (late) =>
 export function receive(root, inbox, line) {
   if (!line || typeof line !== "object") return;
   if (line.type === "control") { outboxOf(root).receive(line); return; }
-  const message = inDiscoveryScope(() => {
-    const read = readMessage(line, [...root.inboxes.values()].map((own) => own.address));
-    // Only a claim this process verifies names the sender; a name the sender asserts is never shown.
-    if (read) read.replyName = claimAt(read.from);
-    return read;
-  });
+  const message = inDiscoveryScope(() => readMessage(line, [...root.inboxes.values()].map((own) => own.address)));
   if (!message) return log("message.receive", { outcome: "dropped", reason: "malformed_envelope" });
   const bytes = Buffer.byteLength(message.body);
   const trace = { operationId: randomUUID(), messageId: logIdentity(message.id ?? undefined), threadId: logIdentity(root.threadId),
@@ -51,6 +46,9 @@ export function receive(root, inbox, line) {
     reply("dropped", reason);
     return log("message.receive", { ...trace, outcome: "dropped", reason: code(reason) });
   }
+  // Only a claim this process verifies names the sender; a name the sender asserts is never shown.
+  // Read only for a message that is admitted.
+  message.replyName = inDiscoveryScope(() => claimAt(message.from));
   pinsOf(root).noteSender(message.from, message.ext.generation);
   reply("queued");
   root.queued++;

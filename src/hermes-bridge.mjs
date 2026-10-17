@@ -368,12 +368,7 @@ export class HermesBridge {
       if (!route.outbox.receive(line)) drop("malformed");
       return;
     }
-    const message = inDiscoveryScope(() => {
-      const read = readMessage(line, [route.address]);
-      // Only a claim this bridge verifies names the sender; a name the sender asserts is never shown.
-      if (read) read.replyName = claimAt(read.from);
-      return read;
-    });
+    const message = inDiscoveryScope(() => readMessage(line, [route.address]));
     if (!message) return drop("malformed");
     // The host needs an id even for a line without one; such a line cannot be deduplicated.
     const id = message.id ?? randomUUID();
@@ -389,6 +384,9 @@ export class HermesBridge {
       }
       this.#contact(route.session, message.from);
     }
+    // Only a claim this bridge verifies names the sender; a name the sender asserts is never shown.
+    // Read only for a sender this conversation accepts.
+    message.replyName = inDiscoveryScope(() => claimAt(message.from));
     const notification = { method: "peer_message", params: {
       session: route.session, message_id: id, from: message.from, from_name: message.sender, message: message.body,
       ...(message.replyName ? { reply_name: message.replyName } : {}),
