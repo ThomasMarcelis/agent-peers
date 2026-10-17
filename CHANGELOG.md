@@ -2,7 +2,7 @@
 
 ## 1.0.0-rc.7 — 2026-10-17
 
-Seventh release candidate for 1.0.0, for the npm `next` tag. Adds **experimental opencode 2.x support** through a thin v2 plugin and one shared stdio bridge per opencode server. Also makes discovery's native-route reason per-kind and adds opencode rows to Codex listing. There is no 1.0.0-rc.5, and 1.0.0-rc.6 was cut locally but never published; their changes are included here. Deterministic suites pass, and a live smoke run plus a three-host run (Claude Code, Codex and opencode on `claude-haiku-5-5`, `gpt-6-luna` and `deepseek/deepseek-flash`) passed; no opencode steering rate is claimed.
+Seventh release candidate for 1.0.0, for the npm `next` tag. Adds **experimental opencode 2.x support** through a thin v2 plugin and one shared stdio bridge per opencode server. Also makes discovery's native-route reason per-kind and adds opencode rows to Codex listing. There is no 1.0.0-rc.5, and 1.0.0-rc.6 was cut locally but never published; their changes are included here. Deterministic suites pass, and after an independent Opus and Codex review round a live smoke run plus a three-host run (Claude Code, Codex and opencode on `claude-haiku-5-5`, `gpt-6-luna` and `deepseek/deepseek-flash`) passed; no opencode steering rate is claimed.
 
 ### Added
 
@@ -25,12 +25,15 @@ Seventh release candidate for 1.0.0, for the npm `next` tag. Adds **experimental
 
 ### Fixed
 
+- Independent review round, before publishing. opencode gives every location's plugin every event, so each location's copy of a prompt rebound the root and closed its inbox. A prompt now binds only through the session's own location and never moves a root; only a tool call does. A lookup still in flight across a move or a plugin close no longer undoes the move or binds for the closed instance. `claim_name`, `release_name` and `send_peer` refuse a root deleted while it was binding, and delivery re-checks the root after its session read. A binder rereads a replaced dead record instead of moving a live one aside, which briefly freed its names. In the plugin: `AGENT_PEERS_NODE` now applies on the startup path; stopping the child rejects pending calls at once as `bridge-lost`; a request over the 4 MiB line limit is a definite `too-large` failure instead of a 120 s `unconfirmed`; a reload during the child's stop keeps its `bridge_command`. `doctor` reads `opencode.json` and `opencode.jsonc` as JSONC.
+- An opencode `send_peer` to a Claude session in another socket directory is refused `inbox-unavailable`, rather than sent with a reply address that Claude would not accept.
 - Discovery chooses its native-route reason per kind (`claude`, `codex`, `hermes`, `opencode`, unknown), not by “every non-Codex peer”. Codex's own listing has no Hermes rows, so the corrected Hermes string is not observable there; opencode rows now use `opencode recipient` and are included in Codex's listing.
 
 ### Documented
 
 - opencode is experimental. Verified live on a private `opencode serve` only; the design's steering runs, the two-server run, the background service, `--standalone` and the TUI were not run ([release verification](docs/release-verification.md#100-rc7)). `opencode run --auto` approves only while that `run` is attached, so a turn a peer message starts later has no approver. A local plugin entry must be the package directory; `doctor` warns about a file path. The exact two-server risk is documented: A's synthetic `resume: true` wakes A's process-local runner while B may already be running the same session, starting a second runner; do not run one session in two servers. `--auto`, the 64-root cap and LRU rule, child sessions, restart behavior and the tested build 2.0.32 are in [compatibility](docs/compatibility.md#opencode-experimental).
 - `OPENCODE_SESSION_ID` is not an agent-peers identity. opencode identity is tool-only.
+- opencode unloads a location after 60 minutes without session events; its sessions read `not-running` until their next prompt or tool call, and the bridge exits when the last location unloads.
 - Install and reachability: `opencode plugin add agent-peers@next`; a session binds on its first prompt or tool call and rebinds after a restart ([reference](docs/reference.md#opencode-plugin-and-bridge)).
 
 ## 1.0.0-rc.4 — 2026-10-17

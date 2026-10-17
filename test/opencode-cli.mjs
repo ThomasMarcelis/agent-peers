@@ -143,6 +143,33 @@ test("doctor reports the install a pinned plugin entry maps to, never a newer ca
   assert.match((await plugin("plugins/agent-peers.mjs")).message, /not in .*plugins/);
 });
 
+test("doctor reads opencode.json and opencode.jsonc as JSONC, applying their plugin lists in order", async (t) => {
+  const f = home(t);
+  const config = join(f.env.XDG_CONFIG_HOME, "opencode");
+  mkdirSync(config, { recursive: true, mode: 0o700 });
+  cachedInstall(f, "agent-peers@next", "1800000000000", VERSION);
+  const check = async () => {
+    const doctor = await run(["doctor", "--json"], f.env);
+    assert.equal(doctor.status, 0, doctor.stderr);
+    return JSON.parse(doctor.stdout).checks.find((entry) => entry.name === "opencode plugin");
+  };
+  // Comments and trailing commas, with comment markers and a comma inside strings left alone.
+  writeFileSync(join(config, "opencode.json"),
+    `{\n  // plugins\n  "$schema": "https://opencode.ai/config.json", /* block */\n  "theme": "a//b,]",\n  "plugins": ["agent-peers@next",],\n}\n`);
+  assert.equal((await check()).status, "ok");
+  rmSync(join(config, "opencode.json"));
+  writeFileSync(join(config, "opencode.jsonc"), `{ "plugins": [ // installed by opencode plugin add\n "agent-peers@next", ], }`);
+  const jsonc = await check();
+  assert.equal(jsonc.status, "ok");
+  assert.match(jsonc.message, /installed package/);
+  // opencode.jsonc comes after opencode.json, so its "-agent-peers" removes the earlier entry.
+  writeFileSync(join(config, "opencode.json"), JSON.stringify({ plugins: ["agent-peers@next"] }));
+  writeFileSync(join(config, "opencode.jsonc"), `{ "plugins": ["-agent-peers"] }`);
+  assert.match((await check()).message, /not in .*opencode\.json and .*opencode\.jsonc's plugins/);
+  writeFileSync(join(config, "opencode.jsonc"), `{ "plugins": [ }`);
+  assert.match((await check()).message, /opencode\.jsonc could not be read as JSONC/);
+});
+
 test("whoami has no opencode CLI identity and claim inside an opencode shell is no-session", async (t) => {
   const f = home(t);
   // Remove the fixture Claude record of this test process: it is an ancestor of the shell, and

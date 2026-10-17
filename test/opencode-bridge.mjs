@@ -135,7 +135,7 @@ test("a forced interleaving between the bind read and link still publishes exact
   assert.equal(sockets(f.dir).length, 1);
 });
 
-test("a forced interleaving replacing a dead record: one binder moves it aside, the other puts the winner's record back and refuses", async (t) => {
+test("a forced interleaving replacing a dead record: one binder moves it aside, the other rereads the winner's live record and refuses without moving it", async (t) => {
   const f = opencodeFixture(t);
   const hostA = new FakeHost(), hostB = new FakeHost();
   // The two hosts give the root different directories, so the record's name says who won.
@@ -163,13 +163,15 @@ test("a forced interleaving replacing a dead record: one binder moves it aside, 
   await until(() => held.count >= 2, "both binders paused after reading the dead record");
   held.release();
   const [ra, rb] = await Promise.all([pendingA, pendingB]);
-  // Both read the dead record on their first attempt, so both reached the move-aside branch.
-  assert.deepEqual(hookLog.map((entry) => [entry.attempt, entry.existingPid]), [[0, 0x7ffffff0], [0, 0x7ffffff0]]);
+  // Both read the dead record on their first attempt.
+  assert.deepEqual(hookLog.slice(0, 2).map((entry) => [entry.attempt, entry.existingPid]), [[0, 0x7ffffff0], [0, 0x7ffffff0]]);
   assert.equal([ra.isError, rb.isError].filter(Boolean).length, 1, `${ra.text} / ${rb.text}`);
   const [winnerResult, loser, loserResult] = ra.isError ? [rb, a, ra] : [ra, b, rb];
-  // The second binder moved the winner's new record aside, found a different inode and put it back.
+  // The second binder saw the inode change before moving anything, read the winner's live record
+  // and refused; the winner's record never left its path, so its names were never freed.
   assert.equal(loserResult.structuredContent.reason, "inbox-unavailable");
-  assert.match(loserResult.text, /another bridge replaced the opencode record while this bridge was binding/);
+  assert.match(loserResult.text, /already served by another opencode server/);
+  assert.deepEqual(hookLog.map((entry) => entry.attempt), [0, 0, 1], "the loser read the record a second time");
   const record = JSON.parse(readFileSync(registry(f.dir, "ses_root"), "utf8"));
   assert.equal(record.name, winnerResult.structuredContent.self.name);
   assert.equal(record.address, winnerResult.structuredContent.self.address);
@@ -897,4 +899,124 @@ test("registry liveness: dead, reused and missing records are stale; a live reco
   write("ses_gone");
   const rebind = claim("opencode:proj/gone", { ...holder, generation: generation("opencode", "ses_gone", start) });
   assert.equal(rebind.status, "refreshed");
+});
+
+test("server-wide events: a prompt binds only through the session's own location and never moves a root another instance serves", async (t) => {
+  const f = opencodeFixture(t);
+  const host = new FakeHost();
+  host.add(session({ id: "ses_a", directory: join(f.dir, "a"), updated: 1, idle: 1 }));
+  host.add(session({ id: "ses_b", directory: join(f.dir, "b"), updated: 1, idle: 1 }));
+  const { bridge, logs } = bridgeFor(host, { instance: "i-a", location: { directory: join(f.dir, "a") } });
+  t.after(() => bridge.close());
+  bridge.hello({ instance: "i-b", location: { directory: join(f.dir, "b") } });
+  // opencode gives every location's instance every event; the other location's copy comes first.
+  await bridge.event({ instance: "i-b", type: "prompt", sessionID: "ses_a" });
+  assert.equal(existsSync(registry(f.dir, "ses_a")), false, "another location's prompt does not bind");
+  await bridge.event({ instance: "i-a", type: "prompt", sessionID: "ses_a" });
+  const token = JSON.parse(readFileSync(registry(f.dir, "ses_a"), "utf8")).token;
+  for (const instance of ["i-b", "i-a", "i-b"]) await bridge.event({ instance, type: "prompt", sessionID: "ses_a" });
+  assert.equal(JSON.parse(readFileSync(registry(f.dir, "ses_a"), "utf8")).token, token, "the bind is never replaced");
+  assert.equal(logs.filter((entry) => entry.event === "inbox.bound").length, 1);
+  // The other instance closing (a reload or an idle location) keeps a root it never served.
+  await bridge.event({ instance: "i-b", type: "closed" });
+  assert.equal(JSON.parse(readFileSync(registry(f.dir, "ses_a"), "utf8")).token, token);
+});
+
+test("a lookup in flight across a move or a close never undoes the move or binds for the closed instance", async (t) => {
+  const f = opencodeFixture(t);
+  const host = new FakeHost();
+  host.add(session({ id: "ses_root", directory: join(f.dir, "one"), updated: 1, idle: 1 }));
+  host.add(session({ id: "ses_other", directory: join(f.dir, "one"), updated: 1, idle: 1 }));
+  const { bridge } = bridgeFor(host, { instance: "i-1" });
+  t.after(() => bridge.close());
+  bridge.hello({ instance: "i-2", location: {} });
+  const call = (instance, sessionID) => bridge.tool({ instance, name: "list_peers", sessionID, args: {} });
+  assert.equal((await call("i-1", "ses_root")).isError, false);
+  // i-1's next lookup is held; the session moves away from i-1 and i-2 binds it.
+  const held = gate();
+  host.beforeSession = async (id) => { if (id === "ses_root" && held.count === 0) await held.wait(); };
+  const stale = call("i-1", "ses_root");
+  await until(() => held.count === 1, "i-1's read in flight");
+  await bridge.event({ instance: "i-1", type: "moved", sessionID: "ses_root" });
+  const moved = await call("i-2", "ses_root");
+  assert.equal(moved.isError, false, moved.text);
+  const record = JSON.parse(readFileSync(registry(f.dir, "ses_root"), "utf8"));
+  held.release();
+  const late = await stale;
+  assert.equal(late.isError, true);
+  assert.equal(late.structuredContent.reason, "inbox-unavailable");
+  assert.deepEqual(JSON.parse(readFileSync(registry(f.dir, "ses_root"), "utf8")), record, "i-2 still serves the session");
+  // A fresh call from i-1 after the move may move it back: that one is current.
+  assert.equal((await call("i-1", "ses_root")).isError, false);
+  // A lookup held across its instance's close publishes nothing.
+  const closing = gate();
+  host.beforeSession = async (id) => { if (id === "ses_other") await closing.wait(); };
+  const orphan = call("i-1", "ses_other");
+  await until(() => closing.count === 1, "the ses_other read in flight");
+  await bridge.event({ instance: "i-1", type: "closed" });
+  closing.release();
+  const result = await orphan;
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.reason, "no-session");
+  assert.equal(existsSync(registry(f.dir, "ses_other")), false);
+  assert.equal(existsSync(registry(f.dir, "ses_root")), false, "close unbound i-1's roots");
+});
+
+test("a delete while the root's record is being published refuses the claim that waited on the bind", async (t) => {
+  const f = opencodeFixture(t);
+  const host = new FakeHost();
+  host.add(session({ id: "ses_root", directory: join(f.dir, "repo"), updated: 1, idle: 1 }));
+  const held = gate();
+  const { bridge } = bridgeFor(host, { publishHook: async () => held.wait() });
+  t.after(() => bridge.close());
+  const pending = bridge.tool({ instance: "i-1", name: "claim_name", sessionID: "ses_root", args: { name: "opencode:team/lead" } });
+  await until(() => held.count === 1, "the publish in flight");
+  const deleting = bridge.event({ instance: "i-1", type: "deleted", sessionID: "ses_root" });
+  held.release();
+  const result = await pending;
+  await deleting;
+  assert.equal(result.isError, true, result.text);
+  assert.equal(result.structuredContent.reason, "no-session");
+  assert.deepEqual(claimRows().filter((row) => row.name === "opencode:team/lead"), []);
+  assert.equal(existsSync(registry(f.dir, "ses_root")), false);
+  assert.equal(sockets(f.dir).length, 0);
+});
+
+test("a move during the delivery's session read drops the message inbox-closed instead of handing it to the old instance", async (t) => {
+  const f = opencodeFixture(t);
+  const { host, bridge } = await bound(t, f);
+  const sender = await f.peer("move-sender");
+  const self = (await bridge.tool({ instance: "i-1", name: "list_peers", sessionID: "ses_root", args: {} })).structuredContent.self;
+  const held = gate();
+  host.beforeSession = async () => held.wait();
+  const { post, peerSocket } = await import("../src/wire.mjs");
+  await post(peerSocket(self.address), peerLine(sender.address, "moving", { receipts: ["queued", "accepted"] }));
+  await until(() => held.count === 1, "the delivery's read in flight");
+  await bridge.event({ instance: "i-1", type: "moved", sessionID: "ses_root" });
+  held.release();
+  await until(() => sender.lines.some((l) => l.type === "control" && l.status === "dropped"), "the inbox-closed drop");
+  assert.equal(sender.lines.find((l) => l.status === "dropped").drop_reason, "inbox-closed");
+  assert.equal(host.calls.some((c) => c.method === "host.synthetic"), false, "nothing reached the old instance");
+});
+
+test("send_peer refuses a Claude peer in another socket directory, which could never reply to this inbox", async (t) => {
+  const f = opencodeFixture(t);
+  const { bridge } = await bound(t, f);
+  const other = join(f.dir, "s2");
+  mkdirSync(other, { mode: 0o700 });
+  const socket = join(other, "elsewhere.sock");
+  const server = createServer(() => {});
+  t.after(() => server.close());
+  await listen(server, socket);
+  const sleeper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"]);
+  f.children.push(sleeper);
+  await until(() => processStart(sleeper.pid), "the second Claude process");
+  writeFileSync(join(f.claude, "sessions", `${sleeper.pid}.json`), JSON.stringify({
+    pid: sleeper.pid, name: "elsewhere", messagingSocketPath: socket, procStart: processStart(sleeper.pid),
+  }));
+  const result = await bridge.tool({ instance: "i-1", name: "send_peer", sessionID: "ses_root", args: { to: address(socket), message: "hi" } });
+  assert.equal(result.isError, true, result.text);
+  assert.equal(result.structuredContent.status, "failed");
+  assert.equal(result.structuredContent.reason, "inbox-unavailable");
+  assert.match(result.text, /Claude replies only within its own socket directory; nothing was sent/);
 });

@@ -77,8 +77,38 @@ function opencodeBinary() {
   return { status: "ok", message: `${path} (${version[1]})` };
 }
 
-function opencodeConfigPath(env = process.env) {
-  return join(env.XDG_CONFIG_HOME || join(env.HOME || homedir(), ".config"), "opencode", "opencode.json");
+// opencode 2.x reads both global files, opencode.json then opencode.jsonc, as JSONC
+// (config/discovery.ts).
+function opencodeConfigPaths(env = process.env) {
+  const directory = join(env.XDG_CONFIG_HOME || join(env.HOME || homedir(), ".config"), "opencode");
+  return ["opencode.json", "opencode.jsonc"].map((name) => join(directory, name));
+}
+
+// JSON with // and /* */ comments and trailing commas, as opencode accepts it. Comments go first,
+// then a comma before a closing bracket; nothing inside a string is touched.
+export function parseJsonc(text) {
+  const scan = (input, other) => {
+    let out = "";
+    for (let i = 0; i < input.length;) {
+      if (input[i] === '"') {
+        let j = i + 1;
+        while (j < input.length && input[j] !== '"') j += input[j] === "\\" ? 2 : 1;
+        out += input.slice(i, j + 1);
+        i = j + 1;
+      } else {
+        const [kept, next] = other(input, i);
+        out += kept;
+        i = next;
+      }
+    }
+    return out;
+  };
+  const uncommented = scan(text, (input, i) => {
+    if (input.startsWith("//", i)) { const end = input.indexOf("\n", i); return ["", end < 0 ? input.length : end]; }
+    if (input.startsWith("/*", i)) { const end = input.indexOf("*/", i + 2); return [" ", end < 0 ? input.length : end + 2]; }
+    return [input[i], i + 1];
+  });
+  return JSON.parse(scan(uncommented, (input, i) => [input[i] === "," && /^\s*[}\]]/.test(input.slice(i + 1)) ? "" : input[i], i + 1]));
 }
 
 function localPackageVersion(entry) {
@@ -168,14 +198,22 @@ function installedPluginVersion(entries, configPath) {
 }
 
 function opencodePlugin() {
-  const path = opencodeConfigPath();
-  let config;
-  try { config = JSON.parse(readFileSync(path, "utf8")); }
-  catch (error) {
-    if (error.code === "ENOENT") return { status: "warning", message: `${path} is absent; install the plugin with "opencode plugin add agent-peers@next"` };
-    return { status: "warning", message: `${path} could not be read as JSON; install the plugin with "opencode plugin add agent-peers@next"` };
+  const paths = opencodeConfigPaths();
+  // Both files are read, in opencode's order; their plugin lists apply one after the other.
+  const plugins = [], found = [];
+  for (const file of paths) {
+    let config;
+    try { config = parseJsonc(readFileSync(file, "utf8")); }
+    catch (error) {
+      if (error.code === "ENOENT") continue;
+      return { status: "warning", message: `${file} could not be read as JSONC; install the plugin with "opencode plugin add agent-peers@next"` };
+    }
+    found.push(file);
+    if (Array.isArray(config?.plugins)) plugins.push(...config.plugins);
   }
-  const plugins = Array.isArray(config?.plugins) ? config.plugins : [];
+  if (!found.length) return { status: "warning", message: `${paths[0]} is absent; install the plugin with "opencode plugin add agent-peers@next"` };
+  // Both files sit in one directory, which a relative entry resolves against.
+  const path = found.join(" and "), base = found[0];
   // opencode applies entries in order; "-<target>" removes an earlier entry for that target.
   const entries = [];
   for (const entry of plugins.map(pluginEntryTarget)) {
@@ -186,19 +224,19 @@ function opencodePlugin() {
     for (let i = entries.length - 1; i >= 0; i--) if (removed(entries[i])) entries.splice(i, 1);
   }
   const listed = entries.some((entry) => isPackageEntry(entry) ||
-    (isLocalPluginEntry(entry) && localEntryPath(entry, path) && localPackageVersion(localEntryPath(entry, path))));
+    (isLocalPluginEntry(entry) && localEntryPath(entry, base) && localPackageVersion(localEntryPath(entry, base))));
   if (!listed) return { status: "warning", message: `agent-peers is not in ${path}'s plugins; run "opencode plugin add agent-peers@next"` };
   // opencode 2.x skips a local plugin path that is a file ("configured plugin path must be a
   // directory"), so such an entry never loads.
   const fileEntry = entries.find((entry) => {
     if (!isLocalPluginEntry(entry)) return false;
-    const local = localEntryPath(entry, path);
+    const local = localEntryPath(entry, base);
     try { return Boolean(local && localPackageVersion(local) && statSync(local).isFile()); } catch { return false; }
   });
   if (fileEntry) {
     return { status: "warning", message: `${path} lists the plugin file ${fileEntry}; opencode loads only a directory, so list the package directory instead` };
   }
-  const installed = installedPluginVersion(entries, path);
+  const installed = installedPluginVersion(entries, base);
   if (!installed) return { status: "warning", message: `agent-peers is listed; its installed package version is unknown (CLI ${VERSION})` };
   if (installed !== VERSION) {
     return { status: "warning", message: `version skew: installed opencode plugin ${installed}, CLI ${VERSION}; pin one package version` };

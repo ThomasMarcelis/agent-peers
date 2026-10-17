@@ -25,6 +25,8 @@ const PROTOCOL = 1;
 const PLUGIN_ID = "agent-peers";
 const TOOL_TIMEOUT_MS = 120_000, HELLO_TIMEOUT_MS = 10_000;
 const NODE_FAILURE_MS = 30_000;
+// The bridge's protocol line limit (src/opencode-bridge.mjs PROTOCOL_MAX_LINE).
+const MAX_LINE = 4 * 1024 * 1024;
 const DEFINITIONS = JSON.parse(readFileSync(new URL("../src/peer-tool-definitions.json", import.meta.url), "utf8"));
 const HINT = "set AGENT_PEERS_NODE to a Node 22+ executable, or set the plugin option bridge_command to the bridge executable and its arguments";
 
@@ -140,13 +142,19 @@ export class BridgeClient {
       pending.timer = setTimeout(() => {
         settle(reject, Object.assign(new Error(`the opencode bridge did not answer ${method}`), { code: "bridge-timeout" }));
       }, timeoutMs);
+      pending.timer.unref?.();
       // Aborted before the write: nothing reached the bridge, so this is a definite failure.
       if (signal?.aborted) {
         return settle(reject, new BridgeUnavailable("the tool call was aborted before the request was written; nothing was sent", "bridge-aborted"));
       }
+      // The bridge answers an oversized line without an id, so it is refused here, unwritten.
+      const message = { v: PROTOCOL, id, method, params };
+      if (Buffer.byteLength(JSON.stringify(message)) + 1 > MAX_LINE) {
+        return settle(reject, new BridgeUnavailable("the request exceeds the 4 MiB bridge line limit; nothing was sent", "too-large"));
+      }
       signal?.addEventListener("abort", onAbort, { once: true });
       this.#pending.set(id, pending);
-      this.#write({ v: PROTOCOL, id, method, params }).catch((error) => {
+      this.#write(message).catch((error) => {
         settle(reject, new BridgeUnavailable(error?.message ?? "the opencode bridge is not running"));
       });
     });
@@ -159,6 +167,7 @@ export class BridgeClient {
   async stop() {
     if (!this.alive) return;
     this.alive = false;
+    this.#rejectPending();
     try { this.#child.stdin.end(); } catch {}
     await new Promise((resolve) => {
       if (!this.#child || this.#child.exitCode !== null) return resolve();
@@ -170,13 +179,17 @@ export class BridgeClient {
   #exit(error) {
     if (!this.alive) return;
     this.alive = false;
-    for (const pending of this.#pending.values()) {
+    this.#rejectPending();
+    this.#onExit?.(error);
+  }
+
+  #rejectPending() {
+    for (const pending of [...this.#pending.values()]) {
       clearTimeout(pending.timer);
       // The request was written to the child; delivery is now unknown, not definitely failed.
-      pending.reject(Object.assign(new BridgeUnavailable("the opencode bridge was lost after the request was written", "bridge-lost")));
+      pending.reject(new BridgeUnavailable("the opencode bridge was lost after the request was written", "bridge-lost"));
     }
     this.#pending.clear();
-    this.#onExit?.(error);
   }
 }
 
@@ -278,20 +291,21 @@ export function probeNode(path, env = process.env) {
   });
 }
 
-export async function findNode({ env = process.env, probe = probeNode } = {}) {
+// Candidates come from `env`; each is probed with `probeEnv`, the child's filtered environment.
+export async function findNode({ env = process.env, probe = probeNode, probeEnv = env } = {}) {
   for (const candidate of nodeCandidates(env)) {
-    if (await probe(candidate, env)) return candidate;
+    if (await probe(candidate, probeEnv)) return candidate;
   }
   throw new BridgeUnavailable(`no working Node 22+ executable found; ${HINT}`);
 }
 
 // Success is cached for the server lifetime. A failure is retried at most every 30 s, so a
 // missing Node never makes every tool call rerun the probes.
-export async function cachedNode(state, { env = process.env, probe = probeNode, now = Date.now } = {}) {
+export async function cachedNode(state, { env = process.env, probe = probeNode, probeEnv = env, now = Date.now } = {}) {
   if (state.node) return state.node;
   if (state.nodeFailure && now() - state.nodeFailure.at < NODE_FAILURE_MS) throw new BridgeUnavailable(state.nodeFailure.message);
   try {
-    state.node = await findNode({ env, probe });
+    state.node = await findNode({ env, probe, probeEnv });
     state.nodeFailure = undefined;
     return state.node;
   } catch (error) {
@@ -316,7 +330,9 @@ async function commandFor(state, env) {
     }
     return { command: configured[0], args: configured.slice(1) };
   }
-  const node = await cachedNode(state, { env });
+  // AGENT_PEERS_NODE, NVM_DIR and HERMES_HOME pick the Node, so the lookup reads the server's own
+  // environment; the probes and the child get only the filtered one.
+  const node = await cachedNode(state, { env: process.env, probeEnv: env });
   return { command: node, args: [join(PACKAGE, "bin", "agent-peers.mjs"), "opencode-bridge"] };
 }
 
@@ -497,6 +513,7 @@ async function executeTool(instance, name, args, tool) {
         sendResult({ status: "unconfirmed", reason: "bridge-lost" }), false);
     }
     if (error?.code === "bridge-aborted") return failure(name, "bridge-unavailable", error.message);
+    if (error?.code === "too-large") return failure(name, "too-large", error.message);
     // A claim or release may also have been applied; both are idempotent, so say so and let the
     // model check with list_peers instead of reading a definite failure.
     if ((name === "claim_name" || name === "release_name") && ["bridge-lost", "bridge-timeout"].includes(error?.code)) {
@@ -525,6 +542,8 @@ async function closeInstance(state, instance) {
   if (state.instances.size === 0) {
     state.client = null;
     await client.stop();
+    // A reload's new instance may have set up while the child stopped; its options stand.
+    if (state.instances.size !== 0) return;
     // The last instance defines the server lifetime. A later instance reload may carry new
     // options and must not reuse a stale Node success or a bridge_command from the old setup.
     state.options = undefined;

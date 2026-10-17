@@ -12,6 +12,8 @@ const logPath = option("--log");
 const mode = option("--mode", "echo");
 const version = option("--version", "1.0.0-rc.7");
 const crashFile = option("--crash-file");
+// Stay alive this long after stdin ends, as a bridge unbinding its roots does.
+const exitDelay = Number(option("--exit-delay", "0"));
 const child = `${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
 const write = (message) => process.stdout.write(JSON.stringify({ v: 1, ...message }) + "\n");
 const record = (message) => appendFileSync(logPath, JSON.stringify({ _child: child, ...message }) + "\n");
@@ -92,4 +94,4 @@ process.stdin.on("data", (data) => {
     });
   }
 });
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", () => setTimeout(() => process.exit(0), exitDelay));

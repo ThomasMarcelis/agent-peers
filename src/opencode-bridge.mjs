@@ -11,7 +11,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { linkSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { frame } from "./frame.mjs";
 import { Admission, Receipts, checkSocketPath, closeInbox, listenInbox, ownsSocket, readMessage } from "./inbox.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
@@ -31,9 +31,9 @@ export const PROTOCOL = 1;
 export const ROOTS_MAX = 64;
 export const PROTOCOL_MAX_LINE = 4 * 1024 * 1024;
 const CONNECTION_MAX = 32, QUEUE_MAX = 50, QUEUE_BYTES_MAX = 8_000_000, DEFAULT_HOST_TIMEOUT_MS = 20_000;
-// Bounds for the child-to-root cache and the deleted session ids (opencode never reuses an id);
-// the oldest entry goes first.
-const CACHE_MAX = 4096, DELETED_MAX = 1024;
+// Bounds for the child-to-root cache, the deleted session ids (opencode never reuses an id) and
+// the recorded moves; the oldest entry goes first.
+const CACHE_MAX = 4096, DELETED_MAX = 1024, MOVES_MAX = 1024;
 const START = processStart(process.pid);
 
 // bridge token -> root, for bridges in this process. A record owned by this pid/start is stale
@@ -139,6 +139,10 @@ export class OpencodeBridge {
   #roots = new Map();
   #cache = new Map();
   #deleted = new Set();
+  // sessionID -> { epoch, from }: the last time a root left an instance, by a move event or a bind
+  // from another instance. A lookup from that instance that started earlier is stale.
+  #moves = new Map();
+  #epoch = 0;
   #bindTasks = new Map();
   #room = Promise.resolve();
   #swept = false;
@@ -201,18 +205,28 @@ export class OpencodeBridge {
     const { instance, type, sessionID } = params;
     if (typeof instance !== "string" || !this.#instances.has(instance)) return;
     if (type === "closed") {
-      for (const root of [...this.#roots.values()]) if (root.instance === instance) await this.#unbind(root);
+      // Unregister first, so a lookup still in flight for this instance cannot bind after the
+      // roots below are closed.
       this.#instances.delete(instance);
+      for (const root of [...this.#roots.values()]) if (root.instance === instance) await this.#unbind(root);
       this.#log("bridge.closed", { sessionId: logIdentity(instance) });
       return;
     }
     if (!validSessionId(sessionID)) return;
     if (type === "prompt") {
-      // Only a root binds on its own prompt; a child's prompt binds nothing.
+      // Only a root binds on its own prompt; a child's prompt binds nothing. opencode delivers
+      // every event to every location's plugin instance, so a prompt binds only through the
+      // instance whose location is the session's, and never moves a root another instance
+      // serves. Only a tool call, which runs in its session's location, moves a root.
+      const serving = this.#roots.get(sessionID);
+      if (serving && serving.instance !== instance) return;
+      const since = ++this.#epoch;
       try {
         const info = await this.#session(instance, sessionID);
         if (info.parentID != null) return;
-        await this.#bind(sessionID, info, instance);
+        const home = this.#instances.get(instance)?.location.directory;
+        if (home !== undefined && info.location.directory !== home) return;
+        await this.#bind(sessionID, info, instance, { since, move: false });
       } catch (error) {
         if (!(error instanceof BridgeError) || error.code !== "not-found") {
           this.#log("bridge.event", { sessionId: logIdentity(sessionID), outcome: "failed", reason: code(error.code ?? "host-lost") });
@@ -239,6 +253,7 @@ export class OpencodeBridge {
       if (root) {
         // A late move from an instance that no longer owns the root never closes a newer bind.
         if (root.instance !== instance) return;
+        this.#moved(sessionID, instance);
         await this.#unbind(root);
       }
       this.#cache.delete(sessionID);
@@ -259,6 +274,7 @@ export class OpencodeBridge {
   // ---- identity and roots ----
 
   async #resolve(instance, sessionID) {
+    const since = ++this.#epoch;
     let info, rootID, rootInfo;
     const cached = this.#cache.get(sessionID);
     if (cached) {
@@ -287,13 +303,29 @@ export class OpencodeBridge {
       if (this.#cache.size >= CACHE_MAX) this.#cache.delete(this.#cache.keys().next().value);
       this.#cache.set(sessionID, { rootID, info, rootInfo });
     }
-    const root = await this.#bind(rootID, rootInfo, instance);
+    const root = await this.#bind(rootID, rootInfo, instance, { since, move: true });
     root.lastActivity = Math.max(root.lastActivity, Date.now(), Number(rootInfo.time?.updated) || 0);
     return { session: info, root, subagent: rootID !== sessionID, name: rootID === sessionID ? root.name : opencodeName(sessionID, info) };
   }
 
-  #bind(rootID, info, instance) {
-    return this.#bindTask(rootID, () => this.#bindNow(rootID, info, instance));
+  #bind(rootID, info, instance, lookup) {
+    return this.#bindTask(rootID, () => this.#bindNow(rootID, info, instance, lookup));
+  }
+
+  #moved(sessionID, from) {
+    this.#moves.delete(sessionID);
+    if (this.#moves.size >= MOVES_MAX) this.#moves.delete(this.#moves.keys().next().value);
+    this.#moves.set(sessionID, { epoch: ++this.#epoch, from });
+  }
+
+  // A lookup is current while its instance is registered and its root has not left that instance
+  // since the lookup started. A stale one must not undo a move or bind for a closed instance.
+  #checkLookup(rootID, instance, since) {
+    if (!this.#instances.has(instance)) throw new BridgeError("not-found", "this opencode plugin instance is no longer registered");
+    const move = this.#moves.get(rootID);
+    if (move && move.from === instance && since < move.epoch) {
+      throw new BridgeError("inbox-unavailable", "this opencode session moved to another location while this call was resolving it; retry");
+    }
   }
 
   // A root's single-flight task chain. Its binds, its eviction and its delete run here, one at a
@@ -307,9 +339,12 @@ export class OpencodeBridge {
     });
   }
 
-  async #bindNow(rootID, info, instance) {
+  // `lookup.since` is the epoch at which the caller started reading the session; `lookup.move`
+  // says whether this bind may take the root from another instance (tool calls) or not (prompts).
+  async #bindNow(rootID, info, instance, { since, move }) {
     if (this.#closed) throw new BridgeError("bridge-closed", "the opencode bridge is closing");
     if (this.#deleted.has(rootID)) throw new BridgeError("not-found", "this opencode session was deleted");
+    this.#checkLookup(rootID, instance, since);
     if (!this.#swept) { this.#swept = true; this.#dropDeadOwners(); }
     for (let attempt = 0; attempt < 2; attempt++) {
       let root = this.#roots.get(rootID);
@@ -323,7 +358,9 @@ export class OpencodeBridge {
           root.lastActivity = Math.max(root.lastActivity, Date.now(), Number(info.time?.updated) || 0);
           return root;
         }
+        if (root.instance !== instance && !move) return root;
         // Another location's plugin instance now serves this session: a move.
+        if (root.instance !== instance) this.#moved(rootID, root.instance);
         await this.#unbind(root);
         root = undefined;
       }
@@ -342,6 +379,7 @@ export class OpencodeBridge {
       const tried = new Set();
       const seat = () => this.#roomLock(() => {
         if (this.#closed) throw new BridgeError("bridge-closed", "the opencode bridge is closing");
+        this.#checkLookup(rootID, instance, since);
         const existing = this.#roots.get(rootID);
         if (existing) return existing;
         return this.#roots.size < ROOTS_MAX ? this.#insert(rootID, info, instance, socket) : undefined;
@@ -364,6 +402,8 @@ export class OpencodeBridge {
         }
       }
       if (root.instance !== instance) {
+        if (!move) return root;
+        this.#moved(rootID, root.instance);
         await this.#unbind(root);
         continue;
       }
@@ -515,6 +555,10 @@ export class OpencodeBridge {
             "this opencode session is already served by another opencode server; stop the other server or let it exit, then retry");
         }
       }
+      // Moving a record aside leaves the path briefly missing, and a missing record frees the
+      // holder's names. If another bridge already replaced the dead record, read it again rather
+      // than moving a live record aside.
+      if (!sameInode(root.registry, { dev, ino })) continue;
       const aside = join(peersHome(), `.opencode-${randomUUID()}.json`);
       try { renameSync(root.registry, aside); }
       catch (error) { if (error.code === "ENOENT") continue; throw error; }
@@ -696,6 +740,14 @@ export class OpencodeBridge {
 
   // ---- tools ----
 
+  // A root a delete, move or close took after this call bound it gives no claim and no send.
+  #gone(root) {
+    if (this.#roots.get(root.sessionID) === root && !root.closing && !this.#deleted.has(root.sessionID)) return undefined;
+    return this.#deleted.has(root.sessionID)
+      ? { reason: "no-session", text: "this opencode session was deleted; nothing was done" }
+      : { reason: "inbox-unavailable", text: "this opencode session was unbound while this call ran; call list_peers again" };
+  }
+
   #toolFailure(name, reason, message) {
     // Only a host not-found means this caller has no session. A timed-out/lost host call is
     // unavailability, not evidence that the session does not exist.
@@ -729,13 +781,23 @@ export class OpencodeBridge {
   }
 
   async #sendPeer({ root, name: callerName }, { to, message, in_reply_to: inReplyTo }) {
+    const gone = this.#gone(root);
+    if (gone) return { text: gone.text, structuredContent: sendResult({ reason: gone.reason }), isError: true };
     if (!root.inbox || !this.#owns(root) || !ownsSocket(root.inbox)) {
       return { text: "this opencode inbox was replaced; call list_peers again", structuredContent: sendResult({ reason: "inbox-unavailable" }), isError: true };
     }
     const out = await sendPeer({
       to, message, inReplyTo,
       pins: root.pins, fromName: callerName, generation: root.generation,
-      route: async () => ({ from: root.address, outbox: root.outbox }),
+      // Claude accepts a reply address only in its own socket directory, and this root has one
+      // inbox, so a Claude peer elsewhere could never answer; refuse instead of a silent loss.
+      route: async (target) => {
+        if (target.kind === "claude" && target.socket && dirname(target.socket) !== dirname(root.socket)) {
+          throw new SendFailure("inbox-unavailable",
+            `this opencode session has an inbox only in ${dirname(root.socket)}, and Claude replies only within its own socket directory; nothing was sent`);
+        }
+        return { from: root.address, outbox: root.outbox };
+      },
     });
     return { text: out.text, structuredContent: out.result, isError: isError(out.result.status) };
   }
@@ -748,6 +810,8 @@ export class OpencodeBridge {
       const text = "a subagent sends under its root session and holds no names; ask the root agent to claim it.";
       return { text, structuredContent: claimRefusal("no-session", text), isError: true };
     }
+    const gone = this.#gone(root);
+    if (gone) return { text: gone.text, structuredContent: claimRefusal(gone.reason, gone.text), isError: true };
     let result;
     try {
       result = action === "claim_name" ? claim(name, this.#claimant(root)) : release(name, this.#claimant(root));
@@ -807,6 +871,11 @@ export class OpencodeBridge {
         }
         // A lost or timed-out host call sends no receipt: the message may still land.
         return this.#log("message.deliver", { ...trace, outcome: "failed", ...errorFields(error) });
+      }
+      // A move, delete or close during the read hands the root over; the old instance gets nothing.
+      if (this.#roots.get(root.sessionID) !== root || root.closing || !this.#owns(root)) {
+        reply("dropped", "inbox-closed");
+        return this.#log("message.deliver", { ...trace, outcome: "skipped", reason: "inbox_closed" });
       }
       if (info.revert) {
         reply("dropped", "host-rejected");

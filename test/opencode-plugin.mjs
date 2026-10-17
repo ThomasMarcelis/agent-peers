@@ -3,7 +3,7 @@
 // shares one stdio child per server, forwards events, and restarts lazily with hello for every
 // instance. The fake bridge isolates the adapter; test/opencode-e2e.mjs runs the real bridge.
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -357,6 +357,77 @@ test("a cached Node that can no longer be spawned is forgotten and retried only 
   assert.match(state.nodeFailure?.message ?? "", /could not be started \(ENOENT\)/);
   const again = await ctx.tools[0].execute({}, { sessionID: "ses_root" });
   assert.match(again.content[0].text, /could not be started \(ENOENT\)/, "the next call within 30 s does not reprobe");
+});
+
+test("AGENT_PEERS_NODE picks the Node on the startup path, though the child's environment omits it", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ap-ocp-"));
+  const log = join(dir, "bridge.jsonl"), argv = join(dir, "argv");
+  // A Node wrapper outside every default location: it answers the version probe and otherwise
+  // records what it was asked to run and serves the fake bridge.
+  const wrapper = join(dir, "custom-node");
+  writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = --version ]; then exec "${process.execPath}" --version; fi\n` +
+    `printf '%s\\n' "$@" > "${argv}"\nexec "${process.execPath}" "${fakeBridge}" --log "${log}" --mode echo\n`);
+  chmodSync(wrapper, 0o700);
+  const saved = { AGENT_PEERS_NODE: process.env.AGENT_PEERS_NODE, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME };
+  process.env.AGENT_PEERS_NODE = wrapper;
+  process.env.AGENT_PEERS_HOME = join(dir, "peers");
+  delete globalThis[KEY];
+  const ctx = context(dir, new Map([["ses_root", { id: "ses_root", location: { directory: "/repo" } }]]));
+  ctx.options = {};
+  const cleanup = await plugin.setup(ctx);
+  t.after(async () => {
+    await cleanup();
+    delete globalThis[KEY];
+    for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : process.env[key] = value;
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const result = await ctx.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.equal(result.content[0].text, "echo");
+  assert.equal(globalThis[KEY].node, wrapper);
+  assert.match(readFileSync(argv, "utf8"), /agent-peers\.mjs\nopencode-bridge\n/);
+});
+
+test("stopping the client rejects a written, unanswered request at once as bridge-lost", async (t) => {
+  const client = new BridgeClient({
+    command: process.execPath, args: ["-e", "process.stdin.resume()"], env: process.env, onRequest: () => ({}),
+  }).start();
+  t.after(() => client.stop());
+  const rejected = assert.rejects(client.request("tool", { name: "send_peer" }, 60_000), { code: "bridge-lost" });
+  const started = Date.now();
+  await client.stop();
+  await rejected;
+  assert.ok(Date.now() - started < 3000);
+});
+
+test("a request over the 4 MiB line limit is refused unwritten as a definite too-large failure", async (t) => {
+  const f = await fixture(t);
+  await f.waitFor((messages) => messages.some((message) => message.method === "hello"), "the hello");
+  // Control characters escape to six bytes each, so 700k of them exceed 4 MiB.
+  const result = await f.ctx.tools.find((tool) => tool.name === "send_peer").execute(
+    { to: "uds:/tmp/peer.sock", message: "\u0001".repeat(700_000) }, { sessionID: "ses_root" });
+  assert.equal(result.metadata.isError, true);
+  assert.equal(result.metadata.structuredContent.status, "failed");
+  assert.equal(result.metadata.structuredContent.reason, "too-large");
+  assert.match(result.content[0].text, /nothing was sent/);
+  assert.equal(f.messages().some((message) => message.method === "tool"), false);
+});
+
+test("an instance that sets up while the last one's child stops keeps its bridge_command", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ap-ocp-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const first = await fixture(t, { command: [process.execPath, fakeBridge, "--log", join(dir, "bridge.jsonl"), "--exit-delay", "1000"] });
+  await until(() => globalThis[KEY]?.client?.alive, "the first child");
+  const closing = first.cleanup();
+  // The old child takes a second to exit; the reload sets up inside that window.
+  await until(() => globalThis[KEY]?.client === null, "the old child to start stopping");
+  const reload = context(first.dir, new Map([["ses_root", { id: "ses_root", location: { directory: "/repo" } }]]));
+  reload.options = first.ctx.options;
+  const cleanup = await plugin.setup(reload);
+  t.after(() => cleanup());
+  await closing;
+  assert.deepEqual(globalThis[KEY].options?.bridge_command, first.ctx.options.bridge_command);
+  const result = await reload.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.equal(result.content[0].text, "echo");
 });
 
 function eventState(subscribe) {
