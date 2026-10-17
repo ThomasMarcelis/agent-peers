@@ -93,3 +93,35 @@ test("the bridge answers host.session on the same wire and cleans up its record 
   assert.equal(existsSync(join(fixture.peers, "opencode-ses_root.json")), false);
   assert.deepEqual(readdirSync(fixture.sockets).filter((name) => name.startsWith("opencode-")), []);
 });
+
+test("stdin EOF with a host call never answered fails it at once, unbinds every root and exits 0", { timeout: 30_000 }, async (t) => {
+  const fixture = opencodeFixture(t);
+  const f = start(t);
+  f.send({ v: 1, id: "p-hello", method: "hello", params: { instance: "i-1", location: { directory: fixture.dir } } });
+  await f.waitFor((m) => m.id === "p-hello");
+  const answered = new Set();
+  const answer = async (sessionID) => {
+    const request = await f.waitFor((m) => m.method === "host.session" && m.params.sessionID === sessionID && !answered.has(m.id), `host.session ${sessionID}`);
+    answered.add(request.id);
+    f.send({ v: 1, id: request.id, result: { id: sessionID, location: { directory: join(fixture.dir, sessionID) }, title: "Repo", time: { updated: 1, idle: 1 } } });
+    return request;
+  };
+  // Fill the cap, so the next bind's eviction reads the host inside that bind's task.
+  const ids = Array.from({ length: 64 }, (_, i) => `ses_${String(i).padStart(3, "0")}`);
+  for (const id of ids) {
+    f.send({ v: 1, id: `p-${id}`, method: "tool", params: { instance: "i-1", name: "list_peers", sessionID: id, args: {} } });
+    await answer(id);
+    assert.equal((await f.waitFor((m) => m.id === `p-${id}`)).result.isError, false, id);
+  }
+  f.send({ v: 1, id: "p-cap", method: "tool", params: { instance: "i-1", name: "list_peers", sessionID: "ses_064", args: {} } });
+  await answer("ses_064");
+  // The eviction read of the oldest root is left unanswered; the host timeout is 20 s.
+  await f.waitFor((m) => m.method === "host.session" && m.params.sessionID === "ses_000", "the eviction read");
+  const startedAt = Date.now();
+  const exited = new Promise((resolve) => f.child.once("exit", (code) => resolve(code)));
+  f.child.stdin.end();
+  assert.equal(await exited, 0, "shutdown finished before the 5 s deadline");
+  assert.ok(Date.now() - startedAt < 4000, `shutdown took ${Date.now() - startedAt} ms`);
+  assert.deepEqual(readdirSync(fixture.peers).filter((name) => name.startsWith("opencode-")), []);
+  assert.deepEqual(readdirSync(fixture.sockets).filter((name) => name.startsWith("opencode-")), []);
+});

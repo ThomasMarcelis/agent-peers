@@ -140,7 +140,10 @@ export class BridgeClient {
       pending.timer = setTimeout(() => {
         settle(reject, Object.assign(new Error(`the opencode bridge did not answer ${method}`), { code: "bridge-timeout" }));
       }, timeoutMs);
-      if (signal?.aborted) return onAbort();
+      // Aborted before the write: nothing reached the bridge, so this is a definite failure.
+      if (signal?.aborted) {
+        return settle(reject, new BridgeUnavailable("the tool call was aborted before the request was written; nothing was sent", "bridge-aborted"));
+      }
       signal?.addEventListener("abort", onAbort, { once: true });
       this.#pending.set(id, pending);
       this.#write({ v: PROTOCOL, id, method, params }).catch((error) => {
@@ -297,6 +300,14 @@ export async function cachedNode(state, { env = process.env, probe = probeNode, 
   }
 }
 
+// A cached Node that can no longer be spawned (removed or no longer executable) is forgotten, so
+// the next start re-resolves it after the same 30 s failure backoff.
+export function forgetNode(state, command, error, now = Date.now) {
+  if (!state.node || state.node !== command || !["ENOENT", "EACCES"].includes(error?.code)) return;
+  state.node = undefined;
+  state.nodeFailure = { at: now(), message: `the cached Node executable could not be started (${error.code})` };
+}
+
 async function commandFor(state, env) {
   const configured = state.options?.bridge_command;
   if (configured !== undefined) {
@@ -319,7 +330,8 @@ function ensureBridge(state) {
     const client = new BridgeClient({
       command, args, env,
       onRequest: (message) => hostRequest(state, message),
-      onExit: () => {
+      onExit: (error) => {
+        forgetNode(state, command, error);
         if (state.client === client) {
           state.client = null;
           state.helloed.clear();
@@ -396,29 +408,37 @@ async function hostRequest(state, message) {
     if (typeof sessionID !== "string" || typeof text !== "string") {
       throw Object.assign(new Error("sessionID and text are required"), { code: "invalid-request" });
     }
+    // A host-side bound, not delivery policy: the frame wrapper and escaping can take a body that
+    // fits the 1 MB wire line past 1 MB of text.
     if (Buffer.byteLength(text) > 1_000_000) throw Object.assign(new Error("the synthetic text is too large"), { code: "too-large" });
     try {
       await target.ctx.session.synthetic({
-        sessionID, text, delivery: delivery === "steer" ? "steer" : delivery, resume: resume !== false,
+        sessionID, text, ...(delivery !== undefined ? { delivery } : {}), ...(resume !== undefined ? { resume } : {}),
         ...(description ? { description } : {}), ...(metadata ? { metadata } : {}),
       });
     } catch (error) {
       throw Object.assign(new Error(error?.message ?? "the opencode host refused the synthetic input"),
         { code: hostErrorCode(error, "host-lost") });
     }
-    return { admitted: true, delivery: delivery ?? "steer" };
+    return { admitted: true };
   }
   throw Object.assign(new Error(`unknown host method ${String(message.method).slice(0, 80)}`), { code: "unknown-method" });
 }
 
-// opencode's protocol errors are tagged Effect errors. Classify them by tag; message matching
-// hid a wrong session.get call and would turn unrelated failures into "no session".
+// opencode's errors are tagged Effect errors that the promise adapter rejects with unchanged.
+// Classify them by tag; message matching hid a wrong session.get call and would turn unrelated
+// failures into "no session". The plugin host raises the core Session.* tags; the protocol tags
+// are what the HTTP client raises for the same endpoints. SchemaError is both the input decode and
+// the output encode, which runs after a synthetic was admitted, so it leaves delivery unknown.
+const NOT_FOUND = new Set(["Session.NotFoundError", "SessionNotFoundError"]);
+const REJECTED = new Set(["Session.SyntheticConflictError", "Session.PromptConflictError", "Session.BusyError",
+  "ConflictError", "SessionBusyError", "InvalidRequestError", "MessageNotFoundError"]);
+const LOST = new Set(["SchemaError", "ServiceUnavailableError", "UnknownError", "AbortError"]);
 function hostErrorCode(error, fallback) {
   const tag = error?._tag ?? error?.tag;
-  if (tag === "SessionNotFoundError" || tag === "NotFoundError") return "not-found";
-  if (tag === "ConflictError" || tag === "SyntheticConflictError" || tag === "SessionBusyError" ||
-      tag === "InvalidRequestError" || tag === "MessageNotFoundError") return "host-rejected";
-  if (tag === "ServiceUnavailableError" || tag === "UnknownError" || tag === "AbortError") return "host-lost";
+  if (NOT_FOUND.has(tag)) return "not-found";
+  if (REJECTED.has(tag)) return "host-rejected";
+  if (LOST.has(tag)) return "host-lost";
   log("host.error", { outcome: "failed", reason: tag ? "other" : "unknown" });
   return fallback;
 }
@@ -433,6 +453,9 @@ async function toolsOf(ctx, instance) {
         name: definition.name,
         description: definition.description,
         input: definition.input,
+        // Direct tools under their exact names, as the peer frame's send_peer(to=reply_to) assumes;
+        // without this opencode 2.x offers plugin tools only inside CodeMode's `execute`.
+        options: { codemode: false },
         execute: (args, tool) => executeTool(instance, definition.name, args, tool),
       });
     }
@@ -472,6 +495,13 @@ async function executeTool(instance, name, args, tool) {
     if (name === "send_peer" && ["bridge-lost", "bridge-timeout"].includes(error?.code)) {
       return resultOf("Delivery is unknown: the opencode bridge did not confirm the send; it is not retried.",
         sendResult({ status: "unconfirmed", reason: "bridge-lost" }), false);
+    }
+    if (error?.code === "bridge-aborted") return failure(name, "bridge-unavailable", error.message);
+    // A claim or release may also have been applied; both are idempotent, so say so and let the
+    // model check with list_peers instead of reading a definite failure.
+    if ((name === "claim_name" || name === "release_name") && ["bridge-lost", "bridge-timeout"].includes(error?.code)) {
+      return failure(name, "bridge-unavailable",
+        `the opencode bridge did not confirm ${name}; it may have been applied, so check with list_peers before retrying; ${HINT}`);
     }
     return failure(name, "bridge-unavailable", `the opencode bridge is unavailable: ${error.message}; ${HINT}`);
   }
@@ -522,33 +552,53 @@ export function forwardEvent(state, instance, event) {
     .catch((error) => log("bridge.event", { outcome: "failed", reason: error.code === "bridge-unavailable" ? "bridge_unavailable" : "other" }));
 }
 
+const RESUBSCRIBE_MIN_MS = 1000, RESUBSCRIBE_MAX_MS = 30_000, DISPOSE_WAIT_MS = 1000;
+const sleep = (ms, signal) => new Promise((resolve) => {
+  const done = () => { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); };
+  const timer = setTimeout(done, ms);
+  signal?.addEventListener("abort", done, { once: true });
+});
+
 // opencode's EventDomain.subscribe returns an AsyncIterable, not a callback registration. Keep
 // one loop per plugin instance, abort it on cleanup, and resubscribe if the volatile stream ends.
-function subscribeEvents(state, instance, disposers) {
+// Resubscribing backs off from 1 s to 30 s and resets once a stream delivers an event; a failing
+// stream is logged on its first failure and then at most once per 30 s.
+export function subscribeEvents(state, instance, disposers, { delay = sleep, now = Date.now, report = log } = {}) {
   if (!state.instances.get(instance)?.ctx?.event?.subscribe) return;
   const controller = new AbortController();
+  const live = () => !controller.signal.aborted && state.instances.has(instance);
   const loop = (async () => {
-    while (!controller.signal.aborted && state.instances.has(instance)) {
+    let wait = RESUBSCRIBE_MIN_MS, reported;
+    while (live()) {
+      let failed;
       try {
         const stream = state.instances.get(instance)?.ctx.event.subscribe({ signal: controller.signal });
         for await (const event of stream) {
-          if (controller.signal.aborted || !state.instances.has(instance)) break;
+          if (!live()) break;
+          wait = RESUBSCRIBE_MIN_MS;
+          reported = undefined;
           forwardEvent(state, instance, event);
         }
-        if (!controller.signal.aborted && state.instances.has(instance)) {
-          log("bridge.event", { outcome: "closed", reason: "stream-ended" });
-        }
-      } catch (error) {
+        if (live()) failed = { outcome: "closed", reason: "stream-ended" };
+      } catch {
         if (controller.signal.aborted) break;
-        log("bridge.event", { outcome: "failed", reason: "stream" });
+        failed = { outcome: "failed", reason: "stream" };
       }
-      if (controller.signal.aborted || !state.instances.has(instance)) break;
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (!live()) break;
+      if (reported === undefined || now() - reported >= RESUBSCRIBE_MAX_MS) {
+        reported = now();
+        report("bridge.event", failed);
+      }
+      await delay(wait, controller.signal);
+      wait = Math.min(wait * 2, RESUBSCRIBE_MAX_MS);
     }
   })();
   disposers.push(async () => {
     controller.abort();
-    await loop.catch(() => {});
+    // A host stream that ignores the abort must not hang plugin unload.
+    let timer;
+    await Promise.race([loop.catch(() => {}), new Promise((resolve) => { timer = setTimeout(resolve, DISPOSE_WAIT_MS); })]);
+    clearTimeout(timer);
   });
 }
 
@@ -561,6 +611,9 @@ export const plugin = {
     const instance = randomUUID();
     state.instances.set(instance, { ctx, location: normalizeLocation(ctx?.location) });
     const options = ctx?.options ?? {};
+    // The first instance's options hold until the last instance closes. A later instance (a hot
+    // reload) can only add a bridge_command when none was set, and that applies at the next child
+    // start; a running child is never restarted for new options.
     if (state.options === undefined) state.options = options;
     else if (state.options.bridge_command === undefined && options.bridge_command !== undefined) state.options = { ...state.options, ...options };
     try {

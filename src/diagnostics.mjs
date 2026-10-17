@@ -1,8 +1,9 @@
-import { lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, opendirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { VERSION } from "./version.mjs";
 import { claudeHome, opencodePeers, peersHome } from "./wire.mjs";
 import { loggingConfig } from "./logging.mjs";
@@ -96,49 +97,70 @@ function localPackageVersion(entry) {
   return undefined;
 }
 
-// The installed plugin package. A local path is walked up to its package.json; a package entry
-// checks the config-local node_modules, then opencode's npm cache. It never walks parent
-// node_modules and reports an unrelated global copy.
-function cachedOpencodePackageVersion(env = process.env) {
-  const home = env.HOME || homedir();
-  const cache = env.XDG_CACHE_HOME || join(home, ".cache");
-  const root = join(cache, "opencode", "npm");
-  let best;
-  try {
-    for (const key of readdirSync(root)) {
-      for (const generation of readdirSync(join(root, key))) {
-        const manifest = join(root, key, generation, "node_modules", "agent-peers", "package.json");
-        try {
-          const stat = statSync(manifest);
-          if (!best || stat.mtimeMs > best.mtime) {
-            const pkg = JSON.parse(readFileSync(manifest, "utf8"));
-            if (pkg?.name === "agent-peers" && typeof pkg.version === "string") best = { version: pkg.version, mtime: stat.mtimeMs };
-          }
-        } catch {}
-      }
-    }
-  } catch {}
-  return best?.version;
+// opencode 2.x installs a package entry into its own npm cache, keyed by the entry itself:
+// <cache>/opencode/npm/<name>@<spec>/<generation>/node_modules/<name>, with a bare name keyed as
+// <name>@latest and the numerically greatest generation the one it loads. Only that install is
+// read: one directory listing and one manifest. A newer copy under another key is not the one
+// opencode loads, so it is never reported.
+const MAX_GENERATIONS = 1024;
+
+function opencodeCacheKey(entry) {
+  return entry === "agent-peers" ? "agent-peers@latest" : entry;
 }
 
-const isLocalPluginEntry = (entry) =>
-  typeof entry === "string" && (entry.endsWith(".mjs") || entry.endsWith(".js") || entry.startsWith(".") || entry.startsWith("/"));
-
-function configuredPackageVersion(configPath) {
+function readAgentPeersManifest(directory) {
   try {
-    const pkg = JSON.parse(readFileSync(join(dirname(configPath), "node_modules", "agent-peers", "package.json"), "utf8"));
+    const pkg = JSON.parse(readFileSync(join(directory, "node_modules", "agent-peers", "package.json"), "utf8"));
     if (pkg?.name === "agent-peers" && typeof pkg.version === "string") return pkg.version;
   } catch {}
   return undefined;
 }
 
+function cachedOpencodePackageVersion(entry, env = process.env) {
+  // Git, URL and file specs use other cache keys; their install is reported as unknown.
+  if (/[/\\:]/.test(entry.slice("agent-peers".length))) return undefined;
+  const cache = env.XDG_CACHE_HOME || join(env.HOME || homedir(), ".cache");
+  const root = join(cache, "opencode", "npm", opencodeCacheKey(entry));
+  let newest, seen = 0, dir;
+  try {
+    dir = opendirSync(root);
+    for (let item; (item = dir.readSync());) {
+      if (++seen > MAX_GENERATIONS) return undefined;
+      if (/^\d+$/.test(item.name) && (newest === undefined || Number(item.name) > Number(newest))) newest = item.name;
+    }
+  } catch { return undefined; }
+  finally { try { dir?.closeSync(); } catch {} }
+  // Without a generation opencode reads the key directory itself.
+  return readAgentPeersManifest(newest === undefined ? root : join(root, newest));
+}
+
+// A configured entry is a string, opencode 2.x's { package, options } object, or a legacy
+// [name, options] pair. A "-name" entry removes a plugin and is not an install.
+function pluginEntryTarget(entry) {
+  if (Array.isArray(entry)) return entry[0];
+  if (entry && typeof entry === "object") return entry.package;
+  return entry;
+}
+
+const isPackageEntry = (entry) => entry === "agent-peers" || entry.startsWith("agent-peers@");
+
+// opencode treats only these forms as local paths; anything else is an npm specifier.
+const isLocalPluginEntry = (entry) =>
+  typeof entry === "string" && (entry.startsWith("./") || entry.startsWith("../") || entry.startsWith("/") ||
+    entry.startsWith("file://"));
+
+function localEntryPath(entry, configPath) {
+  if (entry.startsWith("file://")) { try { return fileURLToPath(entry); } catch { return undefined; } }
+  return isAbsolute(entry) ? entry : join(dirname(configPath), entry);
+}
+
+// The version of the install the first agent-peers entry maps to, or undefined when unknown.
 function installedPluginVersion(entries, configPath) {
   for (const entry of entries) {
-    if (entry === "agent-peers" || entry.startsWith("agent-peers@")) {
-      return configuredPackageVersion(configPath) ?? cachedOpencodePackageVersion();
-    }
+    if (isPackageEntry(entry)) return cachedOpencodePackageVersion(entry);
     if (isLocalPluginEntry(entry)) {
-      const local = localPackageVersion(isAbsolute(entry) ? entry : join(dirname(configPath), entry));
+      const path = localEntryPath(entry, configPath);
+      const local = path && localPackageVersion(path);
       if (local) return local;
     }
   }
@@ -154,10 +176,28 @@ function opencodePlugin() {
     return { status: "warning", message: `${path} could not be read as JSON; install the plugin with "opencode plugin add agent-peers@next"` };
   }
   const plugins = Array.isArray(config?.plugins) ? config.plugins : [];
-  const entries = plugins.map((entry) => Array.isArray(entry) ? entry[0] : entry).filter((entry) => typeof entry === "string");
-  const listed = entries.some((entry) => entry === "agent-peers" || entry.startsWith("agent-peers@") ||
-    (isLocalPluginEntry(entry) && localPackageVersion(isAbsolute(entry) ? entry : join(dirname(path), entry))));
+  // opencode applies entries in order; "-<target>" removes an earlier entry for that target.
+  const entries = [];
+  for (const entry of plugins.map(pluginEntryTarget)) {
+    if (typeof entry !== "string") continue;
+    if (!entry.startsWith("-")) { entries.push(entry); continue; }
+    const target = entry.slice(1);
+    const removed = (other) => other === target || (isPackageEntry(other) && isPackageEntry(target));
+    for (let i = entries.length - 1; i >= 0; i--) if (removed(entries[i])) entries.splice(i, 1);
+  }
+  const listed = entries.some((entry) => isPackageEntry(entry) ||
+    (isLocalPluginEntry(entry) && localEntryPath(entry, path) && localPackageVersion(localEntryPath(entry, path))));
   if (!listed) return { status: "warning", message: `agent-peers is not in ${path}'s plugins; run "opencode plugin add agent-peers@next"` };
+  // opencode 2.x skips a local plugin path that is a file ("configured plugin path must be a
+  // directory"), so such an entry never loads.
+  const fileEntry = entries.find((entry) => {
+    if (!isLocalPluginEntry(entry)) return false;
+    const local = localEntryPath(entry, path);
+    try { return Boolean(local && localPackageVersion(local) && statSync(local).isFile()); } catch { return false; }
+  });
+  if (fileEntry) {
+    return { status: "warning", message: `${path} lists the plugin file ${fileEntry}; opencode loads only a directory, so list the package directory instead` };
+  }
   const installed = installedPluginVersion(entries, path);
   if (!installed) return { status: "warning", message: `agent-peers is listed; its installed package version is unknown (CLI ${VERSION})` };
   if (installed !== VERSION) {

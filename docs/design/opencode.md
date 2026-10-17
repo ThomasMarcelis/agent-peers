@@ -1,8 +1,8 @@
 # opencode support (experimental)
 
-Design for adding **opencode v2** as a peer host in agent-peers 1.0.0-rc.6. Not packaged yet. Normative words: **must**, **never**. Numbers are constants in code, not contract.
+Design for **opencode v2** as a peer host in agent-peers. It first ships, experimental, in 1.0.0-rc.7 (an rc.6 was cut locally from the first implementation but never published); this record describes the rc.7 behavior. Normative words: **must**, **never**. Numbers are constants in code, not contract.
 
-> **Base tree, confirmed 2026-10-17.** `main` is `78a7a21`, the merge of PR #34 (`release/1.0.0-rc.4`); tag `v1.0.0-rc.4` is `af55216`; the package is `1.0.0-rc.4`. There is **no** `release/1.0.0-rc.5` branch, no `v1.0.0-rc.5` tag, and no commit mentioning rc.5, locally or on `origin`. Cut rc.6 from this rc.4 tree. If an rc.5 tree exists in an uncommitted session elsewhere, stop and rebase before implementation.
+> **History.** The design was written against the rc.4 tree (`main` at `78a7a21`, tag `v1.0.0-rc.4` at `af55216`). There was no rc.5, so rc.6 was cut from rc.4. Where a section says "in rc.6", the statement still holds unless §15 records a change after review.
 
 ## 0. Scope
 
@@ -181,7 +181,8 @@ A record whose bridge is dead, or whose file no longer names it, is not listed; 
   - idle means `Session.Info.time.idle` is present and `time.idle >= time.updated`;
   - no claimed names;
   - `lastActivity` is the latest of the last prompt/tool/host-call time and `time.updated`; the eviction candidate is the smallest;
-  - eviction runs through that root's single-flight task, so a handoff already in progress finishes first; the idle/no-names check is repeated before closing. A busy root is never evicted.
+  - no queued delivery;
+  - candidates are tried one at a time in that order. Each is decided inside its own single-flight bind task: the no-names/no-queue check, then a fresh `host.session` read, then the check again before closing. The pass stops at the first eviction, and the room lock only re-checks the count and inserts, retrying while another candidate remains. A busy root is never evicted, and no host call runs under the room lock.
   Eviction closes the inboxes and removes the record, so the name/address reads `not-running`; the session rebinds on its next prompt or tool call. If there is no idle unnamed root, the new bind is refused with `inbox-unavailable` and text to close sessions or release names; the bridge logs `opencode.bind.cap`. The prompt event cannot report this to the model; the session's next tool call does. Busy workers and roots waiting for a peer reply keep their inboxes.
 - **Unbind:** `session.deleted`; `session.moved` (unbind, then rebind on the next prompt/tool in the new location); an `event { type: "closed" }` for a plugin instance; bridge exit. Unbind closes inboxes, removes the registry record, and clears admission/outbox/pins. Name records stay on disk and read `not-running`, exactly as for Codex/Hermes.
 - **No automatic rebind from disk; no in-memory crash list.** A server restart or bridge crash loses the bridge. An idle opencode session is unreachable until its next prompt or tool call, when it binds again. This is the same lazy-restore rule as Hermes and avoids waking abandoned one-off sessions. Dead `opencode-*.json` records and their deterministic sockets are cleaned by a new bridge (only when the old PID/start is dead), not revived.
@@ -308,7 +309,7 @@ Bridge → plugin:
 | method | params | result |
 | --- | --- | --- |
 | `host.session` | `instance`, `sessionID` | `{ id, parentID?, location, title?, time?, revert? }` or error `not-found` |
-| `host.synthetic` | `instance`, `sessionID`, `text`, `delivery`, `resume`, `description`, `metadata` | `{ admitted: true, delivery }` or error `not-found`/`host-rejected`/`too-large` |
+| `host.synthetic` | `instance`, `sessionID`, `text`, `delivery`, `resume`, `description`, `metadata` | `{ admitted: true }` or error `not-found`/`host-rejected`/`too-large`/`host-lost` |
 
 `hello` is once per instance; it does not update `location`. `event` is the only lifecycle notification: `prompt` binds, `deleted` unbinds, `moved` unbinds, `closed` unbinds every root for that instance. A `moved` event from an instance that no longer owns the root is ignored, so a late move cannot close a newer bind. `closed` is an instance unregister, not a session event; without it, a location unload in a shared child would leave roots routed to a dead `ctx`. `host.synthetic` is the peer path and the late-notice path (`resume: false`); there is no `host.notice`, `bind`, `unbind` or `shutdown`.
 
@@ -475,7 +476,7 @@ There is no offline mailbox and no automatic retry. A message written whose host
 Build `test/opencode-host.mjs`, a fake opencode host modeled on `test/app-server.mjs`'s fake:
 
 - a session store with `id`, `parentID`, `location.directory`, `title`, `time { updated, idle? }`, `revert`, and `prompt`/`synthetic`/`get` methods;
-- `synthetic` records the text, delivery and resume; when busy it keeps the text as steer; when idle it “wakes” and can emit a scripted reply; when `revert` is set it refuses the wake and never commits;
+- `synthetic` records the text, delivery and resume and, like opencode 2.0.32's `Session.synthetic`, wakes the session whenever `resume` is not `false` and no revert is staged, busy or idle alike; it can emit a scripted reply; when `revert` is set it suppresses the wake and never commits;
 - `session.deleted`/`session.moved` events with the same shape;
 - a plugin harness with a `globalThis` handle, two instances, and the plugin-side JSON-lines client, so the real bridge, inboxes, registry, names and receipts run unchanged;
 - a fake peer inbox (`test/listeners.mjs`) to observe replies.
@@ -486,9 +487,9 @@ Tests:
 2. **Shared child:** two plugin instances share one stdio child; both `hello`; host calls route by `instance`; closing one sends `closed`, unbinds only its roots, and keeps the child for the other; closing the last ends stdin and the child exits. No stale-socket cases.
 3. **Concurrent bind and cap:** two bridges race with no registry path; exactly one publishes via `link`, the other gets `inbox-unavailable` and claims/sends nothing; prompt event and first tool call bind single-flight; record/socket created; second bind is idempotent; at 64 roots, an idle unnamed LRU root is evicted through its single-flight task and reads `not-running`; a busy root is not evicted even if it is oldest; no idle unnamed candidate refuses; all-named refusal.
 4. **Child:** `get` returns `parentID`; root cache avoids repeated `host.session`; child tool call sends from the root address, no child record; `claim_name`/`release_name` → `no-session`; `self.subagent` true.
-5. **Inbound busy:** peer line; fake host busy; `queued` then `accepted`; text has the frame; delivery `steer`; no turn restart.
-6. **Inbound idle:** peer line; fake host idle; `accepted`; host records `resume: true` and a wake.
-7. **Synthetic vs prompt:** the same frame through both paths steers/wakes in the fake; prompt commits a staged revert, synthetic never does. Synthetic is the only delivery path.
+5. **Inbound busy:** peer line; fake host busy; `queued` then `accepted`; the text is the frame; `host.synthetic` gets `delivery: "steer"` and `resume: true`; the host records one wake, which the running turn coalesces, so the item is steered into that turn and no turn restarts.
+6. **Inbound idle:** peer line; fake host idle; `accepted`; `host.synthetic` gets `resume: true`; the host records one wake, which starts a turn.
+7. **Synthetic vs prompt:** the same frame through both paths wakes the fake; prompt commits a staged revert, synthetic never does. Synthetic is the only delivery path.
 8. **Staged revert:** session with `revert`; `host.session` returns it; bridge drops `host-rejected` before calling `host.synthetic`; revert unchanged; sender gets `dropped`/`host-rejected`.
 9. **Receipts and not-found:** queued/accepted; dropped host-rejected; host `not-found` maps `failed`/`no-session` for a tool and `dropped`/`inbox-closed` for a handoff; a target peer's missing address remains the ordinary `send_peer` `not-found`; no receipt on timeout/lost; duplicate no receipt; rate limit/queue full/too large; no HTTP 404 wording.
 10. **to_name:** a line with a name the root does not hold is dropped `not-a-reply-target`; a held name is admitted.
@@ -507,7 +508,7 @@ Commands: `npm run check`, `npm test`, `npm run test:python`, `npm run test:pack
 
 ## 11. Live tests (only with approval)
 
-- `test/contract.mjs --opencode` (new): start a private `opencode serve` with a temp `XDG_DATA_HOME`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME` and `OPENCODE_PASSWORD`, a temp project with `plugins: ["<checkout>/opencode/server.mjs"]` (or the packed package), and `deepseek/deepseek-flash` with `--auto`. Create a session with `opencode run --server …`; wait for its `opencode-*.json`; send a busy request (sleep) and an idle request; verify the codeword appears in the session context and that a reply reaches the fake peer inbox. Also verify `list_peers`/`send_peer` results, a claimed name, a staged-revert drop, and a restart/rebind.
+- `test/contract.mjs --opencode` (new): start a private `opencode serve` with a temp `XDG_DATA_HOME`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME` and `OPENCODE_PASSWORD`, a temp project with `plugins: ["<checkout>/opencode"]` (opencode loads only a directory for a local entry), or the packed package, and `deepseek/deepseek-flash` with `--auto`. Create a session with `opencode run --server …`; wait for its `opencode-*.json`; send a busy request (sleep) and an idle request; verify the codeword appears in the session context and that a reply reaches the fake peer inbox. Also verify `list_peers`/`send_peer` results, a claimed name, a staged-revert drop, and a restart/rebind.
 - A two-server test with a shared temp `XDG_DATA_HOME`: start two `opencode serve` processes; create a session in A; prompt it in B; record which server's `session.active`/events drain it, and assert only one bridge owns the inbox/record. This observes the documented second-runner risk; it is not a model-quality test.
 - `test/live-matrix.mjs` gains an opencode participant (one root, one child) alongside Claude/Codex/Hermes; all directed round trips; no unrelated sessions. Use isolated `AGENT_PEERS_HOME`, `XDG_RUNTIME_DIR`, `CLAUDE_CONFIG_DIR`, temp config/data/state, and a private opencode server. Ask before running; these start real sessions and spend model tokens.
 - Record exact versions, model, counts and limitations in `docs/release-verification.md`; never commit raw transcripts.
@@ -570,3 +571,15 @@ These are recorded so the implementation matches the reviewed record rather than
 - The registry record carries a per-bridge `token` in addition to `pid`/`procStart`. A same-process record whose token is not held by a live bridge is a stale predecessor; a record whose token belongs to another live bridge is not stolen. This closes the self-lockout after a failed publish without reopening the two-bridge race.
 - The dead-record replacement uses move-aside + inode verification + `link`, not an unconditional `rename` over the registry path; the changelog and reference use the same wording.
 - The opencode tool descriptions are opencode-specific; tool names and input schemas are the Codex ones. Codex's Zod definitions and `tools/list` golden file are unchanged, and a parity test covers names and input schemas.
+
+rc.7 review round:
+
+- Host errors are classified by their Effect tag, using opencode's real `Session.*` tags (for example `Session.NotFoundError` maps to `not-found`); message text is never matched. An unrecognized tag keeps the caller's fallback code.
+- An abort before the request is written to the bridge is a definite failure (`failed`/`bridge-unavailable`). An abort after the write, or a timeout, is `unconfirmed`/`bridge-lost`: delivery is unknown and is not retried.
+- When the volatile event stream ends, each plugin instance resubscribes with backoff until it is closed.
+- Eviction stays lazy. At the cap, a candidate's state is re-read inside that candidate's own bind task before it is unbound, and the pass stops at the first eviction.
+- `session.deleted` is serialized through the root's bind task, so a delete cannot race a bind. Deleted IDs are kept in a bounded set so a late prompt event does not re-bind a deleted root.
+- EOF on the bridge's stdin rejects every pending host call instead of leaving it to time out.
+- The four tools are registered with `options: { codemode: false }`. opencode 2.0.32 offers a tool to the model directly only when `codemode === false` (`packages/core/src/tool.ts`); otherwise it sits behind CodeMode's single `execute` tool, and the model never sees `send_peer` by name. The first live smoke run found this: zero direct calls, while the calls made inside `execute` succeeded.
+- A local plugin entry must be a directory (`config/plugin/source.ts` skips a file with a warning); `doctor` warns about a file entry and applies `-<target>` removals in order, as opencode does.
+- `doctor` reports the install the configured entry maps to: `<cache>/opencode/npm/<name>@<spec>/<newest generation>/node_modules/agent-peers` (a bare name is `@latest`), or the package a local path walks up to. It reads one directory listing and one manifest, and reports `unknown` rather than the newest copy found elsewhere in the cache.

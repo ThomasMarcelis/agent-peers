@@ -22,7 +22,7 @@ function context(dir, host) {
     session: {
       get: async ({ sessionID } = {}) => {
         const info = host.sessions.get(sessionID);
-        if (!info) throw Object.assign(new Error(`session ${sessionID} not found`), { _tag: "SessionNotFoundError", sessionID });
+        if (!info) throw Object.assign(new Error(`session ${sessionID} not found`), { _tag: "Session.NotFoundError", sessionID });
         return info;
       },
       synthetic: async (params) => { ctx.synth.push(params); return { admitted: true }; },

@@ -90,14 +90,19 @@ export function formatCodexPeer(p) {
 // The CLI is also used outside Codex, where there is no caller thread to compare.
 // Name the platform explicitly rather than implying Claude's SendMessage is a Codex tool.
 export function formatSessionPeer(p) {
+  // Claude and Codex rows keep the rc.4 bytes, including the four-space gap when there is no status;
+  // opencode rows join only the fields present, so they never carry a doubled gap.
+  const stale = p.reachable === false ? "  stale" : "";
   const status = [p.status, p.reachable === false ? "stale" : ""].filter(Boolean).join("  ");
-  const head = `${p.name}${status ? `  ${status}` : ""}  cwd=${p.cwd}\n`;
-  const stale = p.reachable === false ? "  stale: the socket refused a connection; the record is kept\n" : "";
+  const head = p.kind === "opencode"
+    ? `${p.name}${status ? `  ${status}` : ""}  cwd=${p.cwd}\n`
+    : `${p.name}  ${p.status ?? ""}${stale}  cwd=${p.cwd}\n`;
+  const staleLine = p.reachable === false ? "  stale: the socket refused a connection; the record is kept\n" : "";
   const claims = p.claims?.length ? `  claimed names: ${p.claims.join(", ")}\n` : "";
   if (p.kind === "opencode") {
-    return head + stale + claims + `  OpenCode bridge: send_peer ${JSON.stringify({ to: p.address })}`;
+    return head + staleLine + claims + `  OpenCode bridge: send_peer ${JSON.stringify({ to: p.address })}`;
   }
-  return head + stale + claims +
+  return head + staleLine + claims +
     `  Claude native: SendMessage ${JSON.stringify({ to: p.address })}\n` +
     `  Codex bridge: send_peer ${JSON.stringify({ to: p.address })}`;
 }

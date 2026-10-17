@@ -10,6 +10,7 @@
 
 import { randomUUID, createHash } from "node:crypto";
 import { linkSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { basename, join } from "node:path";
 import { frame } from "./frame.mjs";
 import { Admission, Receipts, checkSocketPath, closeInbox, listenInbox, ownsSocket, readMessage } from "./inbox.mjs";
@@ -30,6 +31,9 @@ export const PROTOCOL = 1;
 export const ROOTS_MAX = 64;
 export const PROTOCOL_MAX_LINE = 4 * 1024 * 1024;
 const CONNECTION_MAX = 32, QUEUE_MAX = 50, QUEUE_BYTES_MAX = 8_000_000, DEFAULT_HOST_TIMEOUT_MS = 20_000;
+// Bounds for the child-to-root cache and the deleted session ids (opencode never reuses an id);
+// the oldest entry goes first.
+const CACHE_MAX = 4096, DELETED_MAX = 1024;
 const START = processStart(process.pid);
 
 // bridge token -> root, for bridges in this process. A record owned by this pid/start is stale
@@ -73,6 +77,25 @@ const sameInode = (path, identity) => {
   catch { return false; }
 };
 
+// A replaced dead predecessor may have recorded this root's deterministic socket in another
+// socket directory. That file is removed only while it is still the same socket and a connect to
+// it is refused; a listener that answers, or does not answer in time, is left alone.
+async function dropOldSocket(record, socket) {
+  const old = peerSocket(record?.address);
+  if (!old || old === socket || basename(old) !== basename(socket)) return;
+  let identity;
+  try { identity = lstatSync(old); } catch { return; }
+  if (!identity.isSocket()) return;
+  const refused = await new Promise((resolve) => {
+    const conn = connect(old);
+    const finish = (value) => { clearTimeout(timer); conn.destroy(); resolve(value); };
+    const timer = setTimeout(() => finish(false), 200);
+    conn.once("connect", () => finish(false));
+    conn.once("error", (error) => finish(error.code === "ECONNREFUSED" || error.code === "ENOENT"));
+  });
+  try { if (refused && sameInode(old, identity)) rmSync(old, { force: true }); } catch {}
+}
+
 // The plugin returns Session.Info; tolerate the SDK's small wrappers, but never guess a session.
 function sessionInfo(value, expectedID) {
   const info = value?.session ?? value?.data ?? value;
@@ -109,17 +132,16 @@ export function loadToolDefinitions() {
 
 export class OpencodeBridge {
   #send;
-  #hostTimeoutMs;
   #admissionOptions;
   #queueMax;
   #queueBytesMax;
   #instances = new Map();
   #roots = new Map();
   #cache = new Map();
+  #deleted = new Set();
   #bindTasks = new Map();
   #room = Promise.resolve();
   #swept = false;
-  #pending = new Map();
   #receipts;
   #closed = false;
   #closing;
@@ -128,11 +150,10 @@ export class OpencodeBridge {
   #log;
   #publishHook;
 
-  constructor({ send = async () => ({ result: undefined }), log: logger = log, hostTimeoutMs = DEFAULT_HOST_TIMEOUT_MS,
+  constructor({ send = async () => ({ result: undefined }), log: logger = log,
     admission = {}, queueMax = QUEUE_MAX, queueBytesMax = QUEUE_BYTES_MAX, publishHook } = {}) {
     this.#send = send;
     this.#log = logger;
-    this.#hostTimeoutMs = hostTimeoutMs;
     this.#admissionOptions = admission;
     this.#queueMax = queueMax;
     this.#queueBytesMax = queueBytesMax;
@@ -200,8 +221,16 @@ export class OpencodeBridge {
       return;
     }
     if (type === "deleted") {
-      const root = this.#roots.get(sessionID);
-      if (root) await this.#unbind(root);
+      // Mark it first, then unbind through the root's bind task: a bind already in flight
+      // finishes and is closed here, and any later bind of this id refuses not-found.
+      if (!this.#deleted.has(sessionID)) {
+        if (this.#deleted.size >= DELETED_MAX) this.#deleted.delete(this.#deleted.values().next().value);
+        this.#deleted.add(sessionID);
+      }
+      await this.#bindTask(sessionID, async () => {
+        const root = this.#roots.get(sessionID);
+        if (root) await this.#unbind(root);
+      });
       for (const [id, cached] of this.#cache) if (id === sessionID || cached.rootID === sessionID) this.#cache.delete(id);
       return;
     }
@@ -223,11 +252,6 @@ export class OpencodeBridge {
     this.#closing = (async () => {
       await Promise.allSettled([...this.#bindTasks.values()]);
       await Promise.all([...this.#roots.values()].map((root) => this.#unbind(root)));
-      for (const pending of this.#pending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(Object.assign(new Error("the opencode bridge closed"), { code: "bridge-closed" }));
-      }
-      this.#pending.clear();
     })();
     return this.#closing;
   }
@@ -253,7 +277,15 @@ export class OpencodeBridge {
       }
       rootID = current.id;
       rootInfo = current;
-      if (rootID !== sessionID) this.#cache.set(sessionID, { rootID, info, rootInfo });
+    }
+    // A read answered before a delete, or a cached child of a deleted root, is gone.
+    if (this.#deleted.has(sessionID) || this.#deleted.has(rootID)) {
+      this.#cache.delete(sessionID);
+      throw new BridgeError("not-found", "this opencode session was deleted");
+    }
+    if (!cached && rootID !== sessionID) {
+      if (this.#cache.size >= CACHE_MAX) this.#cache.delete(this.#cache.keys().next().value);
+      this.#cache.set(sessionID, { rootID, info, rootInfo });
     }
     const root = await this.#bind(rootID, rootInfo, instance);
     root.lastActivity = Math.max(root.lastActivity, Date.now(), Number(rootInfo.time?.updated) || 0);
@@ -261,8 +293,14 @@ export class OpencodeBridge {
   }
 
   #bind(rootID, info, instance) {
+    return this.#bindTask(rootID, () => this.#bindNow(rootID, info, instance));
+  }
+
+  // A root's single-flight task chain. Its binds, its eviction and its delete run here, one at a
+  // time and in order.
+  #bindTask(rootID, fn) {
     const previous = this.#bindTasks.get(rootID) ?? Promise.resolve();
-    const task = previous.catch(() => {}).then(() => this.#bindNow(rootID, info, instance));
+    const task = previous.catch(() => {}).then(fn);
     this.#bindTasks.set(rootID, task);
     return task.finally(() => {
       if (this.#bindTasks.get(rootID) === task) this.#bindTasks.delete(rootID);
@@ -271,6 +309,7 @@ export class OpencodeBridge {
 
   async #bindNow(rootID, info, instance) {
     if (this.#closed) throw new BridgeError("bridge-closed", "the opencode bridge is closing");
+    if (this.#deleted.has(rootID)) throw new BridgeError("not-found", "this opencode session was deleted");
     if (!this.#swept) { this.#swept = true; this.#dropDeadOwners(); }
     for (let attempt = 0; attempt < 2; attempt++) {
       let root = this.#roots.get(rootID);
@@ -297,38 +336,33 @@ export class OpencodeBridge {
       } catch (error) {
         throw new BridgeError("inbox-unavailable", error?.message ?? "the opencode inbox path is unusable");
       }
-      // Host reads for eviction happen before the room lock; the lock then re-checks the cap and
-      // only inserts, so a hung host never blocks every bind. Eviction itself uses the candidate
-      // root's bind task and never holds the room lock while waiting for it.
-      if (this.#roots.size >= ROOTS_MAX) {
-        for (const candidate of await this.#findEviction(rootID)) {
-          if (await this.#evictPrepared(candidate)) break;
-        }
-      }
-      root = await this.#roomLock(async () => {
+      // The room lock only decides the cap and inserts; it never waits on the host. At the cap
+      // one root is evicted outside the lock and the insert is retried, so a concurrent bind that
+      // took the freed seat makes this bind evict another root instead of being refused.
+      const tried = new Set();
+      const seat = () => this.#roomLock(() => {
         if (this.#closed) throw new BridgeError("bridge-closed", "the opencode bridge is closing");
         const existing = this.#roots.get(rootID);
         if (existing) return existing;
-        if (this.#roots.size >= ROOTS_MAX) {
+        return this.#roots.size < ROOTS_MAX ? this.#insert(rootID, info, instance, socket) : undefined;
+      });
+      for (;;) {
+        // A delete that arrived during eviction must not cost another root its seat.
+        if (this.#deleted.has(rootID)) throw new BridgeError("not-found", "this opencode session was deleted");
+        root = await seat();
+        if (root) break;
+        if (!(await this.#evictOne(rootID, tried))) {
+          if (this.#closed) throw new BridgeError("bridge-closed", "the opencode bridge is closing");
+          if (this.#deleted.has(rootID)) throw new BridgeError("not-found", "this opencode session was deleted");
+          // A delete, move or close may have freed a seat while the candidates were read.
+          root = await seat();
+          if (root) break;
+          this.#log("opencode.bind.cap", { sessionId: logIdentity(rootID), outcome: "refused" });
           throw new BridgeError("inbox-unavailable",
             `this agent-peers bridge already serves ${ROOTS_MAX} opencode sessions and none is idle without claimed names; ` +
             "close idle sessions or release names, then retry");
         }
-        const again = this.#roots.get(rootID);
-        if (again) return again;
-        const created = {
-          sessionID: rootID, instance, name: opencodeName(rootID, info), cwd: info.location.directory, info,
-          socket, address: address(socket), registry: registryPath(rootID), procStart: START,
-          generation: generation("opencode", rootID, START), owner: generation("opencode", rootID), startedAt: Date.now(),
-          token: randomUUID(),
-          lastActivity: Math.max(Date.now(), Number(info.time?.updated) || 0), inbox: undefined, closing: undefined,
-          publishing: true, admission: new Admission(this.#admissionOptions), pins: new Pins(), chain: Promise.resolve(),
-          queued: 0, queuedBytes: 0,
-        };
-        created.outbox = new Outbox({ onLate: (late) => this.#notice(created, late), log: this.#log });
-        this.#roots.set(rootID, created);
-        return created;
-      });
+      }
       if (root.instance !== instance) {
         await this.#unbind(root);
         continue;
@@ -366,6 +400,22 @@ export class OpencodeBridge {
     this.#room = new Promise((resolve) => { release = resolve; });
     await previous;
     try { return await fn(); } finally { release(); }
+  }
+
+  // A new root seat, inserted under the room lock and published after it.
+  #insert(rootID, info, instance, socket) {
+    const created = {
+      sessionID: rootID, instance, name: opencodeName(rootID, info), cwd: info.location.directory, info,
+      socket, address: address(socket), registry: registryPath(rootID), procStart: START,
+      generation: generation("opencode", rootID, START), owner: generation("opencode", rootID), startedAt: Date.now(),
+      token: randomUUID(),
+      lastActivity: Math.max(Date.now(), Number(info.time?.updated) || 0), inbox: undefined, closing: undefined,
+      publishing: true, admission: new Admission(this.#admissionOptions), pins: new Pins(), chain: Promise.resolve(),
+      queued: 0, queuedBytes: 0,
+    };
+    created.outbox = new Outbox({ onLate: (late) => this.#notice(created, late), log: this.#log });
+    this.#roots.set(rootID, created);
+    return created;
   }
 
   // The exclusive bind seat. A missing record is created with link(); an existing one is replaced
@@ -490,6 +540,7 @@ export class OpencodeBridge {
         throw error;
       }
       try { rmSync(aside, { force: true }); } catch {}
+      await dropOldSocket(existing, root.socket);
       return { predecessor: true, dev: identity.dev, ino: identity.ino };
     }
     throw new BridgeError("inbox-unavailable", "the opencode registry changed while this bridge was binding; nothing was bound");
@@ -575,45 +626,47 @@ export class OpencodeBridge {
     return root.closing;
   }
 
-  // At the cap, only an idle root (time.idle is present and >= time.updated), with no claimed
-  // names and no queued delivery, is evictable. Host state is read outside the room lock; the
-  // candidate's own bind task performs the final re-check and close.
-  async #findEviction(incoming) {
-    const candidates = [...this.#roots.values()].filter((root) => root.sessionID !== incoming && !root.closing && !root.publishing)
+  // At the cap, evict one root, oldest lastActivity first, and stop at the first one evicted.
+  // Only an idle root (time.idle is present and >= time.updated) with no claimed names and no
+  // queued delivery is evictable. Each candidate is decided inside its own bind task, so a bind
+  // or delete in progress finishes first, from a fresh host read taken there; no host read is
+  // ever made under the room lock. `tried` holds every id already decided for this bind, so the
+  // caller's retry loop ends. Returns false when no candidate was evicted.
+  async #evictOne(incoming, tried) {
+    const candidates = [...this.#roots.values()]
+      .filter((root) => root.sessionID !== incoming && !root.closing && !root.publishing && !tried.has(root.sessionID))
       .sort((a, b) => a.lastActivity - b.lastActivity);
-    const prepared = [];
     for (const candidate of candidates) {
-      if (candidate.queued > 0 || heldBy("opencode", candidate.generation).length) continue;
-      try {
-        const info = await this.#session(candidate.instance, candidate.sessionID);
-        if (idle(info)) prepared.push({ candidate, info });
-      } catch (error) {
-        // A session the host no longer has is safe to close; an unanswered host is not evidence.
-        if (error instanceof BridgeError && error.code === "not-found") prepared.push({ candidate, gone: true });
-      }
+      if (this.#closed) return false;
+      // A seat freed some other way (delete, move, close) needs no eviction.
+      if (this.#roots.size < ROOTS_MAX) return true;
+      tried.add(candidate.sessionID);
+      if (!this.#evictable(candidate)) continue;
+      if (await this.#bindTask(candidate.sessionID, () => this.#evictIfIdle(candidate, incoming))) return true;
     }
-    return prepared;
+    return false;
   }
 
-  #evictPrepared({ candidate, info, gone }) {
-    const previous = this.#bindTasks.get(candidate.sessionID) ?? Promise.resolve();
-    const task = previous.catch(() => {}).then(async () => {
-      if (this.#roots.get(candidate.sessionID) !== candidate || candidate.closing) return false;
-      if (this.#roots.size < ROOTS_MAX) return true;
-      if (candidate.queued > 0 || heldBy("opencode", candidate.generation).length) return false;
-      if (!gone && !idle(info)) return false;
-      if (!gone) {
-        candidate.info = info;
-        candidate.lastActivity = Math.max(candidate.lastActivity, Number(info.time?.updated) || 0);
-      }
-      await this.#unbind(candidate);
-      this.#log("opencode.bind.cap", { sessionId: logIdentity(candidate.sessionID), outcome: "evicted" });
-      return true;
-    });
-    this.#bindTasks.set(candidate.sessionID, task);
-    return task.finally(() => {
-      if (this.#bindTasks.get(candidate.sessionID) === task) this.#bindTasks.delete(candidate.sessionID);
-    });
+  #evictable(candidate) {
+    return this.#roots.get(candidate.sessionID) === candidate && !candidate.closing &&
+      candidate.queued === 0 && !heldBy("opencode", candidate.generation).length;
+  }
+
+  // Runs inside the candidate's bind task.
+  async #evictIfIdle(candidate, incoming) {
+    if (this.#roots.size < ROOTS_MAX) return true;
+    if (this.#deleted.has(incoming) || !this.#evictable(candidate)) return false;
+    try {
+      if (!idle(await this.#session(candidate.instance, candidate.sessionID))) return false;
+    } catch (error) {
+      // A session the host no longer has is safe to close; an unanswered host is not evidence.
+      if (!(error instanceof BridgeError) || error.code !== "not-found") return false;
+    }
+    // A delivery or a name may have arrived during the read, or the incoming root was deleted.
+    if (this.#deleted.has(incoming) || !this.#evictable(candidate)) return false;
+    await this.#unbind(candidate);
+    this.#log("opencode.bind.cap", { sessionId: logIdentity(candidate.sessionID), outcome: "evicted" });
+    return true;
   }
 
   // ---- host calls ----
@@ -826,7 +879,18 @@ class ProtocolWriter {
 // diagnostic log. Requests run concurrently; per-root bind tasks keep each root's order.
 export function runOpencodeBridge({ hostTimeoutMs = DEFAULT_HOST_TIMEOUT_MS } = {}) {
   const pending = new Map();
-  let buffer = "", discarding = false, stopping = false;
+  let buffer = "", discarding = false, stopping = false, inputClosed = false;
+  const hostClosed = () => Object.assign(new Error("the opencode host connection is closed"), { code: "bridge-closed" });
+  // Once stdin has ended no host answer can arrive. Every pending and later host call fails at
+  // once, so shutdown never waits on one and still unbinds every root.
+  const closeInput = () => {
+    inputClosed = true;
+    for (const [id, entry] of pending) {
+      clearTimeout(entry.timer);
+      pending.delete(id);
+      entry.reject(hostClosed());
+    }
+  };
   const write = (message) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(Object.assign(new Error("bridge output timed out"), { code: "ETIMEDOUT" })), 5000);
     process.stdout.write(JSON.stringify(message) + "\n", (error) => {
@@ -836,6 +900,7 @@ export function runOpencodeBridge({ hostTimeoutMs = DEFAULT_HOST_TIMEOUT_MS } = 
   });
   const writer = new ProtocolWriter(write);
   const send = (message) => new Promise((resolve, reject) => {
+    if (inputClosed) return reject(hostClosed());
     const timer = setTimeout(() => {
       pending.delete(message.id);
       reject(Object.assign(new Error("opencode host did not answer"), { code: "ETIMEDOUT" }));
@@ -847,7 +912,7 @@ export function runOpencodeBridge({ hostTimeoutMs = DEFAULT_HOST_TIMEOUT_MS } = 
       reject(error);
     });
   });
-  const bridge = new OpencodeBridge({ send, hostTimeoutMs, log: (event, fields) => logEvent("opencode-bridge", event, fields) });
+  const bridge = new OpencodeBridge({ send, log: (event, fields) => logEvent("opencode-bridge", event, fields) });
   const stop = async (exitCode = 0) => {
     if (stopping) return;
     stopping = true;
@@ -938,9 +1003,10 @@ export function runOpencodeBridge({ hostTimeoutMs = DEFAULT_HOST_TIMEOUT_MS } = 
   });
   process.stdin.on("end", () => {
     if (buffer.trim()) logEvent("opencode-bridge", "bridge.error", { reason: "malformed", outcome: "incomplete_frame" });
+    closeInput();
     void stop();
   });
-  process.stdin.on("error", (error) => { logEvent("opencode-bridge", "bridge.error", errorFields(error)); void stop(1); });
+  process.stdin.on("error", (error) => { logEvent("opencode-bridge", "bridge.error", errorFields(error)); closeInput(); void stop(1); });
   process.stdout.on("error", (error) => { logEvent("opencode-bridge", "bridge.error", errorFields(error)); void stop(1); });
   process.once("SIGINT", () => { void stop(); });
   process.once("SIGTERM", () => { void stop(); });

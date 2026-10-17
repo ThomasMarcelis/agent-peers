@@ -86,6 +86,9 @@ export class FakeHost {
     this.latency = latency;
     this.failSynthetic = undefined;
     this.hangSynthetic = false;
+    // An optional async hook run before each host.session answer; a test can hold or change a
+    // session there.
+    this.beforeSession = undefined;
   }
 
   add(info) {
@@ -100,6 +103,7 @@ export class FakeHost {
     this.calls.push(message);
     await this.#wait();
     if (message.method === "host.session") {
+      if (this.beforeSession) await this.beforeSession(message.params?.sessionID);
       const info = this.sessions.get(message.params?.sessionID);
       if (!info) return { v: 1, id: message.id, error: { code: "not-found", message: "no such session" } };
       return { v: 1, id: message.id, result: structuredClone(info) };

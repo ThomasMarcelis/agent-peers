@@ -73,6 +73,22 @@ test("display provides usable arguments and labels Claude's native tool by platf
   assert.match(formatSessionPeer(claude), /Codex bridge: send_peer/);
 });
 
+test("session rows keep the rc.4 text for Claude and Codex, and opencode rows have single gaps", () => {
+  const codex = { name: "codex:foo", cwd: "/x", address: "uds:/tmp/foo.sock" };
+  assert.equal(formatSessionPeer(codex),
+    'codex:foo    cwd=/x\n' +
+    '  Claude native: SendMessage {"to":"uds:/tmp/foo.sock"}\n' +
+    '  Codex bridge: send_peer {"to":"uds:/tmp/foo.sock"}');
+  assert.equal(formatSessionPeer({ ...codex, status: "idle" }).split("\n")[0], "codex:foo  idle  cwd=/x");
+  assert.equal(formatSessionPeer({ ...codex, reachable: false }).split("\n")[0], "codex:foo    stale  cwd=/x");
+  const opencode = { kind: "opencode", name: "opencode:bar", cwd: "/y", address: "uds:/tmp/bar.sock" };
+  assert.equal(formatSessionPeer(opencode),
+    'opencode:bar  cwd=/y\n' +
+    '  OpenCode bridge: send_peer {"to":"uds:/tmp/bar.sock"}');
+  assert.equal(formatSessionPeer({ ...opencode, status: "busy", reachable: false }).split("\n")[0],
+    "opencode:bar  busy  stale  cwd=/y");
+});
+
 test("native-only route errors explain the exact native target and idle wake route", () => {
   const threads = [{ ...child("zeno-thread", "root-a", "/root/accepted_content"), agentNickname: "Zeno" }];
   const rows = codexDiscovery([], threads, self);

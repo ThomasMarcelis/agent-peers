@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import plugin, { cachedNode, findNode, nodeCandidates } from "../opencode/server.mjs";
+import plugin, { BridgeClient, cachedNode, findNode, nodeCandidates, subscribeEvents } from "../opencode/server.mjs";
 import { VERSION } from "../src/version.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -25,9 +25,9 @@ async function until(check, description = "condition", tries = 300) {
   assert.fail(`timed out waiting for ${description}`);
 }
 
-function notFound(sessionID) {
-  return Object.assign(new Error(`session ${sessionID} not found`), { _tag: "SessionNotFoundError", sessionID });
-}
+// The tags opencode v2.0.32's plugin host raises (packages/core/src/session/error.ts).
+const tagged = (tag, message, fields = {}) => Object.assign(new Error(message), { _tag: tag, ...fields });
+const notFound = (sessionID) => tagged("Session.NotFoundError", `session ${sessionID} not found`, { sessionID });
 
 function context(dir, sessions) {
   const ctx = {
@@ -105,6 +105,8 @@ test("setup registers the four definitions immediately, before the bridge, and e
   for (const tool of f.ctx.tools) {
     assert.deepEqual({ name: tool.name, description: tool.description, input: tool.input }, definitions[tool.name]);
     assert.equal(typeof tool.execute, "function");
+    // opencode 2.x offers only codemode:false tools to the model directly (core/src/tool.ts).
+    assert.deepEqual(tool.options, { codemode: false });
   }
   const result = await f.ctx.tools.find((tool) => tool.name === "send_peer").execute(
     { to: "uds:/tmp/x.sock", message: "hello", in_reply_to: "m-1" }, { sessionID: "ses_root" });
@@ -127,7 +129,7 @@ test("host.session is executed by the plugin and its Session.Info is returned to
   assert.deepEqual(result.metadata.structuredContent, { id: "ses_root", location: { directory: "/repo" } });
 });
 
-test("a tagged host SessionNotFoundError is classified as not-found, not by message text", async (t) => {
+test("a tagged host Session.NotFoundError is classified as not-found, not by message text", async (t) => {
   const f = await fixture(t, { mode: "host-missing" });
   const result = await f.ctx.tools[0].execute({}, { sessionID: "ses_root" });
   assert.equal(result.metadata.isError, true);
@@ -135,10 +137,32 @@ test("a tagged host SessionNotFoundError is classified as not-found, not by mess
   assert.equal(f.ctx.gets[0], "ses_missing");
 });
 
+test("host errors are classified by their opencode tag, never by message text", async (t) => {
+  const f = await fixture(t, { mode: "host-missing" });
+  const cases = [
+    [tagged("Session.NotFoundError", "lookup failed"), "not-found"],
+    [tagged("Session.BusyError", "session ses_missing not found"), "host-rejected"],
+    [tagged("SchemaError", "session not found"), "host-lost"],
+    [new Error("session ses_missing not found"), "host-lost"],
+  ];
+  for (const [error, code] of cases) {
+    f.ctx.session.get = async () => { throw error; };
+    const result = await f.ctx.tools[0].execute({}, { sessionID: "ses_root" });
+    assert.equal(result.metadata.structuredContent.code, code, `${error._tag ?? "untagged"}: ${error.message}`);
+  }
+});
+
+test("a host Session.SyntheticConflictError is host-rejected", async (t) => {
+  const f = await fixture(t, { mode: "host-synthetic" });
+  f.ctx.session.synthetic = async () => { throw tagged("Session.SyntheticConflictError", "conflict", { inputID: "msg_1" }); };
+  const result = await f.ctx.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.equal(result.metadata.structuredContent.error.code, "host-rejected");
+});
+
 test("host.synthetic is executed by the plugin with the bridge's delivery fields", async (t) => {
   const synthetic = await fixture(t, { mode: "host-synthetic" });
   const answered = await synthetic.ctx.tools[0].execute({}, { sessionID: "ses_root" });
-  assert.match(answered.content[0].text, /"admitted":true/);
+  assert.deepEqual(answered.metadata.structuredContent.result, { admitted: true });
   assert.deepEqual(synthetic.ctx.synth[0], {
     sessionID: "ses_root", text: "synthetic from bridge", delivery: "steer", resume: true,
     description: "agent-peers peer message", metadata: { source: "agent-peers" },
@@ -274,16 +298,41 @@ test("a send whose bridge is lost after the request was written is unconfirmed/b
   assert.match(result.content[0].text, /Delivery is unknown/);
 });
 
-test("an aborted send is unconfirmed, not a definite failure", async (t) => {
+test("a send aborted before the request is written is a definite failure, and nothing reaches the bridge", async (t) => {
   const f = await fixture(t);
   await f.waitFor((messages) => messages.some((message) => message.method === "hello"), "the hello");
   const controller = new AbortController();
   controller.abort();
   const result = await f.ctx.tools.find((tool) => tool.name === "send_peer").execute(
     { to: "uds:/tmp/peer.sock", message: "aborted" }, { sessionID: "ses_root", signal: controller.signal });
+  assert.equal(result.metadata.isError, true);
+  assert.equal(result.metadata.structuredContent.status, "failed");
+  assert.equal(result.metadata.structuredContent.reason, "bridge-unavailable");
+  assert.match(result.content[0].text, /nothing was sent/);
+  assert.equal(f.messages().some((message) => message.method === "tool"), false);
+});
+
+test("a send aborted after the request is written is unconfirmed/bridge-lost", async (t) => {
+  const f = await fixture(t, { mode: "hang" });
+  const controller = new AbortController();
+  const pending = f.ctx.tools.find((tool) => tool.name === "send_peer").execute(
+    { to: "uds:/tmp/peer.sock", message: "aborted" }, { sessionID: "ses_root", signal: controller.signal });
+  await f.waitFor((messages) => messages.some((message) => message.method === "tool"), "the written request");
+  controller.abort();
+  const result = await pending;
   assert.equal(result.metadata.isError, false);
   assert.equal(result.metadata.structuredContent.status, "unconfirmed");
   assert.equal(result.metadata.structuredContent.reason, "bridge-lost");
+});
+
+test("an unanswered request rejects as bridge-timeout, the code a send reports as unconfirmed", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ap-ocp-"));
+  const client = new BridgeClient({
+    command: process.execPath, args: [fakeBridge, "--log", join(dir, "bridge.jsonl"), "--mode", "hang"], env: process.env,
+    onRequest: () => ({}),
+  }).start();
+  t.after(async () => { await client.stop(); rmSync(dir, { recursive: true, force: true }); });
+  await assert.rejects(client.request("tool", { name: "send_peer" }, 50), { code: "bridge-timeout" });
 });
 
 test("a mixed bridge version logs a warning but the tools still work", async (t) => {
@@ -291,4 +340,64 @@ test("a mixed bridge version logs a warning but the tools still work", async (t)
   const result = await f.ctx.tools[0].execute({}, { sessionID: "ses_root" });
   assert.equal(result.metadata.structuredContent.status, "failed");
   assert.ok(f.messages().length > 0);
+});
+
+test("a cached Node that can no longer be spawned is forgotten and retried only after the 30 s backoff", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ap-ocp-"));
+  const missing = join(dir, "missing-node");
+  globalThis[KEY] = { client: null, starting: null, instances: new Map(), helloed: new Set(), options: undefined, node: missing, nodeFailure: undefined };
+  const ctx = context(dir, new Map([["ses_root", { id: "ses_root" }]]));
+  ctx.options = {};
+  const cleanup = await plugin.setup(ctx);
+  t.after(async () => { await cleanup(); delete globalThis[KEY]; rmSync(dir, { recursive: true, force: true }); });
+  const failed = await ctx.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.equal(failed.metadata.structuredContent.reason, "bridge-unavailable");
+  const state = globalThis[KEY];
+  assert.equal(state.node, undefined, "the stale path is cleared");
+  assert.match(state.nodeFailure?.message ?? "", /could not be started \(ENOENT\)/);
+  const again = await ctx.tools[0].execute({}, { sessionID: "ses_root" });
+  assert.match(again.content[0].text, /could not be started \(ENOENT\)/, "the next call within 30 s does not reprobe");
+});
+
+function eventState(subscribe) {
+  const instance = "instance-1";
+  return { instance, state: { instances: new Map([[instance, { ctx: { event: { subscribe } } }]]) } };
+}
+
+test("a failing event stream resubscribes with 1 s to 30 s backoff, logs sparsely, and resets after an event", async () => {
+  let calls = 0;
+  const { instance, state } = eventState(() => {
+    calls++;
+    // The fifth stream delivers one event and ends; every other one fails at once.
+    if (calls === 5) return (async function* () { yield { type: "unrelated" }; })();
+    throw new Error("stream down");
+  });
+  let clock = 0;
+  const waits = [], reports = [];
+  let finish;
+  const done = new Promise((resolve) => { finish = resolve; });
+  const delay = async (ms) => {
+    waits.push(ms);
+    clock += ms;
+    if (waits.length === 14) { state.instances.delete(instance); finish(); }
+  };
+  const disposers = [];
+  subscribeEvents(state, instance, disposers, { delay, now: () => clock, report: (event, fields) => reports.push({ at: clock, ...fields }) });
+  await done;
+  await disposers[0]();
+  assert.deepEqual(waits, [1000, 2000, 4000, 8000, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000]);
+  assert.deepEqual(reports.map((r) => [r.at, r.reason]), [
+    [0, "stream"], [15_000, "stream-ended"], [46_000, "stream"], [76_000, "stream"], [106_000, "stream"], [136_000, "stream"],
+    [166_000, "stream"],
+  ]);
+});
+
+test("cleanup does not hang on an event stream that ignores the abort", async () => {
+  const { instance, state } = eventState(() => ({ [Symbol.asyncIterator]() { return { next: () => new Promise(() => {}) }; } }));
+  const disposers = [];
+  subscribeEvents(state, instance, disposers);
+  const started = Date.now();
+  await disposers[0]();
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 900 && elapsed < 3000, `cleanup took ${elapsed} ms`);
 });

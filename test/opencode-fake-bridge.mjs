@@ -10,7 +10,7 @@ const option = (name, fallback) => {
 };
 const logPath = option("--log");
 const mode = option("--mode", "echo");
-const version = option("--version", "1.0.0-rc.6");
+const version = option("--version", "1.0.0-rc.7");
 const crashFile = option("--crash-file");
 const child = `${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
 const write = (message) => process.stdout.write(JSON.stringify({ v: 1, ...message }) + "\n");
@@ -44,6 +44,8 @@ const handle = async (message) => {
       if (crashFile) writeFileSync(crashFile, "crashed");
       process.exit(3);
     }
+    // The request is recorded but never answered.
+    if (mode === "hang") return;
     if (mode === "host-session") {
       const answer = await request("host.session", { instance: message.params.instance, sessionID: message.params.sessionID });
       write({ id: message.id, result: { text: `host:${answer.result?.id}`, structuredContent: answer.result, isError: false } });

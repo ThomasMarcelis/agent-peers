@@ -14,6 +14,7 @@ import { Pins, sendPeer } from "../src/outbox.mjs";
 import { codexDiscovery } from "../src/discovery.mjs";
 import { address, generation, post, processStart, readLines } from "../src/wire.mjs";
 import { listen } from "./listeners.mjs";
+import { VERSION } from "../src/version.mjs";
 
 const cli = fileURLToPath(new URL("../bin/agent-peers.mjs", import.meta.url));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -23,7 +24,7 @@ function home(t) {
   const claude = join(dir, "claude"), peers = join(dir, "peers"), sockets = join(dir, "s");
   for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true, mode: 0o700 });
   const env = { CLAUDE_CONFIG_DIR: claude, AGENT_PEERS_HOME: peers, XDG_CONFIG_HOME: join(dir, "config"),
-    AGENT_PEERS_CODEX_APP_SERVER: join(dir, "missing.sock") };
+    XDG_CACHE_HOME: join(dir, "cache"), AGENT_PEERS_CODEX_APP_SERVER: join(dir, "missing.sock") };
   writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({
     pid: process.pid, name: "fixture", messagingSocketPath: join(sockets, "fixture.sock"), procStart: processStart(process.pid),
   }));
@@ -67,9 +68,8 @@ test("list shows opencode rows and the OpenCode bridge route, and doctor reports
   const config = join(f.env.XDG_CONFIG_HOME, "opencode");
   mkdirSync(config, { recursive: true, mode: 0o700 });
   writeFileSync(join(config, "opencode.json"), JSON.stringify({ plugins: ["agent-peers"] }));
-  const installed = join(config, "node_modules", "agent-peers");
-  mkdirSync(installed, { recursive: true, mode: 0o700 });
-  writeFileSync(join(installed, "package.json"), JSON.stringify({ name: "agent-peers", version: "1.0.0-rc.6" }));
+  // opencode 2.x keys a bare name as <name>@latest in its npm cache.
+  const installed = cachedInstall(f, "agent-peers@latest", "1700000000000", VERSION);
   const env = { ...f.env, PATH: `${bin}:${process.env.PATH}` };
   const doctor = await run(["doctor", "--json"], env);
   assert.equal(doctor.status, 0, `${doctor.stdout}\n${doctor.stderr}`);
@@ -79,18 +79,68 @@ test("list shows opencode rows and the OpenCode bridge route, and doctor reports
   assert.equal(checks["opencode plugin"].status, "ok");
   assert.match(checks["opencode records"].message, /1 live opencode bridge record/);
   // Version skew is a warning, not a failure, and the CLI still exits 0.
-  writeFileSync(join(installed, "package.json"), JSON.stringify({ name: "agent-peers", version: "1.0.0-rc.5" }));
+  writeFileSync(join(installed, "package.json"), JSON.stringify({ name: "agent-peers", version: "0.9.0" }));
   const skew = await run(["doctor", "--json"], env);
   assert.equal(skew.status, 0, skew.stderr);
   const skewCheck = JSON.parse(skew.stdout).checks.find((check) => check.name === "opencode plugin");
   assert.equal(skewCheck.status, "warning");
-  assert.match(skewCheck.message, /version skew: installed opencode plugin 1\.0\.0-rc\.5, CLI 1\.0\.0-rc\.6/);
+  assert.equal(skewCheck.message, `version skew: installed opencode plugin 0.9.0, CLI ${VERSION}; pin one package version`);
   // No binary and no config: warnings, still a successful diagnostic.
   const bare = await run(["doctor", "--json"], { ...f.env, PATH: "/nonexistent-path", HOME: f.dir, XDG_CONFIG_HOME: join(f.dir, "absent-config") });
   assert.equal(bare.status, 0, bare.stderr);
   const bareChecks = Object.fromEntries(JSON.parse(bare.stdout).checks.map((check) => [check.name, check]));
   assert.equal(bareChecks["opencode binary"].status, "warning");
   assert.equal(bareChecks["opencode plugin"].status, "warning");
+});
+
+function cachedInstall(f, key, generation, version) {
+  const installed = join(f.env.XDG_CACHE_HOME, "opencode", "npm", key, generation, "node_modules", "agent-peers");
+  mkdirSync(installed, { recursive: true, mode: 0o700 });
+  writeFileSync(join(installed, "package.json"), JSON.stringify({ name: "agent-peers", version }));
+  return installed;
+}
+
+test("doctor reports the install a pinned plugin entry maps to, never a newer cached copy", async (t) => {
+  const f = home(t);
+  const config = join(f.env.XDG_CONFIG_HOME, "opencode");
+  mkdirSync(config, { recursive: true, mode: 0o700 });
+  const plugin = async (entry) => {
+    writeFileSync(join(config, "opencode.json"), JSON.stringify({ plugins: [entry] }));
+    const doctor = await run(["doctor", "--json"], f.env);
+    assert.equal(doctor.status, 0, doctor.stderr);
+    return JSON.parse(doctor.stdout).checks.find((check) => check.name === "opencode plugin");
+  };
+  // The pinned key holds an older version; newer copies sit under other keys and in an older,
+  // not yet collected generation of the same key, which opencode does not load.
+  cachedInstall(f, "agent-peers@0.9.0", "1700000000000", "0.9.0");
+  cachedInstall(f, "agent-peers@0.9.0", "999", VERSION);
+  cachedInstall(f, "agent-peers@next", "1800000000000", VERSION);
+  cachedInstall(f, "agent-peers@latest", "1800000000000", VERSION);
+  for (const entry of ["agent-peers@0.9.0", { package: "agent-peers@0.9.0", options: {} }]) {
+    const pinned = await plugin(entry);
+    assert.equal(pinned.status, "warning");
+    assert.equal(pinned.message, `version skew: installed opencode plugin 0.9.0, CLI ${VERSION}; pin one package version`);
+  }
+  assert.deepEqual([(await plugin("agent-peers@next")).status, (await plugin("agent-peers")).status], ["ok", "ok"]);
+  // A pinned spec with no install of its own is unknown, not the newest copy found.
+  const missing = await plugin("agent-peers@0.8.0");
+  assert.equal(missing.status, "warning");
+  assert.match(missing.message, /installed package version is unknown/);
+  // opencode skips a local plugin path that is a file; only the package directory loads.
+  const checkout = join(f.dir, "checkout");
+  mkdirSync(join(checkout, "opencode"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(checkout, "package.json"), JSON.stringify({ name: "agent-peers", version: VERSION }));
+  writeFileSync(join(checkout, "opencode", "server.mjs"), "export default {};\n");
+  const file = await plugin(join(checkout, "opencode", "server.mjs"));
+  assert.equal(file.status, "warning");
+  assert.match(file.message, /opencode loads only a directory/);
+  assert.equal((await plugin(join(checkout, "opencode"))).status, "ok");
+  // A later "-agent-peers" removes the entry; a bare relative-looking name is an npm specifier.
+  writeFileSync(join(config, "opencode.json"), JSON.stringify({ plugins: ["agent-peers@next", "-agent-peers"] }));
+  const removed = JSON.parse((await run(["doctor", "--json"], f.env)).stdout).checks.find((check) => check.name === "opencode plugin");
+  assert.equal(removed.status, "warning");
+  assert.match(removed.message, /not in .*plugins/);
+  assert.match((await plugin("plugins/agent-peers.mjs")).message, /not in .*plugins/);
 });
 
 test("whoami has no opencode CLI identity and claim inside an opencode shell is no-session", async (t) => {

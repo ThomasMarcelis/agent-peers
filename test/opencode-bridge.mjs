@@ -3,12 +3,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { basename, join } from "node:path";
 import { test } from "node:test";
 import { frame } from "../src/frame.mjs";
 import { claimRows } from "../src/names.mjs";
-import { generation, allPeers, stalePeers, processStart, address } from "../src/wire.mjs";
+import { generation, allPeers, stalePeers, processStart, address, socketDirectories, socketPath } from "../src/wire.mjs";
+import { listen } from "./listeners.mjs";
 import {
   FakeHost, bridgeFor, delay, opencodeFixture, peerLine, session, until,
 } from "./opencode-host.mjs";
@@ -16,6 +18,25 @@ import {
 const registry = (dir, id) => join(dir, "peers", `opencode-${id}.json`);
 const sockets = (dir) => readdirSync(join(dir, "s")).filter((name) => name.startsWith("opencode-"));
 const records = (dir) => readdirSync(join(dir, "peers")).filter((name) => /^opencode-.*\.json$/.test(name));
+const socketName = (id) => `opencode-${createHash("sha256").update(id).digest("hex").slice(0, 16)}.sock`;
+const deadRecord = (id, socket, fields = {}) => JSON.stringify({
+  name: "opencode:old-aaaaaa", address: address(socket), addresses: [address(socket)], cwd: "/old", threadId: id,
+  pid: 0x7ffffff0, procStart: "old", generation: generation("opencode", id, "old"), startedAt: 1, ...fields,
+});
+// A gate a test holds a host or publish step on, with a count of the callers that reached it.
+function gate() {
+  let release = () => {};
+  const opened = new Promise((resolve) => { release = resolve; });
+  const held = { count: 0, release, wait: async () => { held.count++; await opened; } };
+  return held;
+}
+// A socket file left by a hard-killed listener.
+async function orphanSocket(path) {
+  const orphan = spawn(process.execPath, ["-e", `require("net").createServer().listen(${JSON.stringify(path)},()=>console.log("up"))`]);
+  await new Promise((resolve) => orphan.stdout.once("data", resolve));
+  orphan.kill("SIGKILL");
+  await new Promise((resolve) => orphan.once("close", resolve));
+}
 
 async function bound(t, f, { id = "ses_root", directory = join(f.dir, "repo"), title = "Repo", updated = 1, idle = 1, instance = "i-1" } = {}) {
   const host = new FakeHost();
@@ -114,30 +135,54 @@ test("a forced interleaving between the bind read and link still publishes exact
   assert.equal(sockets(f.dir).length, 1);
 });
 
-test("a forced interleaving replacing a dead record leaves at most one live record and socket", async (t) => {
+test("a forced interleaving replacing a dead record: one binder moves it aside, the other puts the winner's record back and refuses", async (t) => {
   const f = opencodeFixture(t);
-  writeFileSync(registry(f.dir, "ses_root"), JSON.stringify({
-    name: "opencode:old-aaaaaa", address: address(join(f.sockets, "opencode-old.sock")),
-    addresses: [address(join(f.sockets, "opencode-old.sock"))], cwd: join(f.dir, "old"), threadId: "ses_root",
-    pid: 0x7ffffff0, procStart: "old", generation: generation("opencode", "ses_root", "old"), startedAt: 1,
-  }), { mode: 0o600 });
   const hostA = new FakeHost(), hostB = new FakeHost();
-  for (const host of [hostA, hostB]) host.add(session({ id: "ses_root", directory: join(f.dir, "repo"), updated: 1, idle: 1 }));
-  let reached = 0, release = () => {};
-  const gate = new Promise((resolve) => { release = resolve; });
-  const publishHook = async () => { reached++; if (reached <= 2) await gate; };
-  const a = bridgeFor(hostA, { instance: "a", publishHook });
-  const b = bridgeFor(hostB, { instance: "b", publishHook });
+  // The two hosts give the root different directories, so the record's name says who won.
+  hostA.add(session({ id: "ses_root", directory: join(f.dir, "repo-a"), updated: 1, idle: 1 }));
+  hostB.add(session({ id: "ses_root", directory: join(f.dir, "repo-b"), updated: 1, idle: 1 }));
+  for (const [host, id] of [[hostA, "ses_warm_a"], [hostB, "ses_warm_b"], [hostA, "ses_later"], [hostB, "ses_later"]]) {
+    host.add(session({ id, directory: join(f.dir, id), updated: 1, idle: 1 }));
+  }
+  const held = gate(), hookLog = [];
+  const publishHook = (bridge) => async ({ root, existing, attempt }) => {
+    if (root.sessionID !== "ses_root") return;
+    hookLog.push({ bridge, attempt, existingPid: existing?.pid });
+    await held.wait();
+  };
+  const a = { ...bridgeFor(hostA, { instance: "a", publishHook: publishHook("a") }), instance: "a" };
+  const b = { ...bridgeFor(hostB, { instance: "b", publishHook: publishHook("b") }), instance: "b" };
   t.after(async () => { await a.bridge.close(); await b.bridge.close(); });
-  const pendingA = a.bridge.tool({ instance: "a", name: "list_peers", sessionID: "ses_root", args: {} });
-  const pendingB = b.bridge.tool({ instance: "b", name: "list_peers", sessionID: "ses_root", args: {} });
-  await until(() => reached >= 2, "both binders paused before replacing the dead record");
-  release();
+  const list = (x, sessionID) => x.bridge.tool({ instance: x.instance, name: "list_peers", sessionID, args: {} });
+  // Each bridge's first bind sweeps dead records; the dead record is written after both sweeps
+  // so that both binders find it in place.
+  assert.equal((await list(a, "ses_warm_a")).isError, false);
+  assert.equal((await list(b, "ses_warm_b")).isError, false);
+  writeFileSync(registry(f.dir, "ses_root"), deadRecord("ses_root", join(f.sockets, "opencode-old.sock")), { mode: 0o600 });
+  const pendingA = list(a, "ses_root"), pendingB = list(b, "ses_root");
+  await until(() => held.count >= 2, "both binders paused after reading the dead record");
+  held.release();
   const [ra, rb] = await Promise.all([pendingA, pendingB]);
-  assert.equal([ra.isError, rb.isError].filter(Boolean).length <= 1, true, `${ra.text} / ${rb.text}`);
-  assert.equal(records(f.dir).length <= 1, true);
-  assert.equal(sockets(f.dir).length <= 1, true);
-  if (!records(f.dir).length) assert.equal([ra.isError, rb.isError].every(Boolean), true);
+  // Both read the dead record on their first attempt, so both reached the move-aside branch.
+  assert.deepEqual(hookLog.map((entry) => [entry.attempt, entry.existingPid]), [[0, 0x7ffffff0], [0, 0x7ffffff0]]);
+  assert.equal([ra.isError, rb.isError].filter(Boolean).length, 1, `${ra.text} / ${rb.text}`);
+  const [winnerResult, loser, loserResult] = ra.isError ? [rb, a, ra] : [ra, b, rb];
+  // The second binder moved the winner's new record aside, found a different inode and put it back.
+  assert.equal(loserResult.structuredContent.reason, "inbox-unavailable");
+  assert.match(loserResult.text, /another bridge replaced the opencode record while this bridge was binding/);
+  const record = JSON.parse(readFileSync(registry(f.dir, "ses_root"), "utf8"));
+  assert.equal(record.name, winnerResult.structuredContent.self.name);
+  assert.equal(record.address, winnerResult.structuredContent.self.address);
+  assert.equal(lstatSync(socketPath(record.address)).isSocket(), true, "the winner's socket exists");
+  assert.deepEqual(readdirSync(f.peers).filter((name) => name.startsWith(".opencode-")), [], "no aside or temporary record is left");
+  for (const file of records(f.dir)) {
+    const entry = JSON.parse(readFileSync(join(f.peers, file), "utf8"));
+    assert.equal(lstatSync(socketPath(entry.address)).isSocket(), true, `${file} names a root with a socket`);
+  }
+  assert.equal(records(f.dir).length, 3);
+  assert.equal(sockets(f.dir).length, 3);
+  const later = await list(loser, "ses_later");
+  assert.equal(later.isError, false, later.text);
 });
 
 test("the prompt event and the first tool call share one bind; a child's prompt binds nothing", async (t) => {
@@ -207,6 +252,142 @@ test("at 64 roots an idle unnamed LRU root is evicted; a busy or named root neve
   assert.equal(refused.structuredContent.reason, "inbox-unavailable");
   assert.match(refused.text, /none is idle without claimed names/);
   assert.equal(existsSync(registry(f.dir, "ses_065")), false);
+  assert.equal(records(f.dir).length, 64);
+});
+
+// A bridge serving 64 idle roots, bound in order, so ses_000 has the oldest lastActivity.
+async function capped(t, f) {
+  const host = new FakeHost();
+  const ids = Array.from({ length: 64 }, (_, i) => `ses_${String(i).padStart(3, "0")}`);
+  for (const [i, id] of [...ids, "ses_064", "ses_065"].entries()) host.add(session({ id, directory: join(f.dir, `repo-${i}`), updated: 1, idle: 1 }));
+  const { bridge, logs } = bridgeFor(host);
+  t.after(() => bridge.close());
+  for (const id of ids) {
+    const result = await bridge.tool({ instance: "i-1", name: "list_peers", sessionID: id, args: {} });
+    assert.equal(result.isError, false, `${id}: ${result.text}`);
+  }
+  const list = (sessionID) => bridge.tool({ instance: "i-1", name: "list_peers", sessionID, args: {} });
+  const reads = (from) => host.calls.slice(from).filter((call) => call.method === "host.session").map((call) => call.params.sessionID);
+  const evicted = () => logs.filter((entry) => entry.event === "opencode.bind.cap" && entry.fields.outcome === "evicted").length;
+  return { host, bridge, ids, list, reads, evicted };
+}
+
+test("at the cap, eviction reads the host only until the first evictable root", { timeout: 60_000 }, async (t) => {
+  const f = opencodeFixture(t);
+  const { host, bridge, ids, list, reads } = await capped(t, f);
+  // ses_000 is busy, ses_001 holds a name (skipped without a read), ses_002 is idle.
+  delete host.sessions.get(ids[0]).time.idle;
+  const claimed = await bridge.tool({ instance: "i-1", name: "claim_name", sessionID: ids[1], args: { name: "proj/lead" } });
+  assert.equal(claimed.structuredContent.status, "claimed");
+  const mark = host.calls.length;
+  const added = await list("ses_064");
+  assert.equal(added.isError, false, added.text);
+  assert.deepEqual(reads(mark), ["ses_064", ids[0], ids[2]], "one read for the new root, then one per candidate up to the first evicted");
+  assert.ok(existsSync(registry(f.dir, ids[0])));
+  assert.ok(existsSync(registry(f.dir, ids[1])));
+  assert.equal(existsSync(registry(f.dir, ids[2])), false);
+  assert.ok(existsSync(registry(f.dir, ids[3])));
+  assert.equal(records(f.dir).length, 64);
+});
+
+test("a root idle when a cap bind selected it, but busy by its fresh read, is not evicted", { timeout: 60_000 }, async (t) => {
+  const f = opencodeFixture(t);
+  const { host, ids, list, reads, evicted } = await capped(t, f);
+  // The first cap bind's read of ses_000 is held inside ses_000's bind task.
+  const held = gate();
+  host.beforeSession = async (id) => { if (id === ids[0] && !held.count) await held.wait(); };
+  const first = list("ses_064");
+  await until(() => held.count === 1, "the first cap bind reading ses_000");
+  // The second cap bind selects ses_000 while it is still idle and queues on its bind task.
+  const mark = host.calls.length;
+  const second = list("ses_065");
+  await until(() => reads(mark).includes("ses_065"), "the second cap bind's own read");
+  await delay(20);
+  assert.deepEqual(reads(mark), ["ses_065"], "the second bind has not read ses_000 before waiting for its bind task");
+  // ses_000 turns busy before either eviction read is answered.
+  delete host.sessions.get(ids[0]).time.idle;
+  held.release();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.isError, false, a.text);
+  assert.equal(b.isError, false, b.text);
+  assert.ok(existsSync(registry(f.dir, ids[0])), "the root that turned busy stays bound");
+  assert.equal(existsSync(registry(f.dir, ids[1])), false);
+  assert.equal(existsSync(registry(f.dir, ids[2])), false);
+  assert.ok(existsSync(registry(f.dir, ids[3])));
+  assert.equal(reads(mark).filter((id) => id === ids[0]).length, 1, "the second bind read ses_000 fresh, after the first bind's read");
+  assert.equal(evicted(), 2);
+  assert.equal(records(f.dir).length, 64);
+});
+
+test("two concurrent new binds at the cap with two idle candidates both succeed, each evicting one", { timeout: 60_000 }, async (t) => {
+  const f = opencodeFixture(t);
+  const { host, ids, list, evicted } = await capped(t, f);
+  for (const id of ids.slice(2)) delete host.sessions.get(id).time.idle;
+  const [a, b] = await Promise.all([list("ses_064"), list("ses_065")]);
+  assert.equal(a.isError, false, a.text);
+  assert.equal(b.isError, false, b.text);
+  assert.equal(existsSync(registry(f.dir, ids[0])), false);
+  assert.equal(existsSync(registry(f.dir, ids[1])), false);
+  for (const id of [...ids.slice(2), "ses_064", "ses_065"]) assert.ok(existsSync(registry(f.dir, id)), id);
+  assert.equal(evicted(), 2);
+  assert.equal(records(f.dir).length, 64);
+  assert.equal(sockets(f.dir).length, 64);
+});
+
+test("a seat freed by a delete during the eviction reads is taken, not refused", { timeout: 60_000 }, async (t) => {
+  const f = opencodeFixture(t);
+  const { host, bridge, ids, list, evicted } = await capped(t, f);
+  for (const id of ids) delete host.sessions.get(id).time.idle;
+  const held = gate();
+  host.beforeSession = async (id) => { if (id === ids[0] && held.count === 0) await held.wait(); };
+  const pending = list("ses_064");
+  await until(() => held.count === 1, "the eviction read of ses_000");
+  await bridge.event({ instance: "i-1", type: "deleted", sessionID: ids[10] });
+  held.release();
+  const result = await pending;
+  assert.equal(result.isError, false, result.text);
+  assert.equal(evicted(), 0);
+  assert.equal(records(f.dir).length, 64);
+});
+
+test("a delete queued ahead of an eviction frees the seat, so no second idle root is evicted", { timeout: 60_000 }, async (t) => {
+  const f = opencodeFixture(t);
+  const { host, bridge, ids, list, evicted } = await capped(t, f);
+  for (const id of ids) delete host.sessions.get(id).time.idle;
+  host.sessions.get(ids[1]).time.idle = 1;
+  host.sessions.get(ids[2]).time.idle = 1;
+  const held = gate();
+  host.beforeSession = async (id) => { if (id === ids[0] && held.count === 0) await held.wait(); };
+  const a = list("ses_064");
+  await until(() => held.count === 1, "A's eviction read of ses_000");
+  const deleted = bridge.event({ instance: "i-1", type: "deleted", sessionID: ids[0] });
+  const b = list("ses_065");
+  await delay(50);
+  held.release();
+  const [ra, rb] = await Promise.all([a, b]);
+  await deleted;
+  assert.equal(ra.isError, false, ra.text);
+  assert.equal(rb.isError, false, rb.text);
+  // The delete freed one seat and one idle root was evicted for the other bind; never two.
+  assert.equal(evicted(), 1);
+  assert.equal(records(f.dir).length, 64);
+});
+
+test("a root deleted while its own bind is evicting gives up its bind without costing a seat", { timeout: 60_000 }, async (t) => {
+  const f = opencodeFixture(t);
+  const { host, bridge, ids, list, evicted } = await capped(t, f);
+  for (const id of ids.slice(1)) delete host.sessions.get(id).time.idle;
+  const held = gate();
+  host.beforeSession = async (id) => { if (id === ids[0] && held.count === 0) await held.wait(); };
+  const pending = list("ses_064");
+  await until(() => held.count === 1, "the eviction read of ses_000");
+  await bridge.event({ instance: "i-1", type: "deleted", sessionID: "ses_064" });
+  held.release();
+  const result = await pending;
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.reason, "no-session", result.text);
+  assert.equal(existsSync(registry(f.dir, "ses_064")), false);
+  assert.equal(evicted(), 0);
   assert.equal(records(f.dir).length, 64);
 });
 
@@ -508,6 +689,40 @@ test("deleted, moved and closed unbind only the affected roots; a late move from
   assert.equal(existsSync(registry(f.dir, "ses_b")), true);
 });
 
+test("a delete during a tool call's session read unbinds the root, and nothing rebinds or publishes it afterwards", async (t) => {
+  const f = opencodeFixture(t);
+  const host = new FakeHost();
+  host.add(session({ id: "ses_root", directory: join(f.dir, "repo"), updated: 1, idle: 1 }));
+  host.add(session({ id: "ses_child", parentID: "ses_root", directory: join(f.dir, "repo"), updated: 1, idle: 1 }));
+  const { bridge, logs } = bridgeFor(host);
+  t.after(() => bridge.close());
+  const call = (sessionID) => bridge.tool({ instance: "i-1", name: "list_peers", sessionID, args: {} });
+  assert.equal((await call("ses_root")).isError, false);
+  assert.ok(existsSync(registry(f.dir, "ses_root")));
+  // A root call and a child call both read ses_root; both reads are held until after the delete,
+  // and then answer with the session as it was before it was deleted.
+  const held = gate();
+  host.beforeSession = async (id) => { if (id === "ses_root") await held.wait(); };
+  const pendingRoot = call("ses_root"), pendingChild = call("ses_child");
+  await until(() => held.count === 2, "both reads of ses_root in flight");
+  await bridge.event({ instance: "i-1", type: "deleted", sessionID: "ses_root" });
+  assert.equal(existsSync(registry(f.dir, "ses_root")), false);
+  assert.equal(sockets(f.dir).length, 0);
+  host.beforeSession = undefined;
+  held.release();
+  for (const result of await Promise.all([pendingRoot, pendingChild])) {
+    assert.equal(result.isError, true, result.text);
+    assert.equal(result.structuredContent.reason, "no-session");
+  }
+  // The host still answers for the session here, so only the bridge's deleted set refuses it.
+  await bridge.event({ instance: "i-1", type: "prompt", sessionID: "ses_root" });
+  for (const id of ["ses_root", "ses_child"]) assert.equal((await call(id)).structuredContent.reason, "no-session");
+  await delay(50);
+  assert.equal(records(f.dir).length, 0);
+  assert.equal(sockets(f.dir).length, 0);
+  assert.equal(logs.filter((entry) => entry.event === "inbox.bound").length, 1, "only the first bind published");
+});
+
 test("two servers: the first live bridge owns the root, the second refuses, and after the first exits the second binds", async (t) => {
   const f = opencodeFixture(t);
   const hostA = new FakeHost(), hostB = new FakeHost();
@@ -628,6 +843,35 @@ test("a new bridge removes only dead opencode records and their deterministic so
   assert.equal(existsSync(deadSocket), false);
   assert.equal(existsSync(registry(f.dir, "ses_live")), true, "a live owner is never touched");
   assert.equal(basename(liveSocket), "opencode-live.sock");
+});
+
+test("replacing a dead record removes its old socket in another socket directory only when a connect is refused", async (t) => {
+  const f = opencodeFixture(t);
+  // A Claude record that once named s2 makes it a permitted socket directory; new inboxes stay in s.
+  const other = join(f.dir, "s2");
+  mkdirSync(other, { mode: 0o700 });
+  const sessionFile = join(f.claude, "sessions", `${process.pid}.json`), original = readFileSync(sessionFile, "utf8");
+  writeFileSync(sessionFile, JSON.stringify({ ...JSON.parse(original), messagingSocketPath: join(other, "fixture.sock") }));
+  assert.ok(socketDirectories().includes(other));
+  writeFileSync(sessionFile, original);
+  const host = new FakeHost();
+  for (const id of ["ses_warm", "ses_dead", "ses_live"]) host.add(session({ id, directory: join(f.dir, id), updated: 1, idle: 1 }));
+  const { bridge } = bridgeFor(host);
+  t.after(() => bridge.close());
+  const call = (sessionID) => bridge.tool({ instance: "i-1", name: "list_peers", sessionID, args: {} });
+  // The first bind's sweep runs before the dead records exist.
+  assert.equal((await call("ses_warm")).isError, false);
+  const deadSocket = join(other, socketName("ses_dead")), liveSocket = join(other, socketName("ses_live"));
+  await orphanSocket(deadSocket);
+  const listener = createServer((conn) => conn.destroy());
+  await listen(listener, liveSocket, t);
+  writeFileSync(registry(f.dir, "ses_dead"), deadRecord("ses_dead", deadSocket), { mode: 0o600 });
+  writeFileSync(registry(f.dir, "ses_live"), deadRecord("ses_live", liveSocket), { mode: 0o600 });
+  assert.equal((await call("ses_dead")).isError, false);
+  assert.equal(existsSync(deadSocket), false, "a refused old socket is removed");
+  assert.ok(existsSync(join(f.sockets, socketName("ses_dead"))), "the new inbox is in the current socket directory");
+  assert.equal((await call("ses_live")).isError, false);
+  assert.equal(lstatSync(liveSocket).isSocket(), true, "a socket that still accepts is never removed");
 });
 
 test("registry liveness: dead, reused and missing records are stale; a live record is not taken over", async (t) => {
