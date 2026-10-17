@@ -2,6 +2,20 @@
 
 Raw live transcripts are excluded from the repository and package.
 
+## Unreleased
+
+Verified on 2026-10-17 on Linux with Node 22.23.1, Claude Code 2.1.302 and Codex CLI 0.162.1.
+
+- Platforms: there is no macOS machine for this project. macOS is covered by CI only (the deterministic suites on Node 22, 24 and 26). Live interoperability with real Claude Code, Codex and Hermes sessions is verified on Linux only.
+- Hermes bridge live harness (`npm run test:live:hermes`), updated for the 1.0 protocol and run for the first time against it. The bridge ran as Hermes profile `live`. All four round trips passed: idle and busy Codex, and idle and busy Claude. Every `send_peer` result had exactly the 1.0 fields. Codex reported `accepted` and Claude `unconfirmed` (`no-receipt`). Codex's own replies stopped at `queued`, because the harness plays the plugin and reports no `delivery_result`. Stable names also passed:
+  - A conversation claimed `hermes:live/<claim>`. A claim for another profile's scope was refused `scope-denied`.
+  - The name was listed as running with the conversation's inbox in the bridge, MCP and CLI listings. Hermes was still never a peer row.
+  - The real Claude session reached the name with `agent-peers resolve` and SendMessage. The holder answered with `in_reply_to` set.
+  - After `release_name`, the name resolved `not-found`. Codex then sent to the released, now unclaimed inbox, whose owner never gave it that address, and got `dropped` / `not-a-reply-target` (#28). The message never reached the conversation.
+  - Every private inbox was retired on `close_session`. No product bugs were found.
+  - The `--codex-only` mode passed too: two Codex round trips, then the claim, release and guessed-inbox refusal.
+- The four-session live matrix (`npm run test:live`) gained a stable-name check: a Claude session claims `claude:<scope>/<claim>` with `agent-peers claim`, and a Codex session reaches it by name with `send_peer` (`unconfirmed`, with the holder's name, inbox and generation). The check passed with `node test/live-matrix.mjs --names-only`, which starts all four sessions and runs only that check. The full matrix was not re-run here.
+
 ## 1.0.0-rc.2
 
 Verified on 2026-10-17 on Linux with Node 22.23.1. CI on Linux and macOS gates the release job.
