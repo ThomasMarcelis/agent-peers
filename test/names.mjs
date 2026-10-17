@@ -161,6 +161,32 @@ test("compare-and-swap: a record replaced between read and rename is restored, a
   assert.equal(resolveClaim(NAME).generation, next.claimant().generation);
 });
 
+// The documented worst case (reference, "Races"): B takes a dead name over between A's read and
+// A's rename, and C claims while A holds B's record aside, so A cannot put it back.
+test("a three-way race can lose a claim, but never leaves two holders", async (t) => {
+  const f = fixture(t), old = await f.session("old"), b = await f.session("b"), c = await f.session("c");
+  claim(NAME, old.claimant());
+  await old.stop();
+  const file = fileOf(f.dir, NAME);
+  interleave(t, file, { ...JSON.parse(readFileSync(file, "utf8")), owner: b.claimant().owner, generation: b.claimant().generation,
+    holder: b.claimant().holder });
+  const link = fs.linkSync;
+  let during;
+  fs.linkSync = (source, destination) => {
+    if (!during && String(source).includes(".reap-")) during = claim(NAME, c.claimant());
+    return link(source, destination);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.linkSync = link; syncBuiltinESMExports(); });
+  const a = claim(NAME, f.me());
+  assert.deepEqual([a.status, a.reason, during?.status], ["refused", "conflict", "claimed"]);
+  // B's takeover is lost; C is the one holder, on disk and for every reader.
+  assert.deepEqual(readdirSync(join(f.peers, "names")), [basename(file)], "one record and nothing left aside");
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).generation, c.claimant().generation);
+  assert.deepEqual(claimRows().map((row) => [row.name, row.generation, row.running]), [[NAME, c.claimant().generation, true]]);
+  assert.equal(resolveClaim(NAME).holder, "claude:c");
+});
+
 test("a claim or release sweeps what a dead claim left aside a minute ago, and nothing else", (t) => {
   const f = fixture(t), names = join(f.peers, "names");
   claim(NAME, f.me());
