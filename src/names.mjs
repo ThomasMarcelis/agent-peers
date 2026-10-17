@@ -293,11 +293,22 @@ export function claim(text, claimant) {
   });
 }
 
-// Remove a name: its holder (the same owner or generation) may, and anyone may once the holder is
-// not running. `claimant` is undefined outside a session; `kind` fills in an elided kind.
+// Remove a name: its holder (the same owner or generation) may, and once the holder is not running
+// so may another releaser of the same kind (for Hermes, of the same profile). A dead name of another
+// kind or profile is left for its own claimant, which may take it back after a restart. `claimant`
+// is undefined for the CLI outside a session, which releases claude: names; `kind` fills in an
+// elided kind.
+const RELEASES = {
+  claude: "agent-peers release removes only claude: names; a Codex session or Hermes conversation releases its own with release_name",
+  codex: "A Codex session releases only codex: names", hermes: "A Hermes conversation releases only hermes: names",
+};
 export function release(text, claimant, kind = claimant?.kind) {
   return inDiscoveryScope(() => {
     const parsed = parseName(text, kind), fields = { name: parsed.name, kind: parsed.kind };
+    if (parsed.kind !== kind) return claimRefusal("scope-denied", `${RELEASES[kind]}, not ${parsed.name}.`, fields);
+    if (claimant?.scope !== undefined && parsed.scope !== claimant.scope) {
+      return claimRefusal("scope-denied", `This Hermes profile releases only hermes:${claimant.scope}/<claim> names, not ${parsed.name}.`, fields);
+    }
     const dir = existingDirectory(), file = dir && join(dir, fileName(parsed.name));
     if (dir) sweep(dir);
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {

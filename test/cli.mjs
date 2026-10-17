@@ -240,6 +240,9 @@ test("a dead claim stays listed as not running, and anyone may release it", asyn
     const resolved = run(["resolve", "claude:proj/lead"], session.env);
     assert.equal(resolved.status, 1);
     assert.match(resolved.stderr, /is claimed by claude:lead, a Claude session that is no longer running/);
+    // The CLI releases only claude: names, dead or not; other kinds are left to their own claimants.
+    const foreign = run(["release", "hermes:jd/relay", "--json"], session.env);
+    assert.deepEqual([foreign.status, JSON.parse(foreign.stdout).reason], [1, "scope-denied"]);
     assert.equal(run(["release", "proj/lead"], session.env).status, 0);
     assert.deepEqual(JSON.parse(run(["list", "--json"], session.env).stdout).names, []);
   } finally { rmSync(session.home, { recursive: true, force: true }); }

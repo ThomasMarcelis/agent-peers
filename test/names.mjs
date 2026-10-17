@@ -373,6 +373,33 @@ test("release: only the holder of a running claim, anyone once the holder stoppe
   assert.equal(JSON.parse(readFileSync(file, "utf8")).generation, next.claimant().generation);
 });
 
+test("a dead name is released only by a releaser of its own kind, and a Hermes one only within its profile", async (t) => {
+  const f = fixture(t);
+  // A gaming conversation's names right after its gateway restarted: dead until its next call.
+  const owner = generation("hermes", "gaming", "conversation-1");
+  const gaming = { kind: "hermes", scope: "gaming", owner, generation: generation("hermes", "route-old"), address: null,
+    holder: { pid: 0x7ffffffd, autoName: "hermes:gaming:abcd1234", addresses: [address(join(f.sockets, `hermes-${"b".repeat(32)}.sock`))] } };
+  for (const name of ["hermes:gaming/relay", "hermes:gaming/scout"]) assert.equal(claim(name, gaming).status, "claimed");
+  const deadCodex = { kind: "codex", owner: generation("codex", "gone"), generation: generation("codex", "gone", "1"), address: null,
+    holder: { pid: 0x7ffffffe, autoName: "codex:gone-1234", threadId: "gone", addresses: [] } };
+  assert.equal(claim("codex:proj/worker", deadCodex).status, "claimed");
+  const codex = { kind: "codex", owner: generation("codex", "T"), generation: generation("codex", "T", "1"), address: null,
+    holder: { pid: process.pid, autoName: "codex:x-0001", threadId: "T", addresses: [] } };
+  const casa = { ...gaming, scope: "casa", owner: generation("hermes", "casa", "conversation-2"), generation: generation("hermes", "route-casa") };
+  for (const [who, name, claimant, kind] of [["the CLI outside a session", "hermes:gaming/relay", undefined, "claude"],
+    ["the CLI outside a session", "codex:proj/worker", undefined, "claude"], ["a Claude session", "codex:proj/worker", f.me(), "claude"],
+    ["a Codex session", "hermes:gaming/scout", codex, "codex"], ["another Hermes profile", "hermes:gaming/scout", casa, "hermes"]]) {
+    const refused = release(name, claimant, kind);
+    assert.deepEqual([refused.status, refused.reason, refused.name], ["refused", "scope-denied", name], `${who}: ${name}`);
+  }
+  assert.deepEqual(claimRows().map((row) => row.name), ["codex:proj/worker", "hermes:gaming/relay", "hermes:gaming/scout"], "nothing was removed");
+  // Its own kind may: Codex releases the dead Codex name, the gaming profile its own dead name.
+  assert.equal(release("codex:proj/worker", codex).status, "released");
+  const sibling = { ...gaming, owner: generation("hermes", "gaming", "conversation-3"), generation: generation("hermes", "route-3") };
+  assert.equal(release("hermes:gaming/scout", sibling).status, "released");
+  assert.equal(release("hermes:gaming/relay", gaming).status, "released");
+});
+
 test("file safety: unsafe, foreign or mismatched files are never read as claims; the directory is private", async (t) => {
   const f = fixture(t), other = await f.session("other");
   claim(NAME, other.claimant());
