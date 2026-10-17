@@ -2,13 +2,13 @@
 // conflict table, release, file safety, send-time resolution and pins.
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import fs, { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync,
   writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { claim, claimRows, claudeClaimant, parseName, release, resolveClaim, withClaims } from "../src/names.mjs";
@@ -159,6 +159,28 @@ test("compare-and-swap: a record replaced between read and rename is restored, a
   assert.deepEqual([result.status, result.reason], ["refused", "conflict"]);
   assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), JSON.parse(JSON.stringify(replacement)), "the newer record is back in place");
   assert.equal(resolveClaim(NAME).generation, next.claimant().generation);
+});
+
+test("a claim or release sweeps what a dead claim left aside a minute ago, and nothing else", (t) => {
+  const f = fixture(t), names = join(f.peers, "names");
+  claim(NAME, f.me());
+  const leftover = (prefix) => { const path = join(names, `${prefix}-${randomUUID()}.json`); writeFileSync(path, "{}", { mode: 0o600 }); return basename(path); };
+  const reaped = leftover(".reap"), temporary = leftover(".t"), linked = `.reap-${randomUUID()}.json`, folder = `.t-${randomUUID()}.json`;
+  symlinkSync(join(f.dir, "elsewhere.json"), join(names, linked));
+  mkdirSync(join(names, folder));
+  writeFileSync(join(names, ".reap-not-a-uuid.json"), "{}", { mode: 0o600 });
+  const kept = [basename(fileOf(f.dir, NAME)), linked, folder, ".reap-not-a-uuid.json"].sort();
+  // A fresh one may belong to a claim or release still running.
+  claim(NAME, f.me());
+  assert.deepEqual(readdirSync(names).sort(), [...kept, reaped, temporary].sort());
+  const now = Date.now;
+  Date.now = () => now() + 61_000;
+  t.after(() => { Date.now = now; });
+  claim(NAME, f.me());
+  assert.deepEqual(readdirSync(names).sort(), kept, "only this user's regular leftovers, by their exact names");
+  const another = leftover(".reap");
+  assert.equal(release("proj/missing", f.me()).reason, "not-found");
+  assert.equal(readdirSync(names).includes(another), false, "a release sweeps too");
 });
 
 test("a running holder's refresh never leaves its name free for another claimant", async (t) => {
