@@ -45,7 +45,8 @@ test("empty discovery and doctor are structured and do not create state", () => 
       AGENT_PEERS_CODEX_APP_SERVER: join(home, "missing.sock") };
     const listing = run(["list", "--json"], env);
     assert.equal(listing.status, 0, listing.stderr);
-    assert.deepEqual(JSON.parse(listing.stdout), { peers: [] });
+    assert.deepEqual(JSON.parse(listing.stdout), { peers: [], names: [] });
+    for (const args of [["resolve", "claude:x/y"], ["release", "x/y"]]) assert.equal(run(args, env).status, 1);
     const result = run(["doctor", "--json"], env);
     assert.equal(result.status, 0, result.stderr);
     const report = JSON.parse(result.stdout);
@@ -154,7 +155,7 @@ test("whoami finds the calling Claude session through process ancestry and fails
     server.close();
     const [json, text] = out.split("---\n");
     assert.deepEqual(JSON.parse(json), { name: "claude:worker", address: `uds:${socket}`, kind: "claude", cwd: "/tmp", pid: shell.pid,
-      generation: generation("claude", shell.pid, undefined, socket) });
+      generation: generation("claude", shell.pid, undefined, socket), claims: [] });
     assert.equal(text.trim(), `claude:worker\nuds:${socket}`);
 
     const outside = run(["whoami"], env);
@@ -163,6 +164,81 @@ test("whoami finds the calling Claude session through process ancestry and fails
     assert.equal(outside.stdout, "");
     assert.equal(run(["whoami", "--no-probe"], env).status, 2);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+// Runs CLI commands from a shell that is the Claude session, as Claude's Bash tool does, and returns
+// each command's { status, stdout, stderr }.
+async function inSession({ home, env }, socket, commands) {
+  const steps = commands.map((args) => `out=$("${process.execPath}" "${cli}" ${args} 2>"${home}/err"); status=$?; ` +
+    `printf '%s\\n' "$out"; printf 'E:'; cat "${home}/err"; echo "@@$status"`);
+  const shell = execFile("sh", ["-c", `read go; ${steps.join("; ")}`], { encoding: "utf8", env: { ...process.env, ...env } });
+  let out = "";
+  shell.stdout.on("data", (d) => { out += d; });
+  writeFileSync(join(home, "claude", "sessions", `${shell.pid}.json`), JSON.stringify({ pid: shell.pid, name: "lead", cwd: "/tmp", messagingSocketPath: socket }));
+  shell.stdin.end("go\n");
+  await once(shell, "close");
+  return { pid: shell.pid, results: out.split(/@@(\d+)\n/).reduce((acc, part, i, all) => {
+    if (i % 2 === 0 && i + 1 < all.length) {
+      const [stdout, stderr] = part.split("E:");
+      acc.push({ stdout, stderr, status: Number(all[i + 1]) });
+    }
+    return acc;
+  }, []) };
+}
+
+test("claim, resolve, list, whoami and release from inside a Claude session, with exit codes 0, 1 and 2", async () => {
+  const session = sessionHome(), socket = join(session.sockets, "lead.sock"), addr = `uds:${socket}`;
+  try {
+    const { pid, results } = await inSession(session, socket, ["claim proj/lead --json", "claim proj/lead", "whoami --json",
+      "resolve claude:proj/lead", "resolve proj/lead --json", "list --json --no-probe", "list --no-probe", "claim codex:proj/x --json",
+      "claim Proj/x", "claim a/b c/d", "resolve proj/missing", "release proj/lead", "resolve proj/lead --json"]);
+    const [claimed, again, me, resolved, resolvedJson, listed, text, denied, invalid, usage, missing, released, gone] = results;
+    const gen = generation("claude", pid, undefined, socket);
+    assert.equal(claimed.status, 0, claimed.stderr);
+    assert.deepEqual(JSON.parse(claimed.stdout), { status: "claimed", reason: null, name: "claude:proj/lead", kind: "claude", generation: gen,
+      address: addr, previous: null, text: "Claimed claude:proj/lead; senders now reach this session by that name." });
+    assert.deepEqual([again.status, again.stdout.trim()], [0, "claude:proj/lead already names this session."]);
+    assert.deepEqual(JSON.parse(me.stdout).claims, ["claude:proj/lead"]);
+    assert.deepEqual([resolved.status, resolved.stdout, resolved.stderr], [0, `${addr}\n`, ""], "exactly one uds: line");
+    assert.deepEqual(JSON.parse(resolvedJson.stdout), { status: "resolved", reason: null, name: "claude:proj/lead", kind: "claude", address: addr,
+      generation: gen, text: addr });
+    const { peers, names } = JSON.parse(listed.stdout);
+    assert.deepEqual(peers.map((p) => [p.name, p.claims]), [["claude:lead", ["claude:proj/lead"]]]);
+    assert.equal(names.length, 1);
+    assert.deepEqual({ ...names[0], claimedAt: 0 }, { name: "claude:proj/lead", kind: "claude", running: true, address: addr, addresses: [addr],
+      generation: gen, holder: "claude:lead", claimedAt: 0 });
+    assert.match(text.stdout, /claimed names: claude:proj\/lead/);
+    assert.match(text.stdout, new RegExp(`claude:proj/lead  running  SendMessage \\{"to":"${addr}"\\}`));
+    assert.deepEqual([denied.status, JSON.parse(denied.stdout).reason], [1, "scope-denied"]);
+    assert.deepEqual([invalid.status, invalid.stdout], [2, "\n"]);
+    assert.match(invalid.stderr, /is not a claimed name/);
+    assert.equal(usage.status, 2);
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /No session has claimed "proj\/missing"/);
+    assert.equal(released.status, 0);
+    assert.deepEqual([gone.status, JSON.parse(gone.stdout).reason], [1, "not-found"]);
+
+    const outside = run(["claim", "proj/lead"], session.env);
+    assert.equal(outside.status, 1);
+    assert.match(outside.stderr, /no Claude Code session found in this process's ancestry/);
+  } finally { rmSync(session.home, { recursive: true, force: true }); }
+});
+
+test("a dead claim stays listed as not running, and anyone may release it", async () => {
+  const session = sessionHome(), socket = join(session.sockets, "lead.sock");
+  try {
+    const { results } = await inSession(session, socket, ["claim proj/lead"]);
+    assert.equal(results[0].status, 0, results[0].stderr);
+    // The shell has exited, so the claim's holder is not running.
+    const listed = JSON.parse(run(["list", "--json"], session.env).stdout);
+    assert.deepEqual(listed.names.map((row) => [row.name, row.running, row.address, row.holder]), [["claude:proj/lead", false, null, null]]);
+    assert.match(run(["list"], session.env).stdout, /claude:proj\/lead  not running/);
+    const resolved = run(["resolve", "claude:proj/lead"], session.env);
+    assert.equal(resolved.status, 1);
+    assert.match(resolved.stderr, /is claimed by claude:lead, a Claude session that is no longer running/);
+    assert.equal(run(["release", "proj/lead"], session.env).status, 0);
+    assert.deepEqual(JSON.parse(run(["list", "--json"], session.env).stdout).names, []);
+  } finally { rmSync(session.home, { recursive: true, force: true }); }
 });
 
 test("list marks a refusing socket stale without removing the record; --no-probe skips the check", async () => {

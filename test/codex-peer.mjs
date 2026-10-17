@@ -659,7 +659,7 @@ test("one process serves two root threads, each with its own inbox, registry and
   assert.deepEqual([existsSync(f.registry), existsSync(otherRegistry), existsSync(firstSocket), existsSync(secondSocket)], [false, false, false, false]);
 });
 
-test("exact routing: kind-elided exact names, never fragments; reserved names; stale and reused targets fail as not running", async (t) => {
+test("exact routing: kind-elided exact names, never fragments; unclaimed names; stale and reused targets fail as not running", async (t) => {
   const f = await fixture(t), peer = await f.start();
   await peer.call("list_peers");
   assert.equal((await peer.call("send_peer", { to: "test", message: "elided kind" })).structuredContent.name, "claude:test");
@@ -667,7 +667,8 @@ test("exact routing: kind-elided exact names, never fragments; reserved names; s
   assert.deepEqual([fragment.isError, fragment.structuredContent.reason], [true, "not-found"]);
   assert.match(fragment.content[0].text, /no live peer named "tes"; exact names: claude:test/);
   const claimed = await peer.call("send_peer", { to: "claude:project/lead", message: "a claim" });
-  assert.equal(claimed.structuredContent.reason, "reserved-name");
+  assert.deepEqual([claimed.isError, claimed.structuredContent.reason], [true, "not-found"]);
+  assert.equal((await peer.call("send_peer", { to: "claude:project/Lead", message: "a claim" })).structuredContent.reason, "invalid-request");
   assert.equal((await peer.call("send_peer", { to: "claude:*", message: "a pattern" })).structuredContent.reason, "invalid-request");
   const invalid = (await peer.call("send_peer", { to: "claude:test", message: "x", in_reply_to: "not an id" })).structuredContent;
   assert.deepEqual([invalid.reason, invalid.in_reply_to], ["invalid-request", null], "an invalid id is never echoed");

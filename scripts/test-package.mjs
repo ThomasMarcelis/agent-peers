@@ -26,7 +26,7 @@ try {
   const env = { ...process.env, CLAUDE_CONFIG_DIR: join(scratch, "claude"), AGENT_PEERS_HOME: join(scratch, "peers"), AGENT_PEERS_CODEX_APP_SERVER: join(scratch, "missing.sock") };
   const launch = (args) => execFileSync(join(install, "node_modules", ".bin", "agent-peers"), args, { env, encoding: "utf8" });
   assert.equal(launch(["--version"]).trim(), VERSION);
-  assert.deepEqual(JSON.parse(launch(["list", "--json"])), { peers: [] });
+  assert.deepEqual(JSON.parse(launch(["list", "--json"])), { peers: [], names: [] });
   assert.equal(JSON.parse(launch(["doctor", "--json"])).ok, true);
   const pkg = JSON.parse(readFileSync(join(installed, "package.json"), "utf8"));
   assert.equal(pkg.version, VERSION);

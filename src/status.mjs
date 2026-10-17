@@ -20,10 +20,14 @@ const MESSAGE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 export const validMessageId = (id) => typeof id === "string" && MESSAGE_ID.test(id);
 const REASON = /^[a-z][a-z0-9-]{0,63}$/;
 const GENERATION = /^[a-f0-9]{16}$/;
+// A claimed name, <kind>:<scope>/<claim> (names.mjs): lowercase ASCII with exactly one "/".
+export const CLAIMED_NAME = /^(claude|codex|hermes):[a-z0-9][a-z0-9_-]{0,63}\/[a-z0-9][a-z0-9_.-]{0,63}$/;
 
 // The extension a 1.0 sender adds to each message line. Claude Code and agent-peers 0.x ignore it.
-export const extension = ({ generation, inReplyTo }) => ({
+// `to_name` is the claimed name the sender resolved to reach this inbox.
+export const extension = ({ generation, inReplyTo, toName }) => ({
   v: 1, receipts: OPT_IN, ...(generation ? { generation } : {}), ...(inReplyTo ? { in_reply_to: inReplyTo } : {}),
+  ...(toName ? { to_name: toName } : {}),
 });
 
 // A line's extension, validated; empty for Claude, agent-peers 0.x and anything malformed.
@@ -34,6 +38,7 @@ export function readExtension(line) {
     receipts: new Set(Array.isArray(ext.receipts) ? ext.receipts.filter((status) => OPT_IN.includes(status)) : []),
     generation: typeof ext.generation === "string" && GENERATION.test(ext.generation) ? ext.generation : undefined,
     inReplyTo: validMessageId(ext.in_reply_to) ? ext.in_reply_to : undefined,
+    toName: typeof ext.to_name === "string" && CLAIMED_NAME.test(ext.to_name) ? ext.to_name : undefined,
   };
 }
 
@@ -63,6 +68,14 @@ export function receiptLine({ from, ids, status, reason }) {
     reason: RECEIPT_TEXT[status], ...(status === "dropped" ? { drop_reason: reason, dropped_msg_ids: ids } : {}), agent_peers: { v: 1 },
   };
 }
+
+// Claude's SendMessage cannot mark a line with the name it was sent to, so `agent-peers resolve`
+// tells a Hermes holder that the Claude session at `from` resolved its name, just before that
+// session sends. Without it the holder cannot tell that sender from one that found its inbox.
+export const nameResolvedLine = ({ from, name }) => ({ type: "control", action: "name_resolved", msgV: 1, msg_id: randomUUID(), from, name,
+  agent_peers: { v: 1 } });
+export const readNameResolved = (line) => line?.type === "control" && line.action === "name_resolved" && typeof line.from === "string" &&
+  typeof line.name === "string" && CLAIMED_NAME.test(line.name) ? { from: line.from, name: line.name } : undefined;
 
 // A send that never produced a deliverable line, with a stable reason code.
 export class SendFailure extends Error {

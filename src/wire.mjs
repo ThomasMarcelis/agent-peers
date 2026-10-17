@@ -83,7 +83,7 @@ export const recordRunning = (record) => running(record, processStarts(record.pr
 export const generation = (kind, ...parts) =>
   createHash("sha256").update([kind, ...parts.map((part) => String(part ?? ""))].join("\0")).digest("hex").slice(0, 16);
 
-function safeDirectory(path, privateOnly = false) {
+export function safeDirectory(path, privateOnly = false) {
   const st = lstatSync(path);
   if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== uid || (st.mode & (privateOnly ? 0o077 : 0o022))) {
     throw new Error(`unsafe peer directory ${path}: expected an owned ${privateOnly ? "0700 " : ""}directory without symlinks or shared write access`);
@@ -100,7 +100,9 @@ export function ensurePrivateDir(path) {
 }
 
 // Read registry files without following a substituted symlink or allocating an unbounded file.
-export function readPeerRecord(path) {
+// The file's identity comes with it, so a writer can tell whether it was replaced since.
+export const readPeerRecord = (path) => readPeerFile(path).record;
+export function readPeerFile(path) {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const st = fstatSync(fd);
@@ -111,16 +113,16 @@ export function readPeerRecord(path) {
     if (bytes > 65_536) throw new Error("peer registry file is too large");
     const value = JSON.parse(buffer.toString("utf8", 0, bytes));
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid peer registry record");
-    return value;
+    return { record: value, dev: st.dev, ino: st.ino };
   } finally {
     closeSync(fd);
   }
 }
 
-const safeText = (s, limit = 512) => typeof s === "string" && s.length > 0 && s.length <= limit && !/[\x00-\x1f\x7f]/.test(s);
-const validSocketPath = (path) => typeof path === "string" && Buffer.byteLength(path) <= MAX_SOCKET_PATH && isAbsolute(path) && normalize(path) === path &&
+export const safeText = (s, limit = 512) => typeof s === "string" && s.length > 0 && s.length <= limit && !/[\x00-\x1f\x7f]/.test(s);
+export const validSocketPath = (path) => typeof path === "string" && Buffer.byteLength(path) <= MAX_SOCKET_PATH && isAbsolute(path) && normalize(path) === path &&
   path.endsWith(".sock") && !/[\x00-\x1f\x7f]/.test(path);
-const validPid = (pid) => Number.isInteger(pid) && pid > 0 && pid <= 0x7fffffff;
+export const validPid = (pid) => Number.isInteger(pid) && pid > 0 && pid <= 0x7fffffff;
 export const validThreadId = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 
 // Every well-formed Claude record, marked `running`; read once per discovery scope. Without
@@ -188,6 +190,12 @@ export function inDiscoveryScope(fn) {
   if (discoveryScope) return fn();
   discoveryScope = {};
   try { return fn(); } finally { discoveryScope = undefined; }
+}
+// A value computed once per discovery scope, and on every call outside one.
+export function scoped(key, compute) {
+  if (!discoveryScope) return compute();
+  if (!Object.hasOwn(discoveryScope, key)) discoveryScope[key] = compute();
+  return discoveryScope[key];
 }
 function verifiedSocketDirectories() {
   refreshDirectoryScope();
@@ -272,6 +280,13 @@ export const claudeSessions = () => inDiscoveryScope(listClaudeSessions);
 function listClaudeSessions() {
   return claudeRecords().flatMap((s) => (peerSocket(address(s.messagingSocketPath)) ? [claudeRow(s)] : []));
 }
+
+// The live Claude session with this PID, plus the start token that, with the PID, owns its claims.
+export const claudeSessionAt = (pid) => inDiscoveryScope(() => {
+  const s = claudeRecords().find((record) => record.pid === pid);
+  if (!s || !peerSocket(address(s.messagingSocketPath))) return undefined;
+  return { ...claudeRow(s), procStart: s.procStart === undefined ? undefined : String(s.procStart) };
+});
 
 export function isSafePeerRecord(p) {
   return !!p && validPid(p.pid) && safeText(p.name, 160) && p.name.startsWith("codex:") &&

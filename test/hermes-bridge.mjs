@@ -328,7 +328,8 @@ test("malformed messages, invalid reply targets and duplicate ids are suppressed
   assert.deepEqual(f.controls, [], "a duplicate id gets no receipt; successes go only to senders that opt in");
   for (const [to, reason, text] of [["uds:/outside/invalid.sock", "invalid-address", /not a peer inbox address/],
     [sent.from, "self-send", /own inbox/], ["test", "ambiguous", /"test" is ambiguous: claude:test .*, codex:test/],
-    ["tes", "not-found", /exact names: claude:test, codex:test/], ["hermes:jd/project", "reserved-name", /reserved for explicit claims/]]) {
+    ["tes", "not-found", /exact names: claude:test, codex:test/], ["hermes:jd/project", "not-found", /No session has claimed hermes:jd\/project\. Its holder must claim it/],
+    ["hermes:JD/project", "invalid-request", /is not a claimed name/]]) {
     const result = await f.send("safe", to);
     assert.deepEqual([result.status, result.reason], ["failed", reason]);
     assert.match(result.text, text);

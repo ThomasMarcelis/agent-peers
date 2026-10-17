@@ -1,9 +1,11 @@
 // The outbound half shared by Codex sessions and Hermes conversations: exact target resolution
 // with generation pins, and one send with its receipt window and late outcomes.
 
+import { dirname } from "node:path";
 import {
   SendFailure, describe, extension, isError, isTerminal, lateNotice, readReceipt, sendResult, validMessageId,
 } from "./status.mjs";
+import { isClaimedTarget, resolveClaim } from "./names.mjs";
 import { MAX_LINE, allPeers, inDiscoveryScope, messageLine, peerSocket, post, stalePeers } from "./wire.mjs";
 
 const WINDOW_MS = 1500, PENDING_MAX = 128, OUTSTANDING_MAX = 256, OUTSTANDING_MS = 30 * 60_000, PINS_MAX = 1024;
@@ -21,6 +23,8 @@ export class Pins {
     this.#map.set(key, generation);
     if (this.#map.size > PINS_MAX) this.#map.delete(this.#map.keys().next().value);
   }
+
+  get(key) { return this.#map.get(key); }
 
   noteRows(rows) {
     for (const row of rows) for (const key of [row.name, row.address, row.bridge?.to, ...(row.addresses ?? [])]) this.note(key, row.generation);
@@ -45,10 +49,25 @@ export class Pins {
 
 const notRunning = (peer) => new SendFailure("not-running", `${peer.name} is no longer running; its inbox address is obsolete. Call list_peers.`);
 
+// A claimed name follows its holder, so a different generation behind it is never a pin failure:
+// the send goes to the verified holder, and the result says the holder changed.
+function claimedTarget(to, pins, directory) {
+  const target = resolveClaim(to, { directory });
+  const previous = pins?.get(target.name);
+  if (previous && previous !== target.generation) {
+    target.note = `${target.name} is held by a different session than at your last send (generation ${previous} → ${target.generation}).`;
+  }
+  pins?.note(target.name, target.generation);
+  pins?.note(target.address, target.generation);
+  return target;
+}
+
 // Exact routing only: an inbox address, an exact name, or an exact name without its kind prefix
 // when exactly one kind has it. Never a fragment, a most-recent guess, a default or a broadcast.
-export function resolveTarget(to, pins) {
+// `directory` prefers the target's inbox there, for a Claude sender's own socket directory.
+export function resolveTarget(to, pins, { directory } = {}) {
   return inDiscoveryScope(() => {
+    if (isClaimedTarget(to)) return claimedTarget(to, pins, directory);
     const peers = allPeers();
     let target;
     if (to.startsWith("uds:")) {
@@ -61,7 +80,6 @@ export function resolveTarget(to, pins) {
       }
       target = owner ? { ...owner, address: to, socket } : { address: to, socket, name: to };
     } else {
-      if (to.includes("/")) throw new SendFailure("reserved-name", `"${to}": names containing "/" are reserved for explicit claims, which this version does not support`);
       if (/[@*?,\s]/u.test(to)) throw new SendFailure("invalid-request", `"${to}" is not a peer name; names never contain patterns or lists`);
       let matches = peers.filter((p) => p.name === to);
       if (!matches.length) matches = peers.filter((p) => p.name === `claude:${to}` || p.name === `codex:${to}`);
@@ -77,6 +95,9 @@ export function resolveTarget(to, pins) {
       }
       target = { ...matches[0], socket: peerSocket(matches[0].address) };
     }
+    const preferred = directory && !to.startsWith("uds:") &&
+      target.addresses?.find((addr) => peerSocket(addr) && dirname(peerSocket(addr)) === directory);
+    if (preferred) Object.assign(target, { address: preferred, socket: peerSocket(preferred) });
     pins?.check([to, target.address], target);
     return target;
   });
@@ -175,10 +196,12 @@ export async function sendPeer({ to, message, inReplyTo, pins, fromName, generat
     if (options.claude && inReplyTo) body += `\n\n(In reply to ${inReplyTo}.)`;
     const intro = options.claude ? introduction?.(target) : undefined;
     if (intro) body += `\n\n${intro}`;
-    const line = messageLine({ from, fromName, body, ext: extension({ generation, inReplyTo }) });
+    // A claimed name rides along, so a Hermes holder can tell a sender who used its name from one
+    // that found its inbox in the socket directory.
+    const line = messageLine({ from, fromName, body, ext: extension({ generation, inReplyTo, toName: target.claimed ? target.name : undefined }) });
     result.message_id = line.msg_id;
     Object.assign(result, await outbox.send(target.socket, line, { to: target.address, name: target.name, receipts }));
-    return { result, text: describe(result, options), bytes: Buffer.byteLength(body) };
+    return { result, text: describe(result, options) + (target.note ? ` ${target.note}` : ""), bytes: Buffer.byteLength(body) };
   } catch (error) {
     if (!(error instanceof SendFailure)) throw error;
     Object.assign(result, { status: "failed", reason: error.reason });
