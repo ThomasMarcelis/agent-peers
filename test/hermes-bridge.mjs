@@ -747,6 +747,32 @@ test("a claim is scoped to the bridge's Hermes profile and opens an inbox in eve
   assert.equal((await f.bridge.request("list_peers")).names[0].running, false);
 });
 
+test("a refused claim closes the inboxes it opened and keeps those the conversation already had", async (t) => {
+  const f = await fixture(t, { profile: "jd" }), otherDir = join(f.dir, "other");
+  mkdirSync(otherDir, { mode: 0o700 });
+  // A second live Claude session makes its socket directory a verified one.
+  const other = spawn("sleep", ["60"], { stdio: "ignore" });
+  t.after(() => other.kill());
+  await once(other, "spawn");
+  writeFileSync(join(f.claude, "sessions", `${other.pid}.json`), JSON.stringify({ pid: other.pid, name: "other", messagingSocketPath: join(otherDir, "c.sock") }));
+  const inboxes = () => [f.sockets, otherDir].flatMap((dir) => readdirSync(dir).filter((name) => name.startsWith("hermes-")).map((name) => join(dir, name))).sort();
+  assert.equal((await named(f.bridge, "claim_name", "holder", "conversation-1", "jd/relay")).status, "claimed");
+  const held = inboxes();
+  assert.equal(held.length, 2);
+  // A conversation with no inbox yet: everything its claim opened is closed again.
+  const fresh = await named(f.bridge, "claim_name", "fresh", "conversation-2", "jd/relay");
+  assert.deepEqual([fresh.status, fresh.reason], ["refused", "name-held"]);
+  assert.deepEqual(inboxes(), held);
+  // A conversation that wrote to a peer keeps that inbox; the one its claim added is closed.
+  const sent = await f.send("writer", "codex:test", "hello");
+  const written = inboxes();
+  assert.equal(written.length, 3);
+  assert.equal((await named(f.bridge, "claim_name", "writer", "conversation-3", "jd/relay")).reason, "name-held");
+  assert.deepEqual(inboxes(), written);
+  await post(peerSocket(sent.from), messageLine({ from: address(join(f.sockets, "codex-test.sock")), body: "reply" }));
+  await until(() => f.events.some((e) => e.params.session === "writer" && e.params.message === "reply"), "the reply on the kept inbox");
+});
+
 test("after a restart the conversation's next call takes its names back, they follow compression, and nobody else takes a live one", async (t) => {
   const f = await fixture(t, { profile: "jd" }), name = "hermes:jd/relay";
   assert.equal((await named(f.bridge, "claim_name", "route-1", "conversation-1", name)).status, "claimed");

@@ -200,22 +200,30 @@ export class HermesBridge {
 
   // Claiming opens this route's inboxes in every verified socket directory first and records them,
   // because a Hermes conversation has no registry: the claim is the only way it is ever listed. A
-  // directory that refuses an inbox is left out; with none at all, the claim is refused.
+  // directory that refuses an inbox is left out; with none at all, the claim is refused. A refused
+  // claim closes the inboxes it opened; those the conversation had before stay open.
   async #claimName(session, owner, identity, name) {
     const refused = (text) => claimRefusal("inbox-unavailable", text, { name, kind: "hermes" });
-    if ([...this.#routes.values()].some((route) => route.session === session && route.name !== identity)) {
-      return refused("this conversation already belongs to a different Hermes identity");
-    }
+    const own = () => [...this.#routes.values()].filter((route) => route.session === session);
+    if (own().some((route) => route.name !== identity)) return refused("this conversation already belongs to a different Hermes identity");
     this.#conversation(session);
-    let failure;
-    const directories = socketDirectories().slice(0, NAME_INBOXES_MAX);
-    for (const directory of directories.length ? directories : [socketDir()]) {
-      try { await this.#bind(session, identity, directory); }
-      catch (error) { failure ??= error; }
+    const before = new Set(own());
+    let failure, result;
+    try {
+      const directories = socketDirectories().slice(0, NAME_INBOXES_MAX);
+      for (const directory of directories.length ? directories : [socketDir()]) {
+        try { await this.#bind(session, identity, directory); }
+        catch (error) { failure ??= error; }
+      }
+      const claimant = this.#claimant(session, owner, identity);
+      result = claimant.holder.addresses.length ? claim(name, claimant) : refused(failure?.message ?? "no socket directory is available for an inbox");
+      return result;
+    } finally {
+      // Also when the claim threw.
+      if (!result || result.status === "refused") {
+        await Promise.all(own().filter((route) => !before.has(route)).map((route) => this.#retire(route)));
+      }
     }
-    const claimant = this.#claimant(session, owner, identity);
-    if (!claimant.holder.addresses.length) return refused(failure?.message ?? "no socket directory is available for an inbox");
-    return claim(name, claimant);
   }
 
   async #claimRequest(method, session, params) {
