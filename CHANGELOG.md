@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-rc.2 — 2026-10-17
 
-Becomes 1.0.0-rc.2. Explicit, scoped stable names (#13), part of the covered 1.0 surface ([stability](docs/stability.md)). See [names](docs/reference.md#names).
+Second release candidate for 1.0.0, on the npm `next` tag. Adds explicit, scoped stable names (#13), part of the covered 1.0 surface ([stability](docs/stability.md)). See [names](docs/reference.md#names).
 
 ### Added
 

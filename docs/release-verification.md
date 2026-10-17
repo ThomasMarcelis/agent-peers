@@ -2,6 +2,14 @@
 
 Raw live transcripts are excluded from the repository and package.
 
+## 1.0.0-rc.2
+
+Verified on 2026-10-17 on Linux with Node 22.23.1. CI on Linux and macOS gates the release job.
+
+- Deterministic suites: 161 JavaScript tests and 35 Python tests, including the stable-name scenarios from `docs/design/names.md` §10: claim, refresh, takeover of a stopped holder, refusal of a running holder, profile scoping, Hermes re-claim after a restart, the name-based exception to the #28 reply-target rule, and storage races.
+- The Hermes integration tests pass against the deployed fork build `0d7c749` with the new `--hermes-profile` bridge argument.
+- The four-session live matrix from rc.1 was not re-run. Names add no change to unnamed delivery. Live use of names happens on the maintainer's machine during the candidate period.
+
 ## 1.0.0-rc.1
 
 Verified on 2026-10-17 on Linux with Node 22.23.1. CI on Linux and macOS gates the release job.
