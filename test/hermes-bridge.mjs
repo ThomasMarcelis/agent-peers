@@ -3,7 +3,7 @@ import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { connect, createServer } from "node:net";
+import { Socket, connect, createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -979,6 +979,29 @@ test("resolve hears whether the holder admits its Claude session, and takes an o
   const silent = await claudeShell(t, f.claude, lead, "resolve hermes:jd/old");
   assert.deepEqual([silent.status, silent.stdout], [0, `${address(old)}\n`]);
   assert.ok(silent.ms >= 1000, "it waited for an answer");
+});
+
+test("a sender that floods name_resolved and reads no answer cannot make the bridge buffer more than 64 KiB of them", { timeout: 30_000 }, async (t) => {
+  const f = await fixture(t, { profile: "jd" });
+  const inbox = peerSocket((await named(f.bridge, "claim_name", "named", "conversation", "jd/relay")).address);
+  // The bridge's side of each connection: how much it has written that the peer has not read.
+  let peak = 0;
+  const write = Socket.prototype.write;
+  Socket.prototype.write = function (...args) {
+    const result = write.apply(this, args);
+    if (this.server) peak = Math.max(peak, this.writableLength);
+    return result;
+  };
+  t.after(() => { Socket.prototype.write = write; });
+  const line = JSON.stringify(nameResolvedLine({ from: address(join(f.sockets, "claude-test.sock")), name: "hermes:jd/relay" })) + "\n";
+  const flood = connect(inbox);
+  t.after(() => flood.destroy());
+  flood.pause();
+  await once(flood, "connect");
+  flood.write(line.repeat(20_000));
+  await until(() => flood.writableLength === 0, "the bridge reading every line");
+  await delay(200);
+  assert.ok(peak > 0 && peak <= 64 * 1024 + 1024, `peak ${peak} bytes`);
 });
 
 test("arrivals carry reply_name only for a verified claim, and first messages to Claude name this conversation", async (t) => {

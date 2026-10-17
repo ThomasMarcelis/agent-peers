@@ -16,7 +16,7 @@ import {
 
 const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256, HANDOFFS_MAX = 256, CONTACTS_MAX = 256,
   CONVERSATIONS_MAX = 2 * SESSIONS_MAX, RETIRED_HANDOFF_MS = 60_000, NAME_INBOXES_MAX = 16, NAMED_MAX = 64,
-  RECLAIM_BACKOFF_MS = 60_000, RECLAIM_REFUSED_MAX = 64;
+  RECLAIM_BACKOFF_MS = 60_000, RECLAIM_REFUSED_MAX = 64, ANSWER_BACKLOG_MAX = 64 * 1024;
 const IDENTITY = /^hermes:[A-Za-z0-9:_-]+$/;
 const START = processStart(process.pid);
 const IPC_QUEUE_MAX = 128, IPC_WRITE_TIMEOUT_MS = 5000;
@@ -492,7 +492,9 @@ export class HermesBridge {
       : !holds(name, generation("hermes", route.session)) ? "not-holder"
       : !inDiscoveryScope(() => from !== route.address && existingSocket(from) && claudeSessions().some((session) => session.address === from))
         ? "unknown-sender" : undefined;
-    if (id && conn && !conn.destroyed) {
+    // resolve writes one line and reads the answer. A sender that writes many and reads none gets
+    // no more answers once 64 KiB of them wait unsent, so it cannot grow this process's memory.
+    if (id && conn && !conn.destroyed && conn.writableLength <= ANSWER_BACKLOG_MAX) {
       try { conn.write(JSON.stringify(nameResolvedStatusLine({ from: route.address, id, admitted: !reason, reason })) + "\n"); } catch {}
     }
     if (reason) return event("receive.dropped", { sessionId, reason: code(reason) });
