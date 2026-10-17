@@ -399,12 +399,17 @@ export class HermesBridge {
     // Only peers this conversation wrote to may write to it (issue #28), and senders that used a name
     // it holds, which are remembered apart. Anyone else found the inbox in the socket directory. A
     // sender is admitted by name only from a socket of this user that exists, never from an address
-    // nobody listens at.
+    // nobody listens at. A line sent by name that this conversation does not hold now is for the
+    // name's holder, so it is dropped whoever sent it.
     const conversation = this.#conversations.get(route.session);
+    const byName = message.ext.toName && holds(message.ext.toName, generation("hermes", route.session));
+    if (message.ext.toName && !byName) {
+      reply("dropped", "not-a-reply-target");
+      return drop("not_a_reply_target", fields);
+    }
     const contact = Boolean(conversation?.contacts.has(message.from));
     if (!contact && !conversation?.named.has(message.from)) {
-      if (!conversation || !message.ext.toName || !holds(message.ext.toName, generation("hermes", route.session)) ||
-          !inDiscoveryScope(() => existingSocket(message.from))) {
+      if (!conversation || !byName || !inDiscoveryScope(() => existingSocket(message.from))) {
         reply("dropped", "not-a-reply-target");
         return drop("not_a_reply_target", fields);
       }

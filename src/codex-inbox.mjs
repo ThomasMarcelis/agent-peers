@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { app, isCurrent, ownsSocket } from "./codex-binding.mjs";
 import { Receipts, readMessage } from "./inbox.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
-import { claimAt } from "./names.mjs";
+import { claimAt, holds } from "./names.mjs";
 import { Outbox, Pins } from "./outbox.mjs";
 import { inDiscoveryScope } from "./wire.mjs";
 
@@ -38,6 +38,12 @@ export function receive(root, inbox, line) {
   const trace = { operationId: randomUUID(), messageId: logIdentity(message.id ?? undefined), threadId: logIdentity(root.threadId),
     targetId: logIdentity(message.from), bytes };
   const reply = (status, reason) => receipts.send({ to: message.from, from: inbox.address, id: message.id, status, reason, optIn: message.ext.receipts });
+  // A line sent by name is for that name's holder. If this root does not hold it now (it released
+  // the name, or lost a race for it), it is dropped, as a Hermes conversation drops it.
+  if (message.ext.toName && !inDiscoveryScope(() => holds(message.ext.toName, root.generation))) {
+    reply("dropped", "not-a-reply-target");
+    return log("message.receive", { ...trace, outcome: "dropped", reason: "not_a_reply_target" });
+  }
   const reason = root.admission.admit(message.from, message.id, { full: root.queued >= QUEUE_MAX || root.queuedBytes + bytes > QUEUE_BYTES_MAX });
   // A repeated id gets no receipt: the first copy's outcome stands, and "dropped" would make the
   // sender treat a delivered message as unsent.

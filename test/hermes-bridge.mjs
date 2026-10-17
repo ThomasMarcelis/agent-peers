@@ -817,6 +817,13 @@ test("a claimed name admits senders that used the name, never one that found the
   assert.deepEqual([sent.status, sent.name, sent.generation], ["queued", "hermes:jd/relay", generation("hermes", "named")]);
   await until(() => f.events.length === 3);
   assert.deepEqual([f.events[2].params.session, f.events[2].params.message], ["named", "from another conversation"]);
+  // A line marked with a name this conversation does not hold is for that name's holder, even from a
+  // sender it admits, and from a peer it wrote to.
+  await f.send("named", "codex:test", "a question");
+  const misdirected = { ...messageLine({ from: codex, body: "for another holder" }), agent_peers: { v: 1, to_name: "hermes:jd/other" } };
+  await post(inbox, misdirected);
+  await until(() => refusedIds().includes(misdirected.msg_id), "the misdirected line refused");
+  assert.equal(f.events.length, 3);
 });
 
 test("senders admitted by name are bounded and have their own buckets, apart from the peers the conversation wrote to", { timeout: 30_000 }, async (t) => {
