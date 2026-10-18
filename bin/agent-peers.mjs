@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { dirname } from "node:path";
-import { agentProcess, allPeers, ancestorPids, claudeSessionAt, exchange, inDiscoveryScope, probePeers, whoami } from "../src/wire.mjs";
+import { MAX_LINE, agentProcess, allPeers, ancestorPids, claudeSessionAt, exchange, inDiscoveryScope, probePeers, whoami } from "../src/wire.mjs";
 import { formatName, formatSessionPeer } from "../src/discovery.mjs";
 import { SCOPE, claim, claimRefusal, claimRows, claudeClaimant, heldBy, parseName, release, withClaims } from "../src/names.mjs";
 import { resolveTarget } from "../src/outbox.mjs";
-import { SendFailure, nameResolvedLine, readNameResolvedStatus } from "../src/status.mjs";
+import { EXIT, LABEL, scriptSend } from "../src/script-send.mjs";
+import { SendFailure, nameResolvedLine, readNameResolvedStatus, sendResult } from "../src/status.mjs";
 import { VERSION } from "../src/version.mjs";
 
 const usage = `agent-peers ${VERSION} — local agent messaging
@@ -16,6 +17,8 @@ Usage: agent-peers <command> [options]
   claim <name> [--json]     Claim a stable name, claude:<scope>/<claim>, for the calling Claude session
   release <name> [--json]   Release a name this session holds, or one whose holder is not running
   resolve <target> [--json] Print the one uds: address to send to for a claimed name, peer name or address
+  send <target> --stdin [--label <label>] [--json]
+                    Send one one-way notice read from stdin, from a temporary script address that takes no replies
   doctor [--json]   Check local prerequisites and whether the Codex app-server answers
   logs [--json]     Summarize retained local diagnostic events
   hermes-bridge    Start the plugin-managed JSON-lines subprocess
@@ -113,6 +116,47 @@ async function resolveCommand(to, json) {
   report(result, json, result.status === "resolved");
 }
 
+// The message body from stdin, refused unread past the inbox line limit.
+async function readStdin() {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of process.stdin) {
+    bytes += chunk.length;
+    if (bytes > MAX_LINE) {
+      process.stdin.destroy();
+      return undefined;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8").replace(/\s+$/u, "");
+}
+
+async function sendCommand(args) {
+  const usageError = () => new SyntaxError("usage: agent-peers send <target> --stdin [--label <label>] [--json]");
+  const values = [], flags = new Set();
+  let label;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--label") {
+      if (label !== undefined || i + 1 >= args.length) throw usageError();
+      label = args[++i];
+    } else if (["--stdin", "--json"].includes(args[i]) && !flags.has(args[i])) flags.add(args[i]);
+    else if (args[i].startsWith("--")) throw usageError();
+    else values.push(args[i]);
+  }
+  if (values.length !== 1 || !flags.has("--stdin")) throw usageError();
+  if (label !== undefined && !LABEL.test(label)) throw new SyntaxError("--label must match [a-z0-9][a-z0-9_-]{0,55}; it is shown as script:<label>");
+  if (process.stdin.isTTY) throw new SyntaxError("--stdin needs the message piped in");
+  const body = await readStdin();
+  const result = body === undefined
+    ? { ...sendResult({ reason: "too-large" }), outcome: "rejected", reply: false, text: `the message is too large for a peer inbox (${MAX_LINE} bytes per line); nothing was sent` }
+    : await scriptSend({ to: values[0], body, label });
+  const ok = result.outcome === "sent";
+  if (flags.has("--json")) console.log(JSON.stringify(result, null, 2));
+  else if (ok) console.log(result.text);
+  else console.error(`agent-peers: ${result.text}`);
+  process.exitCode = result.reason === "invalid-request" ? 2 : EXIT[result.outcome];
+}
+
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
   if (!cmd || ["--help", "-h", "help"].includes(cmd)) {
@@ -131,6 +175,10 @@ async function main() {
     }
     if (cmd === "resolve") await resolveCommand(values[0], flags.length > 0);
     else claimCommand(cmd, values[0], flags.length > 0);
+    return;
+  }
+  if (cmd === "send") {
+    await sendCommand(args);
     return;
   }
   if (cmd === "hermes-bridge") {

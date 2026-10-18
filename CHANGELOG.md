@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Experimental** `agent-peers send <target> --stdin [--label <label>] [--json]`: one one-way notice from a script or detached job to a claimed name, peer name or address. Each call sends from its own temporary inbox beside the target's, open only for the receipt window and removed on exit or SIGINT/SIGTERM/SIGHUP, with `from-name` `script:<label>` and a footer saying replies to that address do nothing. The result adds `outcome` (`sent`, `retry`, `unreachable`, `uncertain`, `rejected`) and `reply: false`, with exit codes 0, 3, 4, 5 and 1 ([reference](docs/reference.md#script-sends)).
+
+### Fixed
+
+- A `write-timeout` result no longer says the message was not delivered. The line may still have arrived, as the reference already said; the text now says so and asks the sender to check with the recipient before sending again.
+
 ## 1.0.0-rc.7 — 2026-10-17
 
 Seventh release candidate for 1.0.0, for the npm `next` tag. Adds **experimental opencode 2.x support** through a thin v2 plugin and one shared stdio bridge per opencode server. Also makes discovery's native-route reason per-kind and adds opencode rows to Codex listing. There is no 1.0.0-rc.5, and 1.0.0-rc.6 was cut locally but never published; their changes are included here. Deterministic suites pass, and after an independent Opus and Codex review round a live smoke run plus a three-host run (Claude Code, Codex and opencode on `claude-haiku-5-5`, `gpt-6-luna` and `deepseek/deepseek-flash`) passed; no opencode steering rate is claimed.

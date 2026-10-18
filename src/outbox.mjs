@@ -105,7 +105,8 @@ export function resolveTarget(to, pins, { directory } = {}) {
 
 const writeFailure = (error, name) => {
   if (["ENOENT", "ECONNREFUSED"].includes(error.code)) return new SendFailure("not-running", `${name} is not running: nothing is listening at its inbox.`);
-  if (error.code === "ETIMEDOUT") return new SendFailure("write-timeout", `${name}'s inbox did not accept the message within 5 s; it was not delivered and is not retried.`);
+  if (error.code === "ETIMEDOUT") return new SendFailure("write-timeout", `${name}'s inbox did not accept the message within 5 s. It may still have arrived, so it is not retried; ` +
+    "ask the recipient before sending it again.");
   if (error.code === "E2BIG") return new SendFailure("too-large", `the message is too large for a peer inbox (${MAX_LINE} bytes per line)`);
   return new SendFailure("write-failed", `the message could not be written to ${name}'s inbox: ${error.message}`);
 };

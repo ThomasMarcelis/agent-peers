@@ -10,6 +10,7 @@
 | `agent-peers claim <name> [--json]` | Claims `claude:<scope>/<claim>` (or `<scope>/<claim>`) for the calling Claude session, found by ancestry like `whoami` but Claude only. The walk stops at the first agent process without a Claude session record (a `claude`, `codex`, `hermes` or `opencode` process, or Node or Python running one), so a worker an agent started never claims for the session above it. Other agents run from a Claude session's shell, such as gemini, aider or goose, are not recognised: a claim they run is made for that Claude session. Prints the [claim result](#claim-and-release-results). Exits 1 when refused, including `no-session` outside a Claude session or inside such a worker, and 2 for a name outside the grammar |
 | `agent-peers release <name> [--json]` | Removes a name this session holds, or a `claude:` name whose holder is not running (also outside a session). Codex, Hermes and opencode names are `scope-denied`: their own sessions release them. Exits 1 when refused |
 | `agent-peers resolve <target> [--json]` | Prints exactly one `uds:` line for a claimed name, an exact peer name or an address: the holder's inbox in the calling Claude session's socket directory when it has one, else its primary inbox. opencode names are ordinary registered inboxes. JSON: `{status: "resolved", reason: null, name, kind, address, generation, text}`, or `{status: "failed", reason, text}`. For a name a Hermes conversation holds, it also tells that conversation which Claude session is about to send, and waits up to a second for its answer ([names](#names-and-the-reply-target-allowlist)). Exits 1 for `not-found`, `not-running`, `ambiguous` or `inbox-unavailable`, and when that conversation will not admit the session (`not-holder`, `unknown-sender`, `inbox-closed`); 2 for invalid usage or grammar |
+| `agent-peers send <target> --stdin [--label <label>] [--json]` | Sends one one-way notice, read from stdin, to a claimed name, an exact peer name or a `uds:` address, for scripts and jobs that are not agent sessions ([experimental](stability.md#experimental)). Each call is its own sender: a temporary inbox `script-<id>.sock` beside the target's inbox, open only for the [receipt window](#delivery-protocol) and removed on exit, including on SIGINT, SIGTERM and SIGHUP. It never sends as a session and needs none in its ancestry, so a detached job can use it. The envelope's `from-name` is `script:<label>` (label `[a-z0-9][a-z0-9_-]{0,55}`, default `script`), which is attribution, not authentication. A footer tells the recipient that replying to its address does nothing; a reply that arrives during the window gets `dropped`/`inbox-closed`. Name the peer to talk to in the body (for example `Discussion: hermes:gaming/relay`); the command never reads it. Prints the [send result](#send_peer-result) plus `outcome` and `reply: false`; see [script sends](#script-sends) for outcomes and exit codes |
 | `agent-peers doctor [--json]` | Runtime, dependency, and local path checks, plus one read-only request to the Codex app-server to confirm it answers. For opencode it reports the binary/version, whether the global config's `plugins` lists `agent-peers`, the live opencode record count, and the installed plugin package version next to the CLI version (a warning on skew, `unknown` when it cannot resolve the package). It never starts a server, reads a password, or writes configuration; a missing opencode is a warning. |
 | `agent-peers logs [--json]` | Read-only summary of retained local diagnostic events |
 | `agent-peers --version` | Package version |
@@ -63,6 +64,20 @@ An error status means the message was definitely not delivered. Nothing is retri
 - `unconfirmed`: `no-receipt`, `bridge-lost`.
 
 For a claimed name, `name` is the claimed name and `generation` its current holder's. When the holder is a different session than at this sender's previous send to that name, the send still goes through and the text says so.
+
+### Script sends
+
+`agent-peers send` makes one send attempt and never retries. That does not make processing at most once: a message whose outcome is `sent` or `uncertain` may already be in the recipient's context, so put an id in the body that lets the recipient recognize a repeat. `outcome` says what a script may do next:
+
+| `outcome` | Exit | Results | Meaning |
+| --- | --- | --- | --- |
+| `sent` | 0 | `accepted`, `queued`, `unconfirmed`, `held`, `delivered` | Written. `unconfirmed` is the normal success for a Claude recipient; `held` waits for its user's approval |
+| `retry` | 3 | `dropped` with `rate-limited` or `queue-full` | Definitely not delivered; a later attempt may succeed |
+| `unreachable` | 4 | `failed` with `not-found`, `not-running` or `inbox-unavailable`; `dropped` with `inbox-closed` | No running holder or inbox took it; nothing was delivered |
+| `uncertain` | 5 | `failed` with `write-timeout` or `write-failed` | The line may have arrived. Sending it again can duplicate it |
+| `rejected` | 1 | everything else, such as `too-large`, `denied`, `refused` or `dropped`/`not-a-reply-target` | Not delivered, and repeating it unchanged will not help |
+
+Invalid usage, including an empty body, exits 2 with `invalid-request`. A negative receipt that arrives after the window closes reaches nobody, because the temporary inbox is gone. Name resolution, pins and admission are those of `send_peer`: a Hermes holder admits the script because the line carries the name it holds (`agent_peers.to_name`), and a Hermes conversation's inbox found by address drops it with `not-a-reply-target`.
 
 ### Claim and release results
 
