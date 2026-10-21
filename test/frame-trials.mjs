@@ -2,7 +2,8 @@
 // Paid, out-of-CI framing experiment. Only a private app-server and this run's Claude-format
 // inbox participate. Model access inherits CODEX_HOME, as contract.mjs does; HOME, registries,
 // work and sockets are private. No credentials/config are copied or changed. Raw evidence stays
-// outside the checkout. Example: node test/frame-trials.mjs --variant A --runs 8
+// outside the checkout, under $AGENT_PEERS_TRIALS_DIR (default ~/.local/share/agent-peers/frame-trials).
+// Example: node test/frame-trials.mjs --variant A --runs 8
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -31,7 +32,8 @@ assert.ok(["control", "A", "B"].includes(variant));
 assert.ok(Number.isInteger(runs) && runs > 0 && runs <= 8);
 assert.ok(Number.isInteger(concurrency) && concurrency > 0 && concurrency <= 8);
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-const evidenceRoot = "/home/thomasmarcelis/workspace/research-artifacts/compact-peer-frame";
+const evidenceRoot = resolve(process.env.AGENT_PEERS_TRIALS_DIR ?? join(homedir(), ".local", "share", "agent-peers", "frame-trials"));
+assert.ok(!evidenceRoot.startsWith(root + sep), "the evidence root must be outside the checkout");
 const output = resolve(arg("output", join(evidenceRoot, `${stamp}-${variant}-${model}`)));
 assert.ok(output.startsWith(evidenceRoot + sep), "raw logs must stay under the external evidence directory");
 assert.ok(!existsSync(output), "use a new output directory; never overwrite a run");
