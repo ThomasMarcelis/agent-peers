@@ -6,7 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { app, bind, claimantOf, inboxFor, ownsRegistry, ownsSocket, roots, serverInfo } from "./codex-binding.mjs";
 import { outboxOf, pinsOf } from "./codex-inbox.mjs";
-import { codexDiscovery, formatCodexPeer, formatExited, formatNames, nativeRouteError } from "./discovery.mjs";
+import { codexDiscovery, formatCodexPeer, formatExited, formatNames, modelListing, nativeRouteError } from "./discovery.mjs";
 import { coordinationGuidance } from "./guidance.mjs";
 import { peerInstructions } from "./frame.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
@@ -132,7 +132,7 @@ mcp.registerTool(
   "list_peers",
   {
     description: "List local Claude Code and Codex peers, including your native Codex agents, with reachability and exact messaging targets.",
-    inputSchema: { all_names: z.boolean().optional().describe("Show reservations whose holder is not running in text; JSON always includes every name.") },
+    inputSchema: { all_names: z.boolean().optional().describe("Include names whose holder is not running; default returns running names and namesNotRunning count.") },
     annotations: { readOnlyHint: true },
   },
   async (args, extra) => {
@@ -148,8 +148,10 @@ mcp.registerTool(
     if (caller) pinsOf(caller.subagent ? roots.get(caller.rootId) : caller, caller.rootId).noteRows(result.peers);
     log("tool.call", { ...trace, outcome: note || result.degraded ? "degraded" : "succeeded", count: result.peers.length,
       durationMs: performance.now() - started });
-    return { content: [{ type: "text", text: result.text + note }], structuredContent: {
-      peers: result.peers, self: result.self, names: result.names, recentlyExited: result.recentlyExited } };
+    return { content: [{ type: "text", text: result.text + note }], structuredContent: modelListing({
+      peers: result.peers, self: result.self, names: result.names, recentlyExited: result.recentlyExited,
+      ...(result.degraded || note ? { note: "Native discovery incomplete; check list_agents." } : {}),
+    }, { allNames: args.all_names }) };
   },
 );
 

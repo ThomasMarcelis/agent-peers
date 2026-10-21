@@ -5,7 +5,10 @@
     "input": {
       "type": "object",
       "properties": {
-        "all_names": { "type": "boolean", "description": "Show reservations whose holder is not running in text; JSON always includes every name." }
+        "all_names": {
+          "type": "boolean",
+          "description": "Include names whose holder is not running; default returns running names and namesNotRunning count."
+        }
       }
     }
   },

@@ -107,6 +107,33 @@ test("turn status reads request only the latest two turns with no items", async 
   assert.deepEqual(f.calls.at(-1).params, { threadId: "root", limit: 2, sortDirection: "desc", itemsView: "notLoaded" });
 });
 
+test("a slow background turn read survives the former one-second limit", async (t) => {
+  const f = await fixture(t, (ws, message) => {
+    if (message.method === "initialize") reply(ws, message, {});
+    else if (message.method === "thread/turns/list") setTimeout(() => reply(ws, message, { data: [] }), 1100);
+  });
+  const started = performance.now();
+  assert.deepEqual(await f.app.latestTurns("root"), []);
+  assert.ok(performance.now() - started >= 1000);
+});
+
+test("background read logging keeps failures and delivery RPCs, omitting successful polling noise", async (t) => {
+  const logs = [];
+  let reads = 0;
+  const f = await fixture(t, (ws, message) => {
+    if (message.method === "thread/turns/list" && ++reads === 2) {
+      ws.send(JSON.stringify({ id: message.id, error: { code: -32603, message: "SECRET_ERROR" } }));
+    } else if (message.id) reply(ws, message, message.method === "thread/turns/list" ? { data: [] } : {});
+  }, undefined, { quietReads: true, log: (_component, event, fields) => { if (event === "rpc.request") logs.push(fields); } });
+  await f.app.latestTurns("root");
+  await f.app.request("thread/read", { threadId: "root" });
+  await f.app.request("thread/loaded/list", {});
+  await f.app.request("turn/start", { threadId: "root" });
+  await assert.rejects(f.app.latestTurns("root"), /SECRET_ERROR/);
+  assert.deepEqual(logs.map((e) => [e.method, e.outcome]), [["turn/start", "started"], ["turn/start", "succeeded"], ["thread/turns/list", "failed"]]);
+  assert.doesNotMatch(JSON.stringify(logs), /SECRET/);
+});
+
 test("a JSON-RPC request from the server reaches the notification callback and cannot settle a pending call", async (t) => {
   const seen = [];
   let request;

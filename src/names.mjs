@@ -147,7 +147,7 @@ function codexServerGone(h) {
   try { entry = readPeerRecord(join(resolve(peersHome()), `codex-${h.threadId}.json`)); }
   catch (error) { return error.code === "ENOENT"; }
   const start = entry.procStart === undefined ? undefined : String(entry.procStart);
-  return entry.pid !== h.pid || start !== h.procStart;
+  return entry.pid !== h.pid || start !== h.procStart || (Number.isSafeInteger(entry.inboxClosedAt) && entry.inboxClosedAt > 0);
 }
 
 // The opencode bridge's record is the only evidence that the bridge still serves the root. A

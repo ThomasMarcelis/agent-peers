@@ -13,6 +13,15 @@ test("error classes use only runtime variants and HTTP codes, including upstream
   for (const info of ["SECRET_MESSAGE", { message: "Selected model is at capacity" }, { SECRET_KEY: {} }]) assert.equal(errorClass(info), undefined);
 });
 
+test("active waiting flags are allowlisted, retained and cleared by subsequent status", () => {
+  let data = observeStatus({}, { type: "active", activeFlags: ["waitingOnUserInput", "waitingOnApproval", "SECRET", "waitingOnUserInput"] }, "thread/read", 1000);
+  assert.deepEqual(data.activeFlags, ["waitingOnUserInput", "waitingOnApproval"]);
+  assert.deepEqual(statusFields(data).activeFlags, data.activeFlags);
+  data = observeStatus(data, { type: "idle" }, "thread/status/changed", 2000);
+  assert.equal(data.activeFlags, undefined);
+  assert.equal(statusFields(data).activeFlags, undefined);
+});
+
 test("status and activity have separate evidence; a completed/failed turn does not imply idle", () => {
   let data = observeStatus({}, { type: "active" }, "thread/status/changed", 1000);
   data = observeTurn(data, turn("failed", { error: { message: "SECRET_PROMPT", codexErrorInfo: "serverOverloaded" }, items: ["SECRET_ITEM"] }), "turn/completed", 2000);
@@ -95,4 +104,41 @@ test("a delayed read cannot overwrite a newer runtime notification", async (t) =
   resolveRead({ status: { type: "idle" } });
   await pending;
   assert.equal(data.status, "active");
+});
+
+test("a turn-summary failure records uncertainty with its source and later recovery clears it", async (t) => {
+  let data, failed = false;
+  const app = { loadedThreads: async () => ["root"], readThread: async () => ({ status: { type: "idle" } }),
+    latestTurns: async () => { if (failed) throw new Error("SECRET_FAILURE"); return [turn("completed")]; } };
+  const monitor = new CodexStatus(app, (_id, value) => { data = value; });
+  t.after(() => monitor.close());
+  monitor.watch("root", { status: { type: "idle" } });
+  await delay();
+  failed = true;
+  await monitor.refresh();
+  assert.deepEqual(data.turnOutcome, { status: "unknown", source: "thread/turns/list", observedAt: data.turnOutcome.observedAt });
+  assert.ok(data.turnOutcome.observedAt);
+  assert.equal(data.lastTurn.status, "completed", "the previous observation remains identified as historical evidence");
+  assert.doesNotMatch(JSON.stringify(data), /SECRET/);
+  failed = false;
+  await monitor.refresh();
+  assert.equal(data.turnOutcome, undefined);
+});
+
+test("lost registry ownership stops polling, notifications and pending observation results", async (t) => {
+  let owned = true, resolveTurns, writes = 0, reads = 0;
+  const app = { loadedThreads: async () => { reads++; return ["root"]; },
+    latestTurns: () => new Promise((resolve) => { resolveTurns = resolve; }),
+    readThread: async () => { reads++; return { status: { type: "idle" } }; } };
+  const monitor = new CodexStatus(app, () => { writes++; }, { owns: () => owned });
+  t.after(() => monitor.close());
+  monitor.watch("root", { status: { type: "idle" } });
+  assert.equal(writes, 1);
+  owned = false;
+  resolveTurns([turn("failed")]);
+  await delay();
+  monitor.notification({ method: "thread/status/changed", params: { threadId: "root", status: { type: "active" } } });
+  await monitor.refresh();
+  assert.equal(writes, 1);
+  assert.equal(reads, 0);
 });

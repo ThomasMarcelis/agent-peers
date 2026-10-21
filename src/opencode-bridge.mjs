@@ -20,7 +20,7 @@ import {
 } from "./names.mjs";
 import { Outbox, Pins, sendPeer } from "./outbox.mjs";
 import { SendFailure, isError, sendResult } from "./status.mjs";
-import { codexDiscovery, formatCodexPeer, formatExited, formatNames } from "./discovery.mjs";
+import { codexDiscovery, formatCodexPeer, formatExited, formatNames, modelListing } from "./discovery.mjs";
 import {
   allPeers, address, ensurePrivateDir, generation, inDiscoveryScope, peerSocket, peersHome,
   processStart, readPeerFile, readPeerRecord, recordRunning, recentlyExitedCodex, socketDir, validSessionId,
@@ -757,7 +757,7 @@ export class OpencodeBridge {
     if (name === "claim_name" || name === "release_name") {
       return { text: message, structuredContent: claimRefusal(publicReason, message), isError: true };
     }
-    return { text: message, structuredContent: { status: "failed", reason: publicReason, text: message, peers: [], self: null, names: [] }, isError: true };
+    return { text: message, structuredContent: modelListing({ status: "failed", reason: publicReason, text: message, self: null }), isError: true };
   }
 
   async #list({ session, root, subagent, name }, allNames = false) {
@@ -777,7 +777,7 @@ export class OpencodeBridge {
     lines.push(...formatNames(names, { allNames, sendPeer: true }), ...formatExited(recentlyExited));
     return {
       text: lines.join("\n"), isError: false,
-      structuredContent: { peers, self, names, recentlyExited },
+      structuredContent: modelListing({ peers, self, names, recentlyExited }, { allNames }),
     };
   }
 

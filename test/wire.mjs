@@ -112,6 +112,9 @@ test("registry status is additive; recent exits are bounded, confirmed and separ
   writeFileSync(path, JSON.stringify({ ...base, ...status }));
   assert.equal(codexPeers()[0].lastTurn.errorClass, "server_overloaded");
   assert.deepEqual(recentlyExitedCodex(now), [], "a running process is never classified as exited");
+  writeFileSync(path, JSON.stringify({ ...base, ...status, inboxClosedAt: now }));
+  assert.deepEqual(codexPeers(), [], "a retained closed inbox cannot reappear, even with no process-start evidence");
+  assert.deepEqual(recentlyExitedCodex(now), [], "inbox closure alone does not prove process exit");
   writeFileSync(path, JSON.stringify({ ...base, ...status, procStart: "different-process" }));
   assert.deepEqual(codexPeers(), []);
   const [exited] = recentlyExitedCodex(now);

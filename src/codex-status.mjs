@@ -1,6 +1,8 @@
 // Runtime observations only. No item, prompt, message or free-form error text crosses this boundary.
 // Protocol: Codex 0.163.0 generated ThreadStatus, Turn and CodexErrorInfo schemas.
 export const RECENT_EXIT_MS = 60 * 60_000;
+export const RECONCILE_MS = 15_000;
+const ACTIVE_FLAGS = new Set(["waitingOnApproval", "waitingOnUserInput"]);
 const STATUSES = new Set(["active", "idle", "notLoaded", "systemError", "unknown"]);
 const SOURCES = new Set(["thread/read", "thread/status/changed", "thread/loaded/list", "app-server-unavailable"]);
 const TURN_SOURCES = new Set(["thread/turns/list", "turn/started", "turn/completed"]);
@@ -31,6 +33,7 @@ export function statusFields(p) {
   const out = {};
   if (STATUSES.has(p?.status) && time(p.statusObservedAt) && SOURCES.has(p.statusSource)) {
     Object.assign(out, { status: p.status, statusObservedAt: p.statusObservedAt, statusSource: p.statusSource });
+    if (p.status === "active" && Array.isArray(p.activeFlags)) out.activeFlags = [...new Set(p.activeFlags.filter((flag) => ACTIVE_FLAGS.has(flag)))];
   }
   const a = p?.lastActivity;
   if (a && turnId(a.turnId) && time(a.at) && time(a.observedAt) && TURN_SOURCES.has(a.source) &&
@@ -47,12 +50,32 @@ export function statusFields(p) {
       out.lastTurn.errorClass = t.errorClass;
     }
   }
+  if (p?.turnOutcome?.status === "unknown" && p.turnOutcome.source === "thread/turns/list" && time(p.turnOutcome.observedAt)) {
+    out.turnOutcome = { status: "unknown", source: "thread/turns/list", observedAt: p.turnOutcome.observedAt };
+  }
   return out;
 }
 
 export function observeStatus(data, status, source, now) {
   if (!STATUSES.has(status?.type) || !SOURCES.has(source)) return data;
-  return { ...data, status: status.type, statusObservedAt: now, statusSource: source };
+  const { activeFlags, ...rest } = data;
+  return { ...rest, status: status.type, statusObservedAt: now, statusSource: source,
+    ...(status.type === "active" && Array.isArray(status.activeFlags)
+      ? { activeFlags: [...new Set(status.activeFlags.filter((flag) => ACTIVE_FLAGS.has(flag)))] } : {}) };
+}
+
+// Status and turn history are independent evidence. A live read can refresh the former
+// while retaining the sidecar's terminal outcome and activity timestamps.
+export function newerStatusFields(a, b) {
+  const left = statusFields(a), right = statusFields(b);
+  const latest = (right.statusObservedAt ?? 0) >= (left.statusObservedAt ?? 0) ? right : left;
+  const { status, statusObservedAt, statusSource, activeFlags, ...history } = { ...left, ...right };
+  const out = { ...history };
+  if (latest.statusObservedAt) Object.assign(out, { status: latest.status, statusObservedAt: latest.statusObservedAt, statusSource: latest.statusSource,
+    ...(latest.activeFlags ? { activeFlags: latest.activeFlags } : {}) });
+  if (left.lastActivity && (left.lastActivity.at > (right.lastActivity?.at ?? 0))) out.lastActivity = left.lastActivity;
+  if (left.lastTurn && (left.lastTurn.observedAt > (right.lastTurn?.observedAt ?? 0))) out.lastTurn = left.lastTurn;
+  return out;
 }
 
 export function observeTurn(data, turn, source, now) {
@@ -82,9 +105,9 @@ export function observeTurn(data, turn, source, now) {
 // Poll summaries because observer clients receive status changes but may not receive turn
 // notifications. Reads run in the background, with at most one pair in flight per bound root.
 export class CodexStatus {
-  #app; #changed; #entries = new Map(); #timer; #polling = false;
-  constructor(app, changed, { intervalMs = 15_000 } = {}) {
-    this.#app = app; this.#changed = changed;
+  #app; #changed; #entries = new Map(); #timer; #polling = false; #owns;
+  constructor(app, changed, { intervalMs = RECONCILE_MS, owns = () => true } = {}) {
+    this.#app = app; this.#changed = changed; this.#owns = owns;
     this.#timer = setInterval(() => { void this.refresh(); }, intervalMs).unref();
   }
   watch(id, thread) {
@@ -95,8 +118,14 @@ export class CodexStatus {
   }
   forget(id) { this.#entries.delete(id); }
   close() { clearInterval(this.#timer); this.#entries.clear(); }
+  #current(id, entry) {
+    if (this.#entries.get(id) !== entry) return false;
+    if (this.#owns(id)) return true;
+    this.forget(id);
+    return false;
+  }
   #emit(id, entry, data) {
-    if (this.#entries.get(id) !== entry) return;
+    if (!this.#current(id, entry)) return;
     entry.data = data;
     this.#changed(id, data);
   }
@@ -109,7 +138,7 @@ export class CodexStatus {
   notification(message) {
     if (Object.hasOwn(message, "id")) return;
     const p = message.params, entry = this.#entries.get(p?.threadId);
-    if (!entry) return;
+    if (!entry || !this.#current(p.threadId, entry)) return;
     if (message.method === "thread/status/changed") {
       entry.revision++;
       this.#emit(p.threadId, entry, observeStatus(entry.data, p.status, message.method, Date.now()));
@@ -121,6 +150,7 @@ export class CodexStatus {
     // An error notification (including willRetry:false) alone is not a terminal turn outcome.
   }
   async #turns(id, entry) {
+    if (!this.#current(id, entry)) return;
     if (entry.busy) { entry.again = true; return; }
     entry.busy = true;
     try {
@@ -128,24 +158,30 @@ export class CodexStatus {
       const turns = await this.#app.latestTurns(id);
       if (revision !== entry.turnRevision) return;
       // Descending order: record the previous terminal outcome before a new active turn.
-      let data = entry.data;
+      const { turnOutcome, ...known } = entry.data;
+      let data = turnOutcome ? known : entry.data;
       const terminal = turns.find((t) => OUTCOMES.has(t.status));
       if (terminal) data = observeTurn(data, terminal, "thread/turns/list", Date.now());
       if (turns[0]?.status === "inProgress") data = observeTurn(data, turns[0], "thread/turns/list", Date.now());
       if (data !== entry.data) this.#emit(id, entry, data);
-    } catch { /* Older/unavailable servers prove no turn outcome. Delivery never waits here. */ }
+    } catch {
+      this.#emit(id, entry, { ...entry.data, turnOutcome: { status: "unknown", source: "thread/turns/list", observedAt: Date.now() } });
+    }
     finally {
       entry.busy = false;
-      if (entry.again && this.#entries.get(id) === entry) { entry.again = false; void this.#turns(id, entry); }
+      if (entry.again && this.#current(id, entry)) { entry.again = false; void this.#turns(id, entry); }
     }
   }
   async refresh() {
     if (this.#polling || !this.#entries.size) return;
+    for (const [id, entry] of this.#entries) this.#current(id, entry);
+    if (!this.#entries.size) return;
     this.#polling = true;
     try {
       const revisions = new Map([...this.#entries].map(([id, entry]) => [id, entry.revision]));
       const loaded = new Set(await this.#app.loadedThreads(1000));
       await Promise.allSettled([...this.#entries].map(async ([id, entry]) => {
+        if (!this.#current(id, entry)) return;
         const revision = revisions.get(id);
         if (!loaded.has(id)) {
           if (revision === entry.revision) this.#emit(id, entry, observeStatus(entry.data, { type: "notLoaded" }, "thread/loaded/list", Date.now()));

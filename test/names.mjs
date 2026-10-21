@@ -431,6 +431,11 @@ test("a Codex holder whose thread's registry file is gone or names another proce
   assert.equal(claimRows()[0].running, false, "another process serves the thread now");
   serve({});
   assert.equal(claimRows()[0].running, true);
+  serve({ inboxClosedAt: Date.now() });
+  assert.equal(claimRows()[0].running, false, "a retained closed inbox no longer serves its thread");
+  assert.throws(() => resolveClaim("codex:proj/lead"), (error) => error.reason === "not-running");
+  serve({});
+  assert.equal(claimRows()[0].running, true, "an open registry retains the original ownership rules");
   rmSync(registry);
   assert.throws(() => resolveClaim("codex:proj/lead"), (error) => error.reason === "not-running");
   const took = claim("codex:proj/lead", codex("T2"));

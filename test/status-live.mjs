@@ -2,7 +2,8 @@
 // Responses fixture. No credentials, external services, installed MCPs or live peers are used.
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { once } from "node:events";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,6 +57,7 @@ try {
   await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
   const env = { ...process.env, CODEX_HOME: join(dir, "codex"), XDG_RUNTIME_DIR: join(dir, "runtime"),
     AGENT_PEERS_HOME: peers, CLAUDE_CONFIG_DIR: join(dir, "claude"), AGENT_PEERS_DEBUG: "0", AGENT_PEERS_LOG: "" };
+  for (const key of Object.keys(env)) if (/API_KEY|TOKEN/i.test(key)) delete env[key];
   const overrides = [
     'model="status-test"', 'model_provider="local"',
     `model_providers.local={name="Local contract",base_url="http://127.0.0.1:${provider.address().port}/v1",wire_api="responses",requires_openai_auth=false,request_max_retries=0,stream_max_retries=0}`,
@@ -93,6 +95,53 @@ try {
   const listing = JSON.parse(execFileSync(process.execPath, [join(root, "bin", "agent-peers.mjs"), "list", "--json", "--no-probe"], { env, encoding: "utf8" }));
   assert.equal(listing.peers.find((p) => p.threadId === thread.id).lastTurn.errorClass, "http_409");
   console.log("CLI JSON: registry observation visible; no model service called");
+
+  // Benchmark the real runtime's persisted-history reader in this throwaway home only.
+  // Populate its history DB from its own turn/item templates, then restart to avoid caches.
+  app.close();
+  const stopped = once(child, "close");
+  process.kill(-child.pid, "SIGKILL");
+  await stopped;
+  const sqlite = process.getBuiltinModule?.("node:sqlite");
+  assert.ok(sqlite?.DatabaseSync, "large-history check requires Node's node:sqlite support");
+  const { DatabaseSync } = sqlite;
+  const database = join(dir, "codex", "thread_history_1.sqlite"), history = new DatabaseSync(database);
+  const sample = history.prepare("SELECT * FROM thread_turns WHERE thread_id = ? AND status = 'completed' LIMIT 1").get(thread.id);
+  assert.ok(sample, "runtime-generated completed-turn template");
+  const items = history.prepare("SELECT * FROM thread_items WHERE thread_id = ? AND turn_id = ?").all(thread.id, sample.turn_id);
+  assert.ok(items.length > 0);
+  const insert = (table, row) => {
+    const columns = Object.keys(row);
+    return history.prepare(`INSERT INTO ${table} (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`);
+  };
+  const putTurn = insert("thread_turns", sample), putItem = insert("thread_items", items[0]);
+  let ordinal = Number(history.prepare("SELECT MAX(rollout_ordinal) AS n FROM thread_items").get().n) + 100;
+  const count = 10_000;
+  history.exec("BEGIN");
+  for (let i = 0; i < count; i++) {
+    const id = `10000000-0000-7000-8000-${String(i).padStart(12, "0")}`;
+    const row = { ...sample, turn_id: id, root_turn_id: id, rollout_ordinal: ordinal++,
+      started_at: Math.floor(Date.now() / 1000) + i, completed_at: Math.floor(Date.now() / 1000) + i };
+    putTurn.run(...Object.values(row));
+    for (const item of items) putItem.run(...Object.values({ ...item, turn_id: id, rollout_ordinal: ordinal++ }));
+  }
+  history.exec("COMMIT");
+  assert.equal(Number(history.prepare("SELECT COUNT(*) AS n FROM thread_turns WHERE thread_id = ?").get(thread.id).n), count + 2);
+  history.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  history.close();
+  rmSync(socket, { force: true });
+  currentThread = undefined;
+  child = spawn("codex", [...overrides.flatMap((o) => ["-c", o]), "app-server", "--listen", `unix://${socket}`],
+    { env, cwd: dir, stdio: ["ignore", "ignore", "pipe"], detached: true });
+  child.stderr.resume();
+  await until("benchmark socket", () => existsSync(socket));
+  app = new AppServer();
+  await app.loadedThreads();
+  const began = performance.now(), summaries = await app.latestTurns(thread.id), elapsed = performance.now() - began;
+  assert.equal(summaries.length, 2);
+  assert.equal(summaries[0].id, `10000000-0000-7000-8000-${String(count - 1).padStart(12, "0")}`);
+  assert.ok(summaries.every((t) => t.items.length === 0), "large history never returns item contents");
+  console.log(`large history: ${count} synthetic turns, ${count * items.length} synthetic items, ${statSync(database).size} history DB bytes; cold thread/turns/list ${elapsed.toFixed(1)} ms; two item-free summaries`);
 } finally {
   app?.close();
   if (child?.pid) { try { process.kill(-child.pid, "SIGKILL"); } catch {} }

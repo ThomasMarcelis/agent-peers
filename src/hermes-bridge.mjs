@@ -4,7 +4,8 @@
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { AppServer } from "./app-server.mjs";
-import { observeStatus, statusFields } from "./codex-status.mjs";
+import { newerStatusFields, observeStatus } from "./codex-status.mjs";
+import { modelListing } from "./discovery.mjs";
 import { Admission, Receipts, checkSocketPath, closeInbox, listenInbox, readMessage } from "./inbox.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
 import { SCOPE, claim, claimAt, claimRefusal, claimRows, claimsOf, heldBy, holds, parseName, release, withClaims } from "./names.mjs";
@@ -136,9 +137,10 @@ export class HermesBridge {
     // A listing pins only the conversation that asked for it. It waits for that conversation's
     // other requests only when it has names to take back (#touch).
     if (method === "list_peers") {
+      if (params.all_names !== undefined && typeof params.all_names !== "boolean") throw new Error("all_names must be a boolean");
       const session = params.session === undefined ? undefined : requiredString(params.session, "session", 512);
       if (session && this.#untouched(session, params)) await this.#serialized(session, () => this.#touch(session, params));
-      return this.#listPeers(session);
+      return this.#listPeers(session, params.all_names);
     }
     if (!["send_peer", "claim_name", "release_name", "close_session"].includes(method)) throw new Error(`unknown method: ${method}`);
     const session = requiredString(params.session, "session", 512);
@@ -275,7 +277,7 @@ export class HermesBridge {
     }
   }
 
-  async #listPeers(session) {
+  async #listPeers(session, allNames = false) {
     // opencode rows are normal registry peers with an inbox, so a Hermes conversation reaches
     // them with send_peer like Claude and Codex. Hermes conversations themselves stay unlisted.
     const peers = allPeers().filter((p) => p.kind === "claude" || p.kind === "codex" || p.kind === "opencode");
@@ -288,7 +290,7 @@ export class HermesBridge {
         const ids = new Set(await this.#app.loadedThreads());
         if (expired) return;
         const results = await Promise.allSettled(peers.filter((p) => p.kind === "codex" && ids.has(p.threadId))
-          .map(async (p) => ({ id: p.threadId, thread: await this.#app.readThread(p.threadId) })));
+          .map(async (p) => ({ id: p.threadId, thread: { ...await this.#app.readThread(p.threadId), statusObservedAt: Date.now() } })));
         if (expired) return;
         for (const r of results) if (r.status === "fulfilled") live.set(r.value.id, r.value.thread);
         if (results.some((r) => r.status === "rejected")) note = "Some live Codex statuses are unavailable.";
@@ -307,17 +309,16 @@ export class HermesBridge {
     if (session) this.#conversation(session).pins.noteRows(peers);
     // Claimed names are the one way Hermes conversations appear here, with every other claim.
     const { rows, names } = inDiscoveryScope(() => ({ rows: withClaims(peers), names: claimRows() }));
-    return {
+    return modelListing({
       peers: rows.map((p) => ({
         name: p.name, kind: p.kind, cwd: p.cwd ?? null,
         status: live.get(p.threadId)?.status?.type ?? p.status ?? null, address: p.address, generation: p.generation, claims: p.claims,
-        ...statusFields(p),
-        ...(!p.statusObservedAt && live.has(p.threadId)
-          ? observeStatus({}, live.get(p.threadId).status, "thread/read", Date.now()) : {}),
+        ...newerStatusFields(p, live.has(p.threadId)
+          ? observeStatus({}, live.get(p.threadId).status, "thread/read", live.get(p.threadId).statusObservedAt) : {}),
       })),
       names, recentlyExited: recentlyExitedCodex(),
       ...(note ? { note } : {}),
-    };
+    }, { allNames });
   }
 
   async #bind(session, name, directory) {

@@ -75,7 +75,7 @@ test("CLI keeps recent exited status-aware sidecars separate from peers and rout
     assert.equal(listed.recentlyExited[0].address, undefined);
     const text = run(["list"], env).stdout;
     assert.match(text, /Recently exited Codex sidecars/);
-    assert.match(text, /codex:exited  exit observed .*last turn failed .*\(server_overloaded\)/);
+    assert.match(text, /codex:exited  last seen .* ago · last turn failed .* ago \(server_overloaded\)/);
     assert.equal(JSON.parse(run(["resolve", "codex:exited", "--json"], env).stdout).reason, "not-running");
   } finally { rmSync(home, { recursive: true, force: true }); }
 });

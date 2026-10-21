@@ -386,7 +386,10 @@ def test_a_claimed_conversation_is_listed_reached_by_name_and_restored_on_its_ne
         # The bridge restarts: its inboxes go. The conversation's next call takes its name back.
         peers._bridge.close()
         peers._bridge = None
-        assert [row["running"] for row in peers.list_peers({})["names"]] == [False]
+        stopped = peers.list_peers({})
+        assert stopped["names"] == []
+        assert stopped["namesNotRunning"] == 1
+        assert [row["running"] for row in peers.list_peers({"all_names": True})["names"]] == [False]
         assert [row["running"] for row in peers.list_peers({}, session_id="chat-a")["names"]] == [True]
         # Once the route closes, another conversation takes over the name from the stopped holder.
         context.routes.pop("chat-a")

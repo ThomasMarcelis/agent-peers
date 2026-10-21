@@ -19,6 +19,7 @@ import { peerInstructions } from "../src/frame.mjs";
 import { logEvent } from "../src/logging.mjs";
 import { sendResult } from "../src/status.mjs";
 import { VERSION } from "../src/version.mjs";
+import { modelListing } from "../src/discovery.mjs";
 
 const PACKAGE = dirname(dirname(fileURLToPath(import.meta.url)));
 const HANDLE_KEY = Symbol.for("agent-peers.opencode.bridge.v1");
@@ -491,7 +492,7 @@ function resultOf(text, structuredContent, isError) {
 function failure(name, reason, text) {
   if (name === "send_peer") return resultOf(text, sendResult({ reason }), true);
   if (name === "claim_name" || name === "release_name") return resultOf(text, claimRefusal(reason, text), true);
-  return resultOf(text, { status: "failed", reason, text, peers: [], self: null, names: [] }, true);
+  return resultOf(text, modelListing({ status: "failed", reason, text, self: null }), true);
 }
 
 async function executeTool(instance, name, args, tool) {

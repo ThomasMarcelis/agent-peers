@@ -1,6 +1,6 @@
 // Discovery describes routes from the caller's point of view. A Codex thread UUID alone
 // does not make it a native send_message target: it must belong to the caller's agent tree.
-import { observeStatus, observeTurn, statusFields } from "./codex-status.mjs";
+import { RECONCILE_MS, newerStatusFields, observeStatus, observeTurn, statusFields } from "./codex-status.mjs";
 
 function threadEvidence(t) {
   if (!t) return {};
@@ -29,7 +29,7 @@ export function codexDiscovery(peers, threads, self) {
     const sameTree = self && (p.threadId === self.rootId || t?.sessionId === self.rootId);
     rows.set(p.threadId || p.address, {
       name: p.name, kind: p.kind, cwd: p.cwd, status: p.status ?? t?.status?.type,
-      ...threadEvidence(t), ...statusFields(p),
+      ...newerStatusFields(p, threadEvidence(t)),
       threadId: p.threadId, generation: p.generation ?? null, claims: p.claims ?? [],
       native: { reachable: !self || sameTree ? null : false, reason: !self ? "caller session unknown"
         : sameTree ? "native target unavailable; check list_agents"
@@ -51,7 +51,7 @@ export function codexDiscovery(peers, threads, self) {
     rows.set(t.id, {
       name: old?.name ?? `codex:${t.agentNickname || target}`,
       kind: "codex", cwd: t.cwd, status: t.status?.type, threadId: t.id, generation: old?.generation ?? null, claims: old?.claims ?? [],
-      ...statusFields(old), ...threadEvidence(t),
+      ...newerStatusFields(old, threadEvidence(t)),
       native: { reachable: true, tool: "send_message", target },
       // Inbox addresses belong to roots; do not present the root's inbox as a way to
       // deliver directly to one of its subagents.
@@ -130,17 +130,28 @@ export function formatName(row, { sendPeer = false } = {}) {
 
 const age = (at, now) => {
   const seconds = Math.max(0, Math.floor((now - at) / 1000));
-  return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h`;
+  return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m`
+    : seconds < 86400 ? `${Math.floor(seconds / 3600)}h` : `${Math.floor(seconds / 86400)}d`;
 };
-const clock = (at) => new Date(at).toISOString().slice(11, 16) + "Z";
-const outcomeText = (turn) => turn ? `last turn ${turn.status} ${turn.completedAt ? clock(turn.completedAt) : `observed ${clock(turn.observedAt)}`}` +
-  (turn.errorClass ? ` (${turn.errorClass})` : "") : "";
+const outcomeText = (turn, now) => {
+  if (!turn) return "";
+  const at = turn.completedAt ?? turn.observedAt;
+  return `last turn ${turn.status} ${turn.completedAt ? "" : "observed "}${age(at, now)} ago` +
+    (now - at >= 86400_000 ? ` (${new Date(at).toISOString().slice(0, 10)})` : "") +
+    (turn.errorClass ? ` (${turn.errorClass})` : "");
+};
 
 export function formatPeerStatus(p, now = Date.now()) {
   const fields = statusFields(p);
   if (!fields.statusObservedAt) return p.status ?? "";
-  const label = { active: "busy", notLoaded: "not loaded", systemError: "system error" }[fields.status] ?? fields.status;
-  return [`${label} · seen ${age(fields.statusObservedAt, now)} ago`, outcomeText(fields.lastTurn)].filter(Boolean).join(" · ");
+  const waiting = fields.activeFlags?.map((flag) => flag === "waitingOnUserInput" ? "waiting on input" : "waiting on approval").join(" + ");
+  const label = waiting || ({ active: "busy", notLoaded: "not loaded", systemError: "system error" }[fields.status] ?? fields.status);
+  const activity = fields.lastActivity;
+  const duration = !waiting && activity && ((fields.status === "active" && activity.event === "started") ||
+    (["idle", "systemError"].includes(fields.status) && activity.event === "completed")) ? ` ${activity.timeSource === "observed" ? "≥" : ""}${age(activity.at, now)}` : "";
+  const stale = now - fields.statusObservedAt > 2 * RECONCILE_MS ? ` (seen ${age(fields.statusObservedAt, now)} ago)` : "";
+  return [`${label}${duration}${stale}`, outcomeText(fields.lastTurn, now),
+    fields.turnOutcome ? "turn outcome unknown (thread/turns/list)" : ""].filter(Boolean).join(" · ");
 }
 
 export function formatNames(names, { allNames = false, sendPeer = false } = {}) {
@@ -151,8 +162,27 @@ export function formatNames(names, { allNames = false, sendPeer = false } = {}) 
     ...(hidden ? [`  +${hidden} reserved names not running`] : [])];
 }
 
-export function formatExited(rows) {
+export function formatExited(rows, now = Date.now()) {
   if (!rows.length) return [];
   return ["Recently exited Codex sidecars (last seen within 60m):", ...rows.map((p) =>
-    `  ${p.name}  exit observed ${clock(p.exitObservedAt)}${p.lastTurn ? ` · ${outcomeText(p.lastTurn)}` : ""}`)];
+    `  ${p.name}  last seen ${age(p.lastSeenAt, now)} ago${p.lastTurn ? ` · ${outcomeText(p.lastTurn, now)}` : ""}`)];
+}
+
+// Model-facing projection only. Registry and CLI JSON retain complete evidence. A shared now
+// gives every timestamp the same reference without repeating an age field beside each one.
+function modelPeer(p) {
+  const { statusSource, lastActivity, lastTurn, turnOutcome, ...row } = p;
+  if (lastActivity) Object.assign(row, { activityAt: lastActivity.at, activityEvent: lastActivity.event });
+  if (lastActivity?.timeSource === "observed") row.activityTimeSource = "observed";
+  if (lastTurn) row.lastTurn = { status: lastTurn.status,
+    ...(lastTurn.completedAt ? { completedAt: lastTurn.completedAt } : { observedAt: lastTurn.observedAt }),
+    ...(lastTurn.errorClass ? { errorClass: lastTurn.errorClass } : {}) };
+  if (turnOutcome) row.turnOutcome = { status: "unknown", source: turnOutcome.source };
+  return row;
+}
+
+export function modelListing({ peers = [], self, names = [], recentlyExited = [], ...rest }, { allNames = false, now = Date.now() } = {}) {
+  return { ...rest, now, peers: peers.map(modelPeer), ...(self !== undefined ? { self } : {}),
+    names: allNames ? names : names.filter((row) => row.running), namesNotRunning: names.filter((row) => !row.running).length,
+    recentlyExited: recentlyExited.map(({ exitObservedAt, exitBasis, inboxClosedAt, ...row }) => modelPeer(row)) };
 }

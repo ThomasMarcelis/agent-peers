@@ -165,6 +165,8 @@ class PeerTools:
                 route_id, _ = self._route_id(session_id)
                 params = {"session": route_id} if route_id else {}
         try:
+            if isinstance(args, dict) and "all_names" in args:
+                params["all_names"] = args["all_names"]
             result = self._client().call("list_peers", params)
             if opened:
                 self._retire_if_closed(*opened)
@@ -333,7 +335,8 @@ def register(ctx):
         schema={"name": "list_peers", "description": (
             "List local Claude Code and Codex sessions, their status and messaging targets, and claimed names. "
             "This conversation is listed only by names it claims. Call on demand when coordination is useful."
-        ), "parameters": {"type": "object", "properties": {}, "additionalProperties": False}},
+        ), "parameters": {"type": "object", "properties": {"all_names": {"type": "boolean",
+            "description": "Include non-running reservations; default returns running names and namesNotRunning count."}}, "additionalProperties": False}},
     )
     ctx.register_tool(
         name="send_peer", toolset="agent-peers", handler=send_peer,

@@ -323,7 +323,11 @@ function codexRecordScan() {
     } catch {}
   }
   const starts = processStarts(out.filter((p) => p.procStart !== undefined).map((p) => p.pid));
-  for (const p of out) p.running = running(p, starts);
+  for (const p of out) {
+    p.processRunning = running(p, starts);
+    // Graceful inbox closure is conclusive even if a reused PID's start token is unreadable.
+    p.running = p.processRunning && !(Number.isSafeInteger(p.inboxClosedAt) && p.inboxClosedAt > 0);
+  }
   if (discoveryScope) discoveryScope.codex = out;
   return out;
 }
@@ -339,7 +343,7 @@ export const codexPeers = () => inDiscoveryScope(() => codexRecordScan().filter(
 // have exited within that hour if its PID is now gone or reused. The exact exit time is unknown.
 // This separate view has no inbox routes and is never consulted by send/name resolution.
 export const recentlyExitedCodex = (now = Date.now()) => inDiscoveryScope(() => codexRecordScan().flatMap((p) => {
-  if (p.running || !Number.isSafeInteger(p.statusRecordedAt) || p.statusRecordedAt > now ||
+  if (p.processRunning || !Number.isSafeInteger(p.statusRecordedAt) || p.statusRecordedAt > now ||
       now - p.statusRecordedAt > RECENT_EXIT_MS || !statusFields(p).statusObservedAt) return [];
   return [{ name: p.name, kind: "codex", threadId: p.threadId, cwd: p.cwd,
     ...statusFields(p), lastSeenAt: p.statusRecordedAt, exitObservedAt: now, exitBasis: "pid-gone-or-reused",

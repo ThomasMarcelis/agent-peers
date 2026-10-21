@@ -22,7 +22,7 @@ const log = (event, fields = {}) => logEvent("codex-peer", event, fields);
 export const app = new AppServer((message) => statusObserver.notification(message), { onDisconnect: () => statusObserver.unavailable() });
 // Status reads have their own bounded connection: a failed/oversized metadata response cannot
 // close the connection carrying delivery RPCs or consume its pending-request allowance.
-const statusApp = new AppServer(undefined, { handshakeTimeoutMs: 1000, connectTimeoutMs: 1000,
+const statusApp = new AppServer(undefined, { handshakeTimeoutMs: 1000, connectTimeoutMs: 1000, quietReads: true,
   onDisconnect: () => statusObserver.unavailable() });
 
 const INBOXES_MAX = 16, ROOTS_MAX = 8, CONNECTION_MAX = 32;
@@ -39,10 +39,14 @@ const statusObserver = new CodexStatus(statusApp, (id, data) => {
   if (root.statusWrite) return;
   root.statusWrite = setImmediate(() => {
     root.statusWrite = undefined;
-    if (!isCurrent(root) || !ownsRegistry(root)) return;
+    if (!isCurrent(root)) return;
+    if (!ownsRegistry(root)) { statusObserver.forget(root.threadId); return; }
     try { publishRegistry(root); } catch { /* Status storage cannot stop inbox delivery. */ }
   });
-});
+}, { owns: (id) => {
+  const root = roots.get(id);
+  return root && ownsRegistry(root);
+} });
 let handler = () => {};
 export const onInboxLine = (fn) => { handler = fn; };
 
