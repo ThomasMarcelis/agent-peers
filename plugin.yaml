@@ -1,5 +1,5 @@
 name: agent-peers
-version: "1.0.0-rc.7"
+version: "1.0.0-rc.8"
 description: "Discover and message local Claude Code, Codex and opencode sessions with private conversation reply inboxes."
 manifest_version: 1
 license: MIT

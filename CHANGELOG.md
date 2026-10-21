@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-rc.8 — 2026-10-21
+
+Eighth release candidate for 1.0.0, for the npm `next` tag. Headless Codex workers now show their runtime status in `list` and `list_peers`. Peer frames are shorter. A new one-way `agent-peers send` lets scripts post notices. Model-facing `list_peers` results are leaner. Each change went through independent review rounds before release ([verification](docs/release-verification.md#100-rc8)).
 
 ### Added
 
 - **Experimental** Codex runtime observations in registry-backed listings: status and observation time, last activity, terminal turn outcome/time, and structured error classes including `http_409` and `server_overloaded`. Background, item-free app-server summaries cover headless workers and bound TUI roots without delaying inbox delivery. A separate `recentlyExited` array/section retains status-aware Codex sidecars last seen within 60 minutes and confirmed gone; exit detection time is explicit.
 - **Experimental** `agent-peers send <target> --stdin [--label <label>] [--json]`: one one-way notice from a script or detached job to a claimed name, peer name or address. Each call sends from its own temporary inbox beside the target's, open only for the receipt window and removed on exit or SIGINT/SIGTERM/SIGHUP, with `from-name` `script:<label>` and a footer saying replies to that address do nothing. The result adds `outcome` (`sent`, `retry`, `unreachable`, `uncertain`, `rejected`) and `reply: false`, with exit codes 0, 3, 4, 5 and 1 ([reference](docs/reference.md#script-sends)).
-- Paid, out-of-CI `test/frame-trials.mjs`: isolated Codex app-servers, Claude-format lead inboxes, busy/idle reply requests, brief-gated corrections and a false-approval injection. Prints builds and keeps raw evidence outside the repository.
+- Paid, out-of-CI `test/frame-trials.mjs`: isolated Codex app-servers, Claude-format lead inboxes, busy/idle reply requests, brief-gated corrections and a false-approval injection. Prints builds and keeps raw evidence outside the repository, under `AGENT_PEERS_TRIALS_DIR` (default `~/.local/share/agent-peers/frame-trials`).
 
 ### Changed
 
