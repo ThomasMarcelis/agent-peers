@@ -15,7 +15,6 @@ import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { claimRefusal } from "../src/names.mjs";
-import { peerInstructions } from "../src/frame.mjs";
 import { logEvent } from "../src/logging.mjs";
 import { sendResult } from "../src/status.mjs";
 import { VERSION } from "../src/version.mjs";
@@ -469,7 +468,7 @@ async function toolsOf(ctx, instance) {
     for (const definition of Object.values(DEFINITIONS)) {
       editor.add({
         name: definition.name,
-        description: definition.description + (definition.name === "send_peer" ? " " + peerInstructions : ""),
+        description: definition.description,
         input: definition.input,
         // Direct tools under their exact names, as the peer frame's send_peer(to=reply_to) assumes;
         // without this opencode 2.x offers plugin tools only inside CodeMode's `execute`.
