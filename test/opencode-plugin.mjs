@@ -318,7 +318,7 @@ test("a send aborted before the request is written is a definite failure, and no
     { sessionID: "ses_root", signal: controller.signal });
   assert.deepEqual(listing.metadata.structuredContent.recentlyExited, []);
   assert.equal(listing.metadata.structuredContent.namesNotRunning, 0);
-  assert.ok(listing.metadata.structuredContent.now);
+  assert.equal(Object.hasOwn(listing.metadata.structuredContent, "now"), false);
 });
 
 test("a send aborted after the request is written is unconfirmed/bridge-lost", async (t) => {

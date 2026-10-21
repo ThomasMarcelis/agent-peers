@@ -137,10 +137,11 @@ export class HermesBridge {
     // A listing pins only the conversation that asked for it. It waits for that conversation's
     // other requests only when it has names to take back (#touch).
     if (method === "list_peers") {
-      if (params.all_names !== undefined && typeof params.all_names !== "boolean") throw new Error("all_names must be a boolean");
+      const allNames = params.all_names === null || params.all_names === "" ? undefined : params.all_names;
+      if (allNames !== undefined && typeof allNames !== "boolean") throw new Error("all_names must be a boolean");
       const session = params.session === undefined ? undefined : requiredString(params.session, "session", 512);
       if (session && this.#untouched(session, params)) await this.#serialized(session, () => this.#touch(session, params));
-      return this.#listPeers(session, params.all_names);
+      return this.#listPeers(session, allNames);
     }
     if (!["send_peer", "claim_name", "release_name", "close_session"].includes(method)) throw new Error(`unknown method: ${method}`);
     const session = requiredString(params.session, "session", 512);

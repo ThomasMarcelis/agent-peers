@@ -10,7 +10,7 @@ for (const [label, runtimeStatus, outcome, info, expectedClass, flags] of [
   ["failed conflict", "systemError", "failed", { httpConnectionFailed: { httpStatusCode: 409 } }, "http_409"],
   ["failed capacity", "systemError", "failed", "serverOverloaded", "server_overloaded"],
   ["idle completed", "idle", "completed", null, undefined],
-  ["active", "active", "inProgress", null, undefined],
+  ["active", "active", "inProgress", null, undefined, []],
   ["waiting on input", "active", "inProgress", null, undefined, ["waitingOnUserInput"]],
   ["waiting on approval", "active", "inProgress", null, undefined, ["waitingOnApproval"]],
 ]) test(`bound worker registry and list_peers expose ${label} without item content`, async (t) => {
@@ -29,9 +29,14 @@ for (const [label, runtimeStatus, outcome, info, expectedClass, flags] of [
   const listed = await peer.call("list_peers", {}, other);
   const row = listed.structuredContent.peers.find((p) => p.threadId === thread);
   assert.equal(row.status, runtimeStatus);
-  assert.deepEqual(record.activeFlags, flags);
-  assert.deepEqual(row.activeFlags, flags);
-  if (flags) assert.ok(listed.content[0].text.includes(label));
+  assert.deepEqual(record.activeFlags, flags?.length ? flags : undefined);
+  assert.deepEqual(row.activeFlags, flags?.length ? flags : undefined);
+  if (flags?.length) assert.ok(listed.content[0].text.includes(label));
+  assert.equal(Object.hasOwn(listed.structuredContent, "now"), false);
+  assert.doesNotMatch(JSON.stringify(row), /At|Source|lastActivity|activityEvent/);
+  const statusLabel = flags?.length ? label : runtimeStatus === "active" ? "busy" : runtimeStatus === "systemError" ? "system error" : runtimeStatus;
+  assert.ok(row.statusText.startsWith(statusLabel));
+  if (outcome !== "inProgress") assert.ok(row.statusText.includes(`last turn ${outcome}`));
   assert.equal(row.lastTurn?.status, outcome === "inProgress" ? undefined : outcome);
   assert.doesNotMatch(JSON.stringify(record) + JSON.stringify(listed), /SECRET_/);
   assert.deepEqual(f.summaryCalls[0], { threadId: thread, limit: 2, sortDirection: "desc", itemsView: "notLoaded" });
@@ -94,5 +99,20 @@ test("MCP all_names expands text and structured names; default gives the inactiv
   assert.equal(expanded.structuredContent.names[0].name, "claude:proj/reserved");
   assert.equal(expanded.structuredContent.names[0].running, false);
   assert.equal(expanded.structuredContent.namesNotRunning, 1);
+  for (const all_names of [null, ""]) {
+    const padded = await peer.call("list_peers", { all_names });
+    assert.deepEqual(padded.structuredContent.names, []);
+    assert.equal(padded.structuredContent.namesNotRunning, 1);
+  }
+  assert.equal((await peer.call("list_peers", { all_names: "true" })).isError, true);
+});
+
+test("structured listing note preserves the actual inbox bind failure", async (t) => {
+  const f = await fixture(t), peer = await f.start();
+  const result = await peer.call("list_peers", {}, "not-loaded");
+  assert.match(result.structuredContent.note, /this Codex thread is not loaded on the app-server/);
+  assert.ok(result.content[0].text.includes(result.structuredContent.note));
+  assert.doesNotMatch(result.structuredContent.note, /Native discovery incomplete/);
+  assert.equal(result.structuredContent.self, null);
 });
 

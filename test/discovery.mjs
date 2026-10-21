@@ -141,11 +141,17 @@ test("list rows compactly show proven status, observation age and the last faile
       source: "thread/turns/list", event: "completed", timeSource: "runtime" },
     lastTurn: { id: "turn", status: "failed", completedAt: now - 12 * 60_000, observedAt: now - 12 * 60_000,
       source: "thread/turns/list", errorClass: "http_409" } };
-  assert.equal(formatPeerStatus(p, now), "idle 12m · last turn failed 12m ago (http_409)");
-  assert.match(formatSessionPeer(p), /last turn failed .* ago \(http_409\)/);
+  assert.equal(formatPeerStatus(p, now), "idle 12m · last turn failed (http_409)");
+  assert.match(formatSessionPeer(p), /idle .* · last turn failed.*\(http_409\)/);
   const [row] = codexDiscovery([p], [], self);
   assert.deepEqual(row.lastTurn, p.lastTurn);
-  assert.match(formatCodexPeer(row), /last turn failed .* ago \(http_409\)/);
+  assert.match(formatCodexPeer(row), /idle .* · last turn failed.*\(http_409\)/);
+  assert.equal(formatPeerStatus({ ...p, lastTurn: { ...p.lastTurn, completedAt: now - 14 * 60_000 } }, now),
+    "idle 12m · last turn failed 14m ago (http_409)");
+  assert.equal(formatPeerStatus({ ...p, lastTurn: { ...p.lastTurn, status: "completed", errorClass: undefined } }, now),
+    "idle 12m · last turn completed");
+  assert.equal(formatPeerStatus({ ...p, turnOutcome: { status: "unknown", source: "thread/turns/list", observedAt: now } }, now),
+    "idle · last turn failed 12m ago (http_409) · turn outcome unknown (thread/turns/list)");
   assert.equal(formatPeerStatus({ ...p, status: "active" }, now).split(" · ")[0], "busy");
   assert.equal(formatPeerStatus(peer("legacy"), now), "");
   assert.match(formatExited([{ ...p, lastSeenAt: now - 12 * 60_000 }], now).join("\n"), /last seen 12m ago · last turn failed 12m ago/);
@@ -185,24 +191,30 @@ test("newer live status wins in both discovery passes, with registry history ret
 
 test("model listings retain actionable facts and filter names without changing full source rows", () => {
   const now = Date.now(), p = { ...peer("worker"), status: "active", activeFlags: ["waitingOnApproval"],
-    statusObservedAt: now, statusSource: "thread/read", lastActivity: { at: now - 1000, event: "started", source: "turn/started" },
+    statusObservedAt: now, statusSource: "thread/read", lastActivity: { turnId: "current", at: now - 1000, observedAt: now, timeSource: "runtime", event: "started", source: "turn/started" },
     lastTurn: { id: "t", status: "failed", completedAt: now - 5000, observedAt: now, source: "thread/turns/list", errorClass: "server_overloaded" } };
-  const source = { peers: [p], names: [{ name: "codex:p/live", running: true }, { name: "codex:p/reserved", running: false }] };
+  const source = { peers: [p], names: [{ name: "codex:p/live", running: true, claimedAt: now }, { name: "codex:p/reserved", running: false }] };
   const result = modelListing(source, { now });
-  assert.equal(result.now, now);
+  assert.equal(Object.hasOwn(result, "now"), false);
   assert.equal(result.namesNotRunning, 1);
-  assert.deepEqual(result.names, [source.names[0]]);
+  assert.deepEqual(result.names, [{ name: "codex:p/live", running: true }]);
   assert.deepEqual(result.peers[0].activeFlags, ["waitingOnApproval"]);
-  assert.equal(result.peers[0].activityAt, now - 1000);
-  assert.equal(result.peers[0].activityEvent, "started");
-  assert.deepEqual(result.peers[0].lastTurn, { status: "failed", completedAt: now - 5000, errorClass: "server_overloaded" });
-  assert.equal(result.peers[0].statusSource, undefined);
-  assert.equal(result.peers[0].lastActivity, undefined);
+  assert.equal(result.peers[0].statusText, formatPeerStatus(p, now));
+  assert.equal(result.peers[0].statusText, "waiting on approval · last turn failed 5s ago (server_overloaded)");
+  assert.deepEqual(result.peers[0].lastTurn, { status: "failed", errorClass: "server_overloaded" });
+  assert.doesNotMatch(JSON.stringify(result), /statusObservedAt|statusSource|lastActivity|activityAt|activityEvent|observedAt|completedAt|claimedAt/);
   assert.equal(modelListing(source, { allNames: true }).names.length, 2);
   assert.equal(source.peers[0].lastTurn.id, "t");
   assert.equal(source.names.length, 2);
   const observed = modelListing({ peers: [{ ...p, lastActivity: { ...p.lastActivity, timeSource: "observed" } }] }, { now });
-  assert.equal(observed.peers[0].activityTimeSource, "observed");
+  assert.equal(observed.peers[0].statusText, result.peers[0].statusText, "waiting never guesses a duration from turn start");
+  assert.equal(modelListing({ peers: [{ ...p, activeFlags: [], lastActivity: { ...p.lastActivity, timeSource: "observed" } }] }, { now }).peers[0].statusText,
+    "busy ≥1s · last turn failed 5s ago (server_overloaded)");
+  const legacy = modelListing({ peers: [{ name: "old", status: null, activeFlags: [], lastTurn: null, turnOutcome: null }] });
+  assert.deepEqual(legacy.peers, [{ name: "old" }]);
+  const recent = modelListing({ recentlyExited: [{ ...p, lastSeenAt: now - 60_000, exitObservedAt: now, exitBasis: "pid-gone-or-reused" }] }, { now }).recentlyExited[0];
+  assert.equal(recent.statusText, "last seen 1m ago · last turn failed 5s ago (server_overloaded)");
+  assert.doesNotMatch(JSON.stringify(recent), /At|Source|exitBasis/);
 });
 
 test("names text hides only non-running holders, with an explicit all_names escape hatch", () => {

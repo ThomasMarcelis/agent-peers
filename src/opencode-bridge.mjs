@@ -179,7 +179,9 @@ export class OpencodeBridge {
   // refused bind can never reach a claim or a send.
   async tool(params = {}) {
     if (this.#closed) throw new BridgeError("bridge-closed", "the opencode bridge is closing");
-    const { instance, name, sessionID, args } = params;
+    const { instance, name, sessionID } = params;
+    const args = name === "list_peers" && (params.args?.all_names === null || params.args?.all_names === "")
+      ? { ...params.args, all_names: undefined } : params.args;
     try {
       if (typeof instance !== "string" || !this.#instances.has(instance)) throw new BridgeError("not-found", "this opencode plugin instance is no longer registered");
       if (typeof name !== "string" || !Object.hasOwn(this.#definitions, name)) {

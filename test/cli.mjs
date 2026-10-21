@@ -80,6 +80,25 @@ test("CLI keeps recent exited status-aware sidecars separate from peers and rout
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
+test("CLI JSON omits empty waiting flags while retaining complete status timestamps", () => {
+  const home = mkdtempSync(join(tmpdir(), "ap-cli-flags-")), now = Date.now();
+  const peers = join(home, "peers"), sockets = join(home, "cc-socks");
+  for (const path of [peers, sockets]) mkdirSync(path, { mode: 0o700 });
+  const env = { AGENT_PEERS_HOME: peers, CLAUDE_CONFIG_DIR: join(home, "claude"), XDG_RUNTIME_DIR: home };
+  try {
+    writeFileSync(join(peers, "codex-active.json"), JSON.stringify({ pid: process.pid, name: "codex:active", threadId: "active",
+      address: `uds:${join(sockets, "codex-active.sock")}`, status: "active", activeFlags: [], statusSource: "thread/read", statusObservedAt: now }));
+    const result = run(["list", "--json", "--no-probe"], env);
+    assert.equal(result.status, 0, result.stderr);
+    const [row] = JSON.parse(result.stdout).peers;
+    assert.equal(Object.hasOwn(row, "activeFlags"), false);
+    assert.equal(row.status, "active");
+    assert.equal(row.statusSource, "thread/read");
+    assert.equal(row.statusObservedAt, now);
+    assert.equal(row.statusText, undefined, "CLI JSON retains evidence rather than the model projection");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 test("doctor reports invalid paths as errors", () => {
   const result = run(["doctor", "--json"], { AGENT_PEERS_HOME: "relative-peers" });
   assert.equal(result.status, 1);

@@ -133,10 +133,10 @@ const age = (at, now) => {
   return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m`
     : seconds < 86400 ? `${Math.floor(seconds / 3600)}h` : `${Math.floor(seconds / 86400)}d`;
 };
-const outcomeText = (turn, now) => {
+const outcomeText = (turn, now, omitAge = false) => {
   if (!turn) return "";
   const at = turn.completedAt ?? turn.observedAt;
-  return `last turn ${turn.status} ${turn.completedAt ? "" : "observed "}${age(at, now)} ago` +
+  return `last turn ${turn.status}` + (omitAge ? "" : ` ${turn.completedAt ? "" : "observed "}${age(at, now)} ago`) +
     (now - at >= 86400_000 ? ` (${new Date(at).toISOString().slice(0, 10)})` : "") +
     (turn.errorClass ? ` (${turn.errorClass})` : "");
 };
@@ -147,10 +147,11 @@ export function formatPeerStatus(p, now = Date.now()) {
   const waiting = fields.activeFlags?.map((flag) => flag === "waitingOnUserInput" ? "waiting on input" : "waiting on approval").join(" + ");
   const label = waiting || ({ active: "busy", notLoaded: "not loaded", systemError: "system error" }[fields.status] ?? fields.status);
   const activity = fields.lastActivity;
-  const duration = !waiting && activity && ((fields.status === "active" && activity.event === "started") ||
+  const duration = !waiting && !fields.turnOutcome && activity && ((fields.status === "active" && activity.event === "started") ||
     (["idle", "systemError"].includes(fields.status) && activity.event === "completed")) ? ` ${activity.timeSource === "observed" ? "≥" : ""}${age(activity.at, now)}` : "";
   const stale = now - fields.statusObservedAt > 2 * RECONCILE_MS ? ` (seen ${age(fields.statusObservedAt, now)} ago)` : "";
-  return [`${label}${duration}${stale}`, outcomeText(fields.lastTurn, now),
+  const sameTime = Boolean(duration && activity.event === "completed" && activity.turnId === fields.lastTurn?.id && activity.at === fields.lastTurn.completedAt);
+  return [`${label}${duration}${stale}`, outcomeText(fields.lastTurn, now, sameTime),
     fields.turnOutcome ? "turn outcome unknown (thread/turns/list)" : ""].filter(Boolean).join(" · ");
 }
 
@@ -165,24 +166,30 @@ export function formatNames(names, { allNames = false, sendPeer = false } = {}) 
 export function formatExited(rows, now = Date.now()) {
   if (!rows.length) return [];
   return ["Recently exited Codex sidecars (last seen within 60m):", ...rows.map((p) =>
-    `  ${p.name}  last seen ${age(p.lastSeenAt, now)} ago${p.lastTurn ? ` · ${outcomeText(p.lastTurn, now)}` : ""}`)];
+    `  ${p.name}  ${exitedStatusText(p, now)}`)];
 }
 
-// Model-facing projection only. Registry and CLI JSON retain complete evidence. A shared now
-// gives every timestamp the same reference without repeating an age field beside each one.
-function modelPeer(p) {
-  const { statusSource, lastActivity, lastTurn, turnOutcome, ...row } = p;
-  if (lastActivity) Object.assign(row, { activityAt: lastActivity.at, activityEvent: lastActivity.event });
-  if (lastActivity?.timeSource === "observed") row.activityTimeSource = "observed";
-  if (lastTurn) row.lastTurn = { status: lastTurn.status,
-    ...(lastTurn.completedAt ? { completedAt: lastTurn.completedAt } : { observedAt: lastTurn.observedAt }),
-    ...(lastTurn.errorClass ? { errorClass: lastTurn.errorClass } : {}) };
-  if (turnOutcome) row.turnOutcome = { status: "unknown", source: turnOutcome.source };
+const exitedStatusText = (p, now) => `last seen ${age(p.lastSeenAt, now)} ago` +
+  (p.lastTurn ? ` · ${outcomeText(p.lastTurn, now)}` : "") +
+  (p.turnOutcome ? " · turn outcome unknown (thread/turns/list)" : "");
+
+// Model-facing projection only. Full evidence stays in the registry and CLI JSON; models
+// get the CLI wording and small branching fields without having to subtract timestamps.
+function modelPeer(p, now, exited = false) {
+  const { status, activeFlags, statusObservedAt, statusSource, statusRecordedAt, lastActivity, lastTurn, turnOutcome,
+    lastSeenAt, exitObservedAt, exitBasis, inboxClosedAt, ...row } = p;
+  const fields = statusFields(p);
+  if (typeof status === "string" && status) row.status = status;
+  if (fields.activeFlags) row.activeFlags = fields.activeFlags;
+  if (fields.statusObservedAt) row.statusText = exited ? exitedStatusText({ ...fields, lastSeenAt }, now) : formatPeerStatus(p, now);
+  if (fields.lastTurn) row.lastTurn = { status: fields.lastTurn.status,
+    ...(fields.lastTurn.errorClass ? { errorClass: fields.lastTurn.errorClass } : {}) };
   return row;
 }
 
 export function modelListing({ peers = [], self, names = [], recentlyExited = [], ...rest }, { allNames = false, now = Date.now() } = {}) {
-  return { ...rest, now, peers: peers.map(modelPeer), ...(self !== undefined ? { self } : {}),
-    names: allNames ? names : names.filter((row) => row.running), namesNotRunning: names.filter((row) => !row.running).length,
-    recentlyExited: recentlyExited.map(({ exitObservedAt, exitBasis, inboxClosedAt, ...row }) => modelPeer(row)) };
+  return { ...rest, peers: peers.map((p) => modelPeer(p, now)), ...(self !== undefined ? { self } : {}),
+    names: (allNames ? names : names.filter((row) => row.running)).map(({ claimedAt, ...row }) => row),
+    namesNotRunning: names.filter((row) => !row.running).length,
+    recentlyExited: recentlyExited.map((p) => modelPeer(p, now, true)) };
 }

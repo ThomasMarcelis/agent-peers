@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
+import { ownsRegistry } from "../src/codex-binding.mjs";
 import { CodexStatus, errorClass, observeStatus, observeTurn, statusFields } from "../src/codex-status.mjs";
 
 const delay = () => new Promise((resolve) => setImmediate(resolve));
@@ -20,6 +23,11 @@ test("active waiting flags are allowlisted, retained and cleared by subsequent s
   data = observeStatus(data, { type: "idle" }, "thread/status/changed", 2000);
   assert.equal(data.activeFlags, undefined);
   assert.equal(statusFields(data).activeFlags, undefined);
+  for (const flags of [[], ["SECRET"], null]) {
+    const empty = observeStatus({ ...data, activeFlags: ["waitingOnApproval"] }, { type: "active", activeFlags: flags }, "thread/read", 3000);
+    assert.equal(Object.hasOwn(empty, "activeFlags"), false, "empty runtime flags clear previous waits without emitting an empty field");
+    assert.equal(Object.hasOwn(statusFields({ ...empty, activeFlags: flags }), "activeFlags"), false);
+  }
 });
 
 test("status and activity have separate evidence; a completed/failed turn does not imply idle", () => {
@@ -141,4 +149,56 @@ test("lost registry ownership stops polling, notifications and pending observati
   await monitor.refresh();
   assert.equal(writes, 1);
   assert.equal(reads, 0);
+});
+
+test("irrelevant notifications never check registry ownership", async (t) => {
+  let checks = 0;
+  const monitor = new CodexStatus({ latestTurns: async () => [] }, () => {}, { owns: () => { checks++; return true; } });
+  t.after(() => monitor.close());
+  monitor.watch("root", { status: { type: "idle" } });
+  await delay();
+  checks = 0;
+  for (let i = 0; i < 50; i++) monitor.notification({ method: "item/agentMessage/delta", params: { threadId: "root", delta: "SECRET" } });
+  monitor.notification({ method: "error", params: { threadId: "root" } });
+  assert.equal(checks, 0);
+  monitor.notification({ method: "thread/status/changed", params: { threadId: "root", status: { type: "active" } } });
+  assert.ok(checks > 0);
+});
+
+test("unknown registry ownership pauses observation and recovers without rebinding", async (t) => {
+  let owned = true, data, writes = 0;
+  const app = { loadedThreads: async () => ["root"], readThread: async () => ({ status: { type: "active" } }), latestTurns: async () => [] };
+  const monitor = new CodexStatus(app, (_id, value) => { data = value; writes++; }, { owns: () => owned });
+  t.after(() => monitor.close());
+  monitor.watch("root", { status: { type: "idle" } });
+  await delay();
+  owned = undefined;
+  await monitor.refresh();
+  monitor.notification({ method: "thread/status/changed", params: { threadId: "root", status: { type: "active" } } });
+  assert.equal(writes, 1);
+  assert.equal(data.status, "idle");
+  owned = true;
+  await monitor.refresh();
+  assert.equal(writes, 2);
+  assert.equal(data.status, "active");
+});
+
+test("only a readable valid replacement record proves registry takeover", (t) => {
+  const dir = mkdtempSync(join(realpathSync("/tmp"), "ap-status-owner-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const root = { registry: join(dir, "codex-root.json"), token: "owner", threadId: "root", address: `uds:${join(dir, "codex-root.sock")}` };
+  const entry = { ...root, pid: process.pid, name: "codex:root" };
+  assert.equal(ownsRegistry(root), undefined, "a missing record is unknown");
+  writeFileSync(root.registry, "{", { mode: 0o600 });
+  assert.equal(ownsRegistry(root), undefined, "a failed read is unknown");
+  writeFileSync(root.registry, "{}");
+  assert.equal(ownsRegistry(root), undefined, "an invalid record cannot prove replacement");
+  writeFileSync(root.registry, JSON.stringify(entry));
+  assert.equal(ownsRegistry(root), true);
+  writeFileSync(root.registry, JSON.stringify({ ...entry, token: "replacement" }));
+  assert.equal(ownsRegistry(root), false);
+  writeFileSync(root.registry, JSON.stringify({ ...entry, pid: 0x7ffffffe }));
+  assert.equal(ownsRegistry(root), false);
+  writeFileSync(root.registry, JSON.stringify(entry));
+  assert.equal(ownsRegistry(root), true);
 });

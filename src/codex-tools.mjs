@@ -71,7 +71,7 @@ async function listPeers(caller, allNames = false) {
       ...formatNames(names, { allNames, sendPeer: true }), ...formatExited(recentlyExited),
       ...(note ? [note] : [])].join("\n"),
     peers, self, names, recentlyExited,
-    degraded: Boolean(note),
+    degraded: Boolean(note), note,
   };
 }
 
@@ -132,7 +132,9 @@ mcp.registerTool(
   "list_peers",
   {
     description: "List local Claude Code and Codex peers, including your native Codex agents, with reachability and exact messaging targets.",
-    inputSchema: { all_names: z.boolean().optional().describe("Include names whose holder is not running; default returns running names and namesNotRunning count.") },
+    // Advertise a boolean while tolerating empty optional-field padding from models.
+    inputSchema: { all_names: z.preprocess((value) => value === null || value === "" ? undefined : value,
+      z.boolean().optional()).meta({ type: "boolean" }).optional().describe("Include names whose holder is not running; default returns running names and namesNotRunning count.") },
     annotations: { readOnlyHint: true },
   },
   async (args, extra) => {
@@ -150,7 +152,7 @@ mcp.registerTool(
       durationMs: performance.now() - started });
     return { content: [{ type: "text", text: result.text + note }], structuredContent: modelListing({
       peers: result.peers, self: result.self, names: result.names, recentlyExited: result.recentlyExited,
-      ...(result.degraded || note ? { note: "Native discovery incomplete; check list_agents." } : {}),
+      ...(result.note || note ? { note: [result.note, note.trim().replace(/^\(|\)$/g, "")].filter(Boolean).join(" ") } : {}),
     }, { allNames: args.all_names }) };
   },
 );

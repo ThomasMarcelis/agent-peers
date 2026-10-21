@@ -125,23 +125,30 @@ test("Hermes JSON has waiting flags, actionable slim evidence, inactive-name cou
   claim("claude:p/reserved", claimant);
   const result = await f.bridge.request("list_peers");
   const row = result.peers.find((p) => p.kind === "codex");
-  assert.ok(result.now >= now);
+  assert.equal(Object.hasOwn(result, "now"), false);
   assert.deepEqual(row.activeFlags, ["waitingOnUserInput"]);
   assert.equal(row.status, "active");
-  assert.equal(row.activityAt, now - 40 * 60_000);
-  assert.equal(row.activityEvent, "started");
-  assert.deepEqual(row.lastTurn, { status: "failed", completedAt: now - 45 * 60_000, errorClass: "server_overloaded" });
+  assert.equal(row.statusText, "waiting on input · last turn failed 45m ago (server_overloaded)");
+  assert.deepEqual(row.lastTurn, { status: "failed", errorClass: "server_overloaded" });
+  assert.doesNotMatch(JSON.stringify(row), /At|Source|activityEvent/);
   assert.equal(row.statusSource, undefined);
   assert.equal(row.lastActivity, undefined);
   assert.deepEqual(result.names, []);
   assert.equal(result.namesNotRunning, 1);
   assert.equal(result.recentlyExited.length, 1);
-  assert.equal(result.recentlyExited[0].lastSeenAt, now - 12 * 60_000);
+  assert.equal(result.recentlyExited[0].statusText, "last seen 12m ago · last turn failed 45m ago (server_overloaded)");
+  assert.equal(result.recentlyExited[0].lastSeenAt, undefined);
   assert.equal(result.recentlyExited[0].exitObservedAt, undefined);
   assert.equal(result.recentlyExited[0].address, undefined);
   const expanded = await f.bridge.request("list_peers", { all_names: true });
   assert.equal(expanded.names[0].name, "claude:p/reserved");
   assert.equal(expanded.names[0].running, false);
+  for (const all_names of [null, ""]) {
+    const padded = await f.bridge.request("list_peers", { all_names });
+    assert.deepEqual(padded.names, []);
+    assert.equal(padded.namesNotRunning, 1);
+  }
+  await assert.rejects(f.bridge.request("list_peers", { all_names: "true" }), /all_names must be a boolean/);
 });
 
 test("Hermes chooses the newest of registry and live status observations", async (t) => {

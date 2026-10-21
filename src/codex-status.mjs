@@ -7,6 +7,7 @@ const STATUSES = new Set(["active", "idle", "notLoaded", "systemError", "unknown
 const SOURCES = new Set(["thread/read", "thread/status/changed", "thread/loaded/list", "app-server-unavailable"]);
 const TURN_SOURCES = new Set(["thread/turns/list", "turn/started", "turn/completed"]);
 const OUTCOMES = new Set(["completed", "failed", "interrupted"]);
+const NOTIFICATIONS = new Set(["thread/status/changed", "turn/started", "turn/completed"]);
 const ERRORS = new Set(["contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded", "rateLimitExceeded",
   "flexUnavailable", "serverOverloaded", "cyberPolicy", "misalignmentPolicyViolation", "tooManyDenials",
   "internalServerError", "unauthorized", "badRequest", "threadRollbackFailed", "sandboxError", "other"]);
@@ -15,6 +16,7 @@ const snake = (s) => s.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const time = (n) => Number.isSafeInteger(n) && n > 0 && n <= 8_640_000_000_000_000;
 const runtimeTime = (n) => time(n) && time(n * 1000) ? n * 1000 : undefined;
 const turnId = (s) => typeof s === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(s);
+const flagsOf = (flags) => Array.isArray(flags) ? [...new Set(flags.filter((flag) => ACTIVE_FLAGS.has(flag)))] : [];
 
 export function errorClass(info) {
   if (ERRORS.has(info)) return snake(info);
@@ -33,7 +35,8 @@ export function statusFields(p) {
   const out = {};
   if (STATUSES.has(p?.status) && time(p.statusObservedAt) && SOURCES.has(p.statusSource)) {
     Object.assign(out, { status: p.status, statusObservedAt: p.statusObservedAt, statusSource: p.statusSource });
-    if (p.status === "active" && Array.isArray(p.activeFlags)) out.activeFlags = [...new Set(p.activeFlags.filter((flag) => ACTIVE_FLAGS.has(flag)))];
+    const flags = p.status === "active" ? flagsOf(p.activeFlags) : [];
+    if (flags.length) out.activeFlags = flags;
   }
   const a = p?.lastActivity;
   if (a && turnId(a.turnId) && time(a.at) && time(a.observedAt) && TURN_SOURCES.has(a.source) &&
@@ -59,9 +62,9 @@ export function statusFields(p) {
 export function observeStatus(data, status, source, now) {
   if (!STATUSES.has(status?.type) || !SOURCES.has(source)) return data;
   const { activeFlags, ...rest } = data;
+  const flags = status.type === "active" ? flagsOf(status.activeFlags) : [];
   return { ...rest, status: status.type, statusObservedAt: now, statusSource: source,
-    ...(status.type === "active" && Array.isArray(status.activeFlags)
-      ? { activeFlags: [...new Set(status.activeFlags.filter((flag) => ACTIVE_FLAGS.has(flag)))] } : {}) };
+    ...(flags.length ? { activeFlags: flags } : {}) };
 }
 
 // Status and turn history are independent evidence. A live read can refresh the former
@@ -120,9 +123,10 @@ export class CodexStatus {
   close() { clearInterval(this.#timer); this.#entries.clear(); }
   #current(id, entry) {
     if (this.#entries.get(id) !== entry) return false;
-    if (this.#owns(id)) return true;
-    this.forget(id);
-    return false;
+    const owned = this.#owns(id);
+    // Unknown ownership pauses observation; only a readable replacement proves takeover.
+    if (owned === false) this.forget(id);
+    return owned === true;
   }
   #emit(id, entry, data) {
     if (!this.#current(id, entry)) return;
@@ -136,7 +140,7 @@ export class CodexStatus {
     }
   }
   notification(message) {
-    if (Object.hasOwn(message, "id")) return;
+    if (Object.hasOwn(message, "id") || !NOTIFICATIONS.has(message.method)) return;
     const p = message.params, entry = this.#entries.get(p?.threadId);
     if (!entry || !this.#current(p.threadId, entry)) return;
     if (message.method === "thread/status/changed") {

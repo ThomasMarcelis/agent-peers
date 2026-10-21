@@ -14,7 +14,7 @@ import { claim, claimsOf } from "./names.mjs";
 import { VERSION } from "./version.mjs";
 import {
   address, codexPeers, ensurePrivateDir, generation, isSafePeerRecord, peerSocket, peersHome, processStart, readPeerRecord,
-  recordRunning, slug, socketDir, socketDirectories, validThreadId,
+  recordRunning, slug, socketDir, socketDirectories, validPid, validThreadId,
 } from "./wire.mjs";
 
 export { ownsSocket };
@@ -40,12 +40,14 @@ const statusObserver = new CodexStatus(statusApp, (id, data) => {
   root.statusWrite = setImmediate(() => {
     root.statusWrite = undefined;
     if (!isCurrent(root)) return;
-    if (!ownsRegistry(root)) { statusObserver.forget(root.threadId); return; }
+    const owned = ownsRegistry(root);
+    if (owned === false) statusObserver.forget(root.threadId);
+    if (owned !== true) return;
     try { publishRegistry(root); } catch { /* Status storage cannot stop inbox delivery. */ }
   });
 }, { owns: (id) => {
   const root = roots.get(id);
-  return root && ownsRegistry(root);
+  return root ? ownsRegistry(root) : false;
 } });
 let handler = () => {};
 export const onInboxLine = (fn) => { handler = fn; };
@@ -271,9 +273,12 @@ function publishRegistry(root) {
 export function ownsRegistry(root) {
   try {
     const entry = readPeerRecord(root.registry);
+    // Ownership evidence does not depend on which socket directories discovery can see.
+    if (!validPid(entry.pid) || typeof entry.token !== "string" || !entry.token ||
+        !validThreadId(entry.threadId) || typeof entry.address !== "string" || !entry.address) return undefined;
     return entry.pid === process.pid && entry.token === root.token &&
       entry.threadId === root.threadId && entry.address === root.address;
-  } catch { return false; }
+  } catch { return undefined; } // Unknown: pause status writes, retain observation for recovery.
 }
 
 const setPrimary = (root, inbox) => Object.assign(root, { socket: inbox.socket, address: inbox.address, identity: inbox.identity });
