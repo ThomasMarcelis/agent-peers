@@ -108,6 +108,62 @@ test("listing sees Claude and live Codex status without creating a Hermes inbox"
   assert.deepEqual(readdirSync(f.peers), ["codex-test.json"]);
 });
 
+test("Hermes JSON has waiting flags, actionable slim evidence, inactive-name counts and recent exits", async (t) => {
+  const now = Date.now();
+  const f = await fixture(t, { app: { loadedThreads: async () => ["live-thread"],
+    readThread: async () => ({ status: { type: "active", activeFlags: ["waitingOnUserInput"] } }) } });
+  const path = join(f.peers, "codex-test.json"), original = JSON.parse(readFileSync(path, "utf8"));
+  const status = { status: "idle", statusObservedAt: now - 2000, statusSource: "thread/read",
+    lastActivity: { turnId: "t", at: now - 40 * 60_000, observedAt: now, source: "turn/started", event: "started", timeSource: "runtime" },
+    lastTurn: { id: "previous", status: "failed", completedAt: now - 45 * 60_000, observedAt: now,
+      source: "thread/turns/list", errorClass: "server_overloaded" } };
+  writeFileSync(path, JSON.stringify({ ...original, ...status }));
+  writeFileSync(join(f.peers, "codex-gone.json"), JSON.stringify({ ...original, ...status, threadId: "gone", name: "codex:gone",
+    address: address(join(f.sockets, "codex-gone.sock")), pid: 0x7ffffffe, statusRecordedAt: now - 12 * 60_000 }));
+  const claimant = claudeClaimant(claudeSessionAt(process.pid));
+  claimant.holder.pid = 0x7ffffffe;
+  claim("claude:p/reserved", claimant);
+  const result = await f.bridge.request("list_peers");
+  const row = result.peers.find((p) => p.kind === "codex");
+  assert.equal(Object.hasOwn(result, "now"), false);
+  assert.deepEqual(row.activeFlags, ["waitingOnUserInput"]);
+  assert.equal(row.status, "active");
+  assert.equal(row.statusText, "waiting on input · last turn failed 45m ago (server_overloaded)");
+  assert.deepEqual(row.lastTurn, { status: "failed", errorClass: "server_overloaded" });
+  assert.doesNotMatch(JSON.stringify(row), /At|Source|activityEvent/);
+  assert.equal(row.statusSource, undefined);
+  assert.equal(row.lastActivity, undefined);
+  assert.deepEqual(result.names, []);
+  assert.equal(result.namesNotRunning, 1);
+  assert.equal(result.recentlyExited.length, 1);
+  assert.equal(result.recentlyExited[0].statusText, "last seen 12m ago · last turn failed 45m ago (server_overloaded)");
+  assert.equal(result.recentlyExited[0].lastSeenAt, undefined);
+  assert.equal(result.recentlyExited[0].exitObservedAt, undefined);
+  assert.equal(result.recentlyExited[0].address, undefined);
+  const expanded = await f.bridge.request("list_peers", { all_names: true });
+  assert.equal(expanded.names[0].name, "claude:p/reserved");
+  assert.equal(expanded.names[0].running, false);
+  for (const all_names of [null, ""]) {
+    const padded = await f.bridge.request("list_peers", { all_names });
+    assert.deepEqual(padded.names, []);
+    assert.equal(padded.namesNotRunning, 1);
+  }
+  await assert.rejects(f.bridge.request("list_peers", { all_names: "true" }), /all_names must be a boolean/);
+});
+
+test("Hermes chooses the newest of registry and live status observations", async (t) => {
+  const f = await fixture(t), path = join(f.peers, "codex-test.json"), record = JSON.parse(readFileSync(path, "utf8"));
+  const fields = { status: "active", activeFlags: ["waitingOnApproval"], statusObservedAt: Date.now() - 1000, statusSource: "thread/read" };
+  writeFileSync(path, JSON.stringify({ ...record, ...fields }));
+  const live = (await f.bridge.request("list_peers")).peers.find((p) => p.kind === "codex");
+  assert.equal(live.status, "idle");
+  assert.equal(live.activeFlags, undefined);
+  writeFileSync(path, JSON.stringify({ ...record, ...fields, statusObservedAt: Date.now() + 1000 }));
+  const newer = (await f.bridge.request("list_peers")).peers.find((p) => p.kind === "codex");
+  assert.equal(newer.status, "active");
+  assert.deepEqual(newer.activeFlags, ["waitingOnApproval"]);
+});
+
 test("a missing daemon keeps discoverable inboxes; historical threads are never read", async (t) => {
   let read = false;
   const f = await fixture(t, { app: { loadedThreads: async () => [], readThread: async () => { read = true; } } });
@@ -745,7 +801,10 @@ test("a claim is scoped to the bridge's Hermes profile and opens an inbox in eve
   // Closing the conversation leaves the name, now not running.
   await f.bridge.request("close_session", { session: "route-alpha" });
   assert.throws(() => resolveClaim("hermes:jd/relay"), notRunning);
-  assert.equal((await f.bridge.request("list_peers")).names[0].running, false);
+  const stopped = await f.bridge.request("list_peers");
+  assert.deepEqual(stopped.names, []);
+  assert.equal(stopped.namesNotRunning, 1);
+  assert.equal((await f.bridge.request("list_peers", { all_names: true })).names[0].running, false);
 });
 
 test("a refused claim closes the inboxes it opened and keeps those the conversation already had", async (t) => {

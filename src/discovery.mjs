@@ -1,5 +1,13 @@
 // Discovery describes routes from the caller's point of view. A Codex thread UUID alone
 // does not make it a native send_message target: it must belong to the caller's agent tree.
+import { RECONCILE_MS, newerStatusFields, observeStatus, observeTurn, statusFields } from "./codex-status.mjs";
+
+function threadEvidence(t) {
+  if (!t) return {};
+  let data = observeStatus({}, t.status, "thread/read", t.statusObservedAt ?? Date.now());
+  for (const turn of t.turns ?? []) data = observeTurn(data, turn, "thread/turns/list", t.statusObservedAt ?? Date.now());
+  return data;
+}
 
 // The reason a non-native peer has no native route. The label follows the peer's kind, never
 // "everything that is not Codex": Hermes and opencode rows have distinct recipients, and an
@@ -20,7 +28,8 @@ export function codexDiscovery(peers, threads, self) {
     const t = loaded.get(p.threadId);
     const sameTree = self && (p.threadId === self.rootId || t?.sessionId === self.rootId);
     rows.set(p.threadId || p.address, {
-      name: p.name, kind: p.kind, cwd: p.cwd, status: t?.status?.type ?? p.status,
+      name: p.name, kind: p.kind, cwd: p.cwd, status: p.status ?? t?.status?.type,
+      ...newerStatusFields(p, threadEvidence(t)),
       threadId: p.threadId, generation: p.generation ?? null, claims: p.claims ?? [],
       native: { reachable: !self || sameTree ? null : false, reason: !self ? "caller session unknown"
         : sameTree ? "native target unavailable; check list_agents"
@@ -42,6 +51,7 @@ export function codexDiscovery(peers, threads, self) {
     rows.set(t.id, {
       name: old?.name ?? `codex:${t.agentNickname || target}`,
       kind: "codex", cwd: t.cwd, status: t.status?.type, threadId: t.id, generation: old?.generation ?? null, claims: old?.claims ?? [],
+      ...newerStatusFields(old, threadEvidence(t)),
       native: { reachable: true, tool: "send_message", target },
       // Inbox addresses belong to roots; do not present the root's inbox as a way to
       // deliver directly to one of its subagents.
@@ -84,7 +94,7 @@ export function formatCodexPeer(p) {
   const wake = subagent && p.status === "idle"
     ? `\n  start idle turn: followup_task ${JSON.stringify({ target: p.native.target })} (send_message only queues a message)` : "";
   const claims = p.claims?.length ? `\n  claimed names: ${p.claims.join(", ")}` : "";
-  return `${p.name}  ${p.status ?? ""}  cwd=${p.cwd}\n  native: ${native}\n  bridge: ${bridge}${wake}${claims}`;
+  return `${p.name}  ${formatPeerStatus(p)}  cwd=${p.cwd}\n  native: ${native}\n  bridge: ${bridge}${wake}${claims}`;
 }
 
 // The CLI is also used outside Codex, where there is no caller thread to compare.
@@ -93,10 +103,11 @@ export function formatSessionPeer(p) {
   // Claude and Codex rows keep the rc.4 bytes, including the four-space gap when there is no status;
   // opencode rows join only the fields present, so they never carry a doubled gap.
   const stale = p.reachable === false ? "  stale" : "";
-  const status = [p.status, p.reachable === false ? "stale" : ""].filter(Boolean).join("  ");
+  const activity = formatPeerStatus(p);
+  const status = [activity, p.reachable === false ? "stale" : ""].filter(Boolean).join("  ");
   const head = p.kind === "opencode"
     ? `${p.name}${status ? `  ${status}` : ""}  cwd=${p.cwd}\n`
-    : `${p.name}  ${p.status ?? ""}${stale}  cwd=${p.cwd}\n`;
+    : `${p.name}  ${activity}${stale}  cwd=${p.cwd}\n`;
   const staleLine = p.reachable === false ? "  stale: the socket refused a connection; the record is kept\n" : "";
   const claims = p.claims?.length ? `  claimed names: ${p.claims.join(", ")}\n` : "";
   if (p.kind === "opencode") {
@@ -115,4 +126,70 @@ export function formatName(row, { sendPeer = false } = {}) {
   if (sendPeer) return `${row.name}  running  send_peer ${JSON.stringify({ to: row.name })}`;
   if (row.kind === "hermes") return `${row.name}  running  agent-peers resolve ${row.name}, then SendMessage to the printed address`;
   return `${row.name}  running  SendMessage ${JSON.stringify({ to: row.address })}`;
+}
+
+const age = (at, now) => {
+  const seconds = Math.max(0, Math.floor((now - at) / 1000));
+  return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m`
+    : seconds < 86400 ? `${Math.floor(seconds / 3600)}h` : `${Math.floor(seconds / 86400)}d`;
+};
+const outcomeText = (turn, now, omitAge = false) => {
+  if (!turn) return "";
+  const at = turn.completedAt ?? turn.observedAt;
+  return `last turn ${turn.status}` + (omitAge ? "" : ` ${turn.completedAt ? "" : "observed "}${age(at, now)} ago`) +
+    (now - at >= 86400_000 ? ` (${new Date(at).toISOString().slice(0, 10)})` : "") +
+    (turn.errorClass ? ` (${turn.errorClass})` : "");
+};
+
+export function formatPeerStatus(p, now = Date.now()) {
+  const fields = statusFields(p);
+  if (!fields.statusObservedAt) return p.status ?? "";
+  const waiting = fields.activeFlags?.map((flag) => flag === "waitingOnUserInput" ? "waiting on input" : "waiting on approval").join(" + ");
+  const label = waiting || ({ active: "busy", notLoaded: "not loaded", systemError: "system error" }[fields.status] ?? fields.status);
+  const activity = fields.lastActivity;
+  const duration = !waiting && !fields.turnOutcome && activity && ((fields.status === "active" && activity.event === "started") ||
+    (["idle", "systemError"].includes(fields.status) && activity.event === "completed")) ? ` ${activity.timeSource === "observed" ? "≥" : ""}${age(activity.at, now)}` : "";
+  const stale = now - fields.statusObservedAt > 2 * RECONCILE_MS ? ` (seen ${age(fields.statusObservedAt, now)} ago)` : "";
+  const sameTime = Boolean(duration && activity.event === "completed" && activity.turnId === fields.lastTurn?.id && activity.at === fields.lastTurn.completedAt);
+  return [`${label}${duration}${stale}`, outcomeText(fields.lastTurn, now, sameTime),
+    fields.turnOutcome ? "turn outcome unknown (thread/turns/list)" : ""].filter(Boolean).join(" · ");
+}
+
+export function formatNames(names, { allNames = false, sendPeer = false } = {}) {
+  if (!names.length) return [];
+  const shown = allNames ? names : names.filter((row) => row.running);
+  const hidden = names.length - shown.length;
+  return ["Claimed names:", ...shown.map((row) => `  ${formatName(row, { sendPeer })}`),
+    ...(hidden ? [`  +${hidden} reserved names not running`] : [])];
+}
+
+export function formatExited(rows, now = Date.now()) {
+  if (!rows.length) return [];
+  return ["Recently exited Codex sidecars (last seen within 60m):", ...rows.map((p) =>
+    `  ${p.name}  ${exitedStatusText(p, now)}`)];
+}
+
+const exitedStatusText = (p, now) => `last seen ${age(p.lastSeenAt, now)} ago` +
+  (p.lastTurn ? ` · ${outcomeText(p.lastTurn, now)}` : "") +
+  (p.turnOutcome ? " · turn outcome unknown (thread/turns/list)" : "");
+
+// Model-facing projection only. Full evidence stays in the registry and CLI JSON; models
+// get the CLI wording and small branching fields without having to subtract timestamps.
+function modelPeer(p, now, exited = false) {
+  const { status, activeFlags, statusObservedAt, statusSource, statusRecordedAt, lastActivity, lastTurn, turnOutcome,
+    lastSeenAt, exitObservedAt, exitBasis, inboxClosedAt, ...row } = p;
+  const fields = statusFields(p);
+  if (typeof status === "string" && status) row.status = status;
+  if (fields.activeFlags) row.activeFlags = fields.activeFlags;
+  if (fields.statusObservedAt) row.statusText = exited ? exitedStatusText({ ...fields, lastSeenAt }, now) : formatPeerStatus(p, now);
+  if (fields.lastTurn) row.lastTurn = { status: fields.lastTurn.status,
+    ...(fields.lastTurn.errorClass ? { errorClass: fields.lastTurn.errorClass } : {}) };
+  return row;
+}
+
+export function modelListing({ peers = [], self, names = [], recentlyExited = [], ...rest }, { allNames = false, now = Date.now() } = {}) {
+  return { ...rest, peers: peers.map((p) => modelPeer(p, now)), ...(self !== undefined ? { self } : {}),
+    names: (allNames ? names : names.filter((row) => row.running)).map(({ claimedAt, ...row }) => row),
+    namesNotRunning: names.filter((row) => !row.running).length,
+    recentlyExited: recentlyExited.map((p) => modelPeer(p, now, true)) };
 }

@@ -1,6 +1,6 @@
 {
   "name": "agent-peers",
-  "version": "1.0.0-rc.7",
+  "version": "1.0.0-rc.8",
   "description": "Local agent-to-agent messaging for Claude Code, Codex and opencode, with a Codex MCP server, Hermes plugin and opencode plugin",
   "mcpName": "io.github.ThomasMarcelis/agent-peers",
   "license": "MIT",
@@ -71,7 +71,7 @@
   },
   "scripts": {
     "check": "node scripts/check.mjs",
-    "test": "node --test --test-timeout=60000 test/bind-retry.mjs test/delivery.mjs test/discovery.mjs test/hermes-bridge.mjs test/wire.mjs test/app-server.mjs test/codex-peer.mjs test/cli.mjs test/logging.mjs test/names.mjs test/opencode-bridge.mjs test/opencode-plugin.mjs test/opencode-e2e.mjs test/opencode-protocol.mjs test/opencode-cli.mjs test/opencode-package.mjs",
+    "test": "node --test --test-timeout=60000 test/bind-retry.mjs test/delivery.mjs test/discovery.mjs test/hermes-bridge.mjs test/wire.mjs test/app-server.mjs test/codex-status.mjs test/codex-status-peer.mjs test/codex-peer.mjs test/cli.mjs test/logging.mjs test/names.mjs test/opencode-bridge.mjs test/opencode-plugin.mjs test/opencode-e2e.mjs test/opencode-protocol.mjs test/opencode-cli.mjs test/opencode-package.mjs test/script-send.mjs",
     "test:python": "node scripts/test-python.mjs",
     "test:package": "node scripts/test-package.mjs",
     "test:live": "node test/live-matrix.mjs",

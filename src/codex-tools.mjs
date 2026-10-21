@@ -6,13 +6,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { app, bind, claimantOf, inboxFor, ownsRegistry, ownsSocket, roots, serverInfo } from "./codex-binding.mjs";
 import { outboxOf, pinsOf } from "./codex-inbox.mjs";
-import { codexDiscovery, formatCodexPeer, formatName, nativeRouteError } from "./discovery.mjs";
+import { codexDiscovery, formatCodexPeer, formatExited, formatNames, modelListing, nativeRouteError } from "./discovery.mjs";
 import { coordinationGuidance } from "./guidance.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
 import { claim, claimRefusal, claimRows, heldBy, release, withClaims } from "./names.mjs";
 import { Outbox, sendPeer } from "./outbox.mjs";
 import { SendFailure, isError, sendResult, validMessageId } from "./status.mjs";
-import { MAX_LINE, allPeers, codexPeers, inDiscoveryScope, peerSocket } from "./wire.mjs";
+import { MAX_LINE, allPeers, codexPeers, inDiscoveryScope, peerSocket, recentlyExitedCodex } from "./wire.mjs";
 
 const log = (event, fields = {}) => logEvent("codex-peer", event, fields);
 const code = (reason) => reason?.replaceAll("-", "_");
@@ -41,7 +41,7 @@ function selfRow(caller) {
   };
 }
 
-async function listPeers(caller) {
+async function listPeers(caller, allNames = false) {
   let threads = [], note = "";
   if (caller) {
     try {
@@ -51,7 +51,7 @@ async function listPeers(caller) {
       // limit and avoid silently dropping every thread after the first 256.
       const results = [];
       for (let i = 0; i < ids.length; i += 16) {
-        results.push(...await Promise.allSettled(ids.slice(i, i + 16).map((id) => app.readThread(id))));
+        results.push(...await Promise.allSettled(ids.slice(i, i + 16).map(async (id) => ({ ...await app.readThread(id), statusObservedAt: Date.now() }))));
       }
       threads = results.filter((r) => r.status === "fulfilled").map((r) => r.value);
       if (results.some((r) => r.status === "rejected")) note = "Some native agents could not be read; check list_agents.";
@@ -59,18 +59,18 @@ async function listPeers(caller) {
       note = `Native discovery unavailable: ${e.message}. Check list_agents.`;
     }
   }
-  const { peers, self, names } = inDiscoveryScope(() => ({ peers: codexDiscovery(withClaims(allPeers()), threads, caller), self: selfRow(caller),
-    names: claimRows() }));
+  const { peers, self, names, recentlyExited } = inDiscoveryScope(() => ({ peers: codexDiscovery(withClaims(allPeers()), threads, caller), self: selfRow(caller),
+    names: claimRows(), recentlyExited: recentlyExitedCodex() }));
   const rows = peers.map(formatCodexPeer);
   return {
     // Worded as in 0.3.0; the caller's address is in structuredContent.self.
     text: [`You are ${caller?.name ?? "codex (not bound yet)"}.`,
       ...(rows.length ? rows : ["No other agents found."]),
       ...(peers.some((p) => p.native.reachable) ? ["Native send_message does not start an idle turn; followup_task can wake non-root agents."] : []),
-      ...(names.length ? ["Claimed names:", ...names.map((row) => `  ${formatName(row, { sendPeer: true })}`)] : []),
+      ...formatNames(names, { allNames, sendPeer: true }), ...formatExited(recentlyExited),
       ...(note ? [note] : [])].join("\n"),
-    peers, self, names,
-    degraded: Boolean(note),
+    peers, self, names, recentlyExited,
+    degraded: Boolean(note), note,
   };
 }
 
@@ -131,10 +131,12 @@ mcp.registerTool(
   "list_peers",
   {
     description: "List local Claude Code and Codex peers, including your native Codex agents, with reachability and exact messaging targets.",
-    inputSchema: {},
+    // Advertise a boolean while tolerating empty optional-field padding from models.
+    inputSchema: { all_names: z.preprocess((value) => value === null || value === "" ? undefined : value,
+      z.boolean().optional()).meta({ type: "boolean" }).optional().describe("Include names whose holder is not running; default returns running names and namesNotRunning count.") },
     annotations: { readOnlyHint: true },
   },
-  async (_args, extra) => {
+  async (args, extra) => {
     const started = performance.now();
     const trace = { operationId: randomUUID(), method: "list_peers", threadId: logIdentity(extra._meta?.threadId) };
     log("tool.call", { ...trace, outcome: "started" });
@@ -143,11 +145,14 @@ mcp.registerTool(
       note = `\n(${e.message})`;
       log("inbox.bind", { ...trace, outcome: "failed", ...errorFields(e) });
     });
-    const result = await listPeers(caller);
+    const result = await listPeers(caller, args.all_names);
     if (caller) pinsOf(caller.subagent ? roots.get(caller.rootId) : caller, caller.rootId).noteRows(result.peers);
     log("tool.call", { ...trace, outcome: note || result.degraded ? "degraded" : "succeeded", count: result.peers.length,
       durationMs: performance.now() - started });
-    return { content: [{ type: "text", text: result.text + note }], structuredContent: { peers: result.peers, self: result.self, names: result.names } };
+    return { content: [{ type: "text", text: result.text + note }], structuredContent: modelListing({
+      peers: result.peers, self: result.self, names: result.names, recentlyExited: result.recentlyExited,
+      ...(result.note || note ? { note: [result.note, note.trim().replace(/^\(|\)$/g, "")].filter(Boolean).join(" ") } : {}),
+    }, { allNames: args.all_names }) };
   },
 );
 

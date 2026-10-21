@@ -1,108 +1,13 @@
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { createServer as httpServer } from "node:http";
 import { connect, createServer } from "node:net";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { WebSocketServer } from "ws";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { claim, claudeClaimant, release, resolveClaim } from "../src/names.mjs";
-import { address, claudeSessionAt, generation, messageLine, parseEnvelope, peerSocket, post, processStart, readLines } from "../src/wire.mjs";
+import { address, claudeSessionAt, codexPeers, generation, messageLine, parseEnvelope, peerSocket, post, processStart, readLines } from "../src/wire.mjs";
 import { closeServer, listen } from "./listeners.mjs";
 
-const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const thread = "01900000-0000-0000-0000-123456789abc";
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function until(check) {
-  for (let i = 0; i < 300; i++) { const value = check(); if (value) return value; await delay(10); }
-  assert.fail("timed out waiting for condition");
-}
-
-async function fixture(t, options = {}) {
-  // The real path keeps logging's symlink checks meaningful; /tmp keeps macOS socket paths short.
-  const dir = mkdtempSync(join(realpathSync("/tmp"), "ap-codex-"));
-  const claude = join(dir, "claude"), peers = join(dir, "peers"), daemon = join(dir, "daemon.sock");
-  const sockets = options.longSocketDir
-    ? join(dir, "é".repeat(Math.max(1, Math.ceil((80 - Buffer.byteLength(dir) - 1) / 2))))
-    : join(dir, "socks");
-  for (const path of [join(claude, "sessions"), peers, sockets]) mkdirSync(path, { recursive: true, mode: 0o700 });
-  const before = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, AGENT_PEERS_HOME: process.env.AGENT_PEERS_HOME };
-  Object.assign(process.env, { CLAUDE_CONFIG_DIR: claude, AGENT_PEERS_HOME: peers });
-  const inbox = join(sockets, "claude.sock"), messages = [], controls = [], turns = [], reads = [], clients = [], held = [], mcpServers = {},
-    statusCalls = [], injected = [];
-  // A fast inbox that accepts at once, unless the test supplies another receipt or none (null, as Claude does for accepted input).
-  const receiver = createServer((conn) => readLines(conn, (line) => {
-    if (line.type !== "user") return controls.push(line);
-    messages.push(line);
-    if (options.receipt !== null) void post(peerSocket(line.from), { type: "control", action: "peer_message_status", orig_msg_id: line.msg_id,
-      from: address(inbox), status: "accepted", ...options.receipt }).catch(() => {});
-  }));
-  const http = httpServer(), wss = new WebSocketServer({ server: http });
-  // Registered before anything listens, so a failure below cannot leave a handle open.
-  t.after(async () => {
-    await Promise.all(clients.map(({ close }) => close()));
-    for (const ws of wss.clients) ws.terminate();
-    await new Promise((resolve) => wss.close(resolve));
-    await closeServer(http);
-    await closeServer(receiver);
-    for (const [key, value] of Object.entries(before)) value === undefined ? delete process.env[key] : process.env[key] = value;
-    rmSync(dir, { recursive: true, force: true });
-  });
-  await listen(receiver, inbox);
-  writeFileSync(join(claude, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "test", cwd: dir, messagingSocketPath: inbox,
-    procStart: processStart(process.pid) }));
-  const reply =(ws, message, result) => ws.send(JSON.stringify({ id: message.id, result }));
-  let hold = !!options.hold;
-  wss.on("connection", (ws) => ws.on("message", (data) => {
-    const message = JSON.parse(data);
-    if (message.method === "initialize") reply(ws, message, {});
-    if (message.method === "thread/loaded/list") reply(ws, message, { data: options.loaded ?? [thread], nextCursor: null });
-    if (message.method === "thread/read") {
-      reads.push(message.params.threadId);
-      const respond = () => reply(ws, message, { thread: { id: message.params.threadId, parentThreadId: options.parents?.[message.params.threadId],
-        name: "fixture", cwd: dir, status: { type: "idle" }, ...options.threadData?.[message.params.threadId] } });
-      if (options.readDelay) setTimeout(respond, options.readDelay);
-      else respond();
-    }
-    if (message.method === "mcpServerStatus/list") {
-      statusCalls.push(message.params.threadId);
-      const servers = mcpServers[message.params.threadId];
-      if (servers === "error") ws.send(JSON.stringify({ id: message.id, error: { code: -32603, message: "transient" } }));
-      else reply(ws, message, { data: servers ?? [] });
-    }
-    if (message.method === "turn/start") {
-      turns.push(message.params);
-      if (options.turnError) {
-        ws.send(JSON.stringify({ id: message.id, error: options.turnError }));
-        return;
-      }
-      if (hold) held.push(() => reply(ws, message, {}));
-      else reply(ws, message, {});
-    }
-    if (message.method === "thread/inject_items") {
-      injected.push(message.params);
-      reply(ws, message, {});
-    }
-  }));
-  await listen(http, daemon);
-  const start = async (extraEnv = {}) => {
-    const transport = new StdioClientTransport({ command: process.execPath, args: [join(root, "src", "codex-peer.mjs")],
-      env: { ...process.env, CLAUDE_CONFIG_DIR: claude, AGENT_PEERS_HOME: peers, AGENT_PEERS_CODEX_APP_SERVER: daemon,
-        AGENT_PEERS_DEBUG: options.logging ? "1" : "0", AGENT_PEERS_LOG: "", ...extraEnv }, stderr: "pipe" });
-    const client = new Client({ name: "test", version: "1" });
-    transport.stderr.resume();
-    const close = () => client.close();
-    // Tracked before connecting: a failed handshake must still stop the child process.
-    clients.push({ client, close });
-    await client.connect(transport);
-    return { client, transport, close, call: (name, args = {}, id = thread) => client.callTool({ name, arguments: args, _meta: { threadId: id } }) };
-  };
-  return { dir, peers, sockets, inbox, claude, messages, controls, turns, reads, injected, start, mcpServers, statusCalls,
-    registry: join(peers, `codex-${thread}.json`),
-    release: () => { hold = false; held.splice(0).forEach((release) => release()); } };
-}
+import { root, thread, delay, until, fixture } from "./codex-peer-fixture.mjs";
 
 test("MCP binds privately, discovers peers, sends and receives framed messages, then cleans up", async (t) => {
   const f = await fixture(t), peer = await f.start();
@@ -138,7 +43,8 @@ test("MCP binds privately, discovers peers, sends and receives framed messages, 
   assert.deepEqual(f.controls, [], "Claude and 0.x senders never get positive receipts");
   await peer.close();
   assert.equal(existsSync(socket), false);
-  assert.equal(existsSync(f.registry), false);
+  assert.ok(JSON.parse(readFileSync(f.registry, "utf8")).inboxClosedAt);
+  assert.deepEqual(codexPeers(), []);
   assert.deepEqual(readdirSync(f.sockets), ["claude.sock"]);
 });
 
@@ -186,7 +92,8 @@ test("a session is reachable under its folder name before its first tool call, a
   await until(() => f.turns.length === 1);
   assert.equal(f.turns[0].threadId, thread);
   await peer.close();
-  await until(() => !existsSync(socket) && !existsSync(f.registry));
+  await until(() => !existsSync(socket));
+  assert.ok(JSON.parse(readFileSync(f.registry, "utf8")).inboxClosedAt);
 });
 
 test("startup binding ignores other processes' connections and honours AGENT_PEERS_NAME", async (t) => {
@@ -238,7 +145,11 @@ test("a delayed startup scan does not take over an inbox a replacement process o
   f.mcpServers[thread] = [{ name: "agent-peers", serverInfo: first.client.getServerVersion() }];
   const seen = f.statusCalls.length;
   await until(() => f.statusCalls.length > seen + 2);
-  assert.deepEqual(JSON.parse(readFileSync(f.registry, "utf8")), owned);
+  const current = JSON.parse(readFileSync(f.registry, "utf8"));
+  // Runtime observations may advance while inbox ownership must remain unchanged.
+  for (const field of ["token", "pid", "procStart", "threadId", "generation", "address", "addresses"]) {
+    assert.deepEqual(current[field], owned[field], field);
+  }
   assert.equal(existsSync(peerSocket(owned.address)), true);
 });
 
@@ -522,6 +433,7 @@ test("an unverified listener at the deterministic inbox pathname is never overwr
 test("a live legacy registry cannot be taken over until its process exits", async (t) => {
   const f = await fixture(t), legacy = await f.start();
   await legacy.call("list_peers");
+  await until(() => JSON.parse(readFileSync(f.registry, "utf8")).statusObservedAt);
   const record = JSON.parse(readFileSync(f.registry, "utf8")), socket = peerSocket(record.address);
   const identity = lstatSync(socket);
   delete record.addresses;
@@ -660,7 +572,7 @@ test("one process serves two root threads, each with its own inbox, registry and
   assert.equal((await peer.call("send_peer", { to: "claude:test", message: "the first saw the old process" }, thread)).structuredContent.reason, "not-running");
   assert.equal((await peer.call("send_peer", { to: "claude:test", message: "the second listed again" }, other)).structuredContent.status, "accepted");
   await peer.close();
-  assert.deepEqual([existsSync(f.registry), existsSync(otherRegistry), existsSync(firstSocket), existsSync(secondSocket)], [false, false, false, false]);
+  assert.deepEqual([existsSync(f.registry), existsSync(otherRegistry), existsSync(firstSocket), existsSync(secondSocket)], [true, true, false, false]);
 });
 
 test("exact routing: kind-elided exact names, never fragments; unclaimed names; stale and reused targets fail as not running", async (t) => {

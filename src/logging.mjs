@@ -34,7 +34,7 @@ const outcomes = new Set(["started", "succeeded", "failed", "success", "error", 
   "skipped", "closed", "accepted", "bound", "unbound", "native_only", "degraded", "receipt_unavailable", "unreachable",
   "delivered", "denied", "expired", "refused", "unconfirmed"]);
 const methods = new Set(["list_peers", "send_peer", "claim_name", "release_name", "close_session", "shutdown", "initialize", "initialized", "thread/loaded/list",
-  "thread/read", "turn/start", "thread/inject_items", "mcpServerStatus/list",
+  "thread/read", "thread/turns/list", "turn/start", "thread/inject_items", "mcpServerStatus/list",
   // The app-server's requests to clients (0.162.1), which agent-peers logs and never answers.
   "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval",
   "mcpServer/elicitation/request", "item/tool/requestUserInput", "applyPatchApproval", "execCommandApproval",

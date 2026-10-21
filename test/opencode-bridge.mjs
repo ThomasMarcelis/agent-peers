@@ -488,6 +488,9 @@ test("tool and handoff not-found mapping, ordinary target not-found, duplicates,
   const missing = await bridge.tool({ instance: "i-1", name: "list_peers", sessionID: "ses_root", args: {} });
   assert.equal(missing.isError, true);
   assert.equal(missing.structuredContent.reason, "no-session");
+  assert.deepEqual(missing.structuredContent.recentlyExited, []);
+  assert.equal(missing.structuredContent.namesNotRunning, 0);
+  assert.equal(Object.hasOwn(missing.structuredContent, "now"), false);
   host.add(session({ id: "ses_root", directory: join(f.dir, "repo"), updated: 1, idle: 1 }));
   await bridge.tool({ instance: "i-1", name: "list_peers", sessionID: "ses_root", args: {} });
   // A missing target peer stays the ordinary send result.
@@ -610,6 +613,20 @@ test("opencode names: claim, refresh, dead takeover, live refusal, cross-kind sc
   const dead = { kind: "opencode", owner: generation("opencode", "ses_dead"), generation: generation("opencode", "ses_dead", "old"),
     address: root.address, holder: { pid: 0x7ffffffe, procStart: "old", autoName: "opencode:dead-bbbbbb", threadId: "ses_dead", addresses: [root.address] } };
   assert.equal(claim("opencode:proj/dead", dead).status, "claimed");
+  const compact = await call("list_peers", {});
+  assert.match(compact.text, /\+1 reserved names not running/);
+  assert.doesNotMatch(compact.text, /opencode:proj\/dead/);
+  const expanded = await call("list_peers", { all_names: true });
+  assert.match(expanded.text, /opencode:proj\/dead  not running/);
+  assert.deepEqual(compact.structuredContent.names, expanded.structuredContent.names.filter((row) => row.running));
+  assert.equal(compact.structuredContent.namesNotRunning, 1);
+  assert.equal(expanded.structuredContent.names.find((row) => row.name === "opencode:proj/dead").running, false);
+  for (const all_names of [null, ""]) {
+    const padded = await call("list_peers", { all_names });
+    assert.deepEqual(padded.structuredContent.names, compact.structuredContent.names);
+    assert.equal(padded.structuredContent.namesNotRunning, 1);
+  }
+  assert.equal((await call("list_peers", { all_names: "true" })).structuredContent.reason, "invalid-request");
   assert.equal((await call("release_name", { name: "opencode:proj/dead" })).structuredContent.status, "released");
   // The bridge restart refresh: a record for the same owner with an old generation.
   const nameFile = join(f.peers, "names", `n-${(await import("node:crypto")).createHash("sha256").update("opencode:proj/restart").digest("hex").slice(0, 32)}.json`);

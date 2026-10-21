@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.0-rc.8 — 2026-10-21
+
+Eighth release candidate for 1.0.0, for the npm `next` tag. Headless Codex workers now show their runtime status in `list` and `list_peers`. A new one-way `agent-peers send` lets scripts post notices. Model-facing `list_peers` results are leaner. Peer frames are unchanged from rc.7. A shorter frame passed the framing trials, where each worker's brief allowed peer replies. It was withdrawn before release because, with no brief, it refused direct peer requests: in the live contract an idle Codex declined to answer in 3 of 4 runs, against 0 of 3 with the rc.7 frame. Each change went through independent review rounds before release ([verification](docs/release-verification.md#100-rc8)).
+
+### Added
+
+- **Experimental** Codex runtime observations in registry-backed listings: status and observation time, last activity, terminal turn outcome/time, and structured error classes including `http_409` and `server_overloaded`. Background, item-free app-server summaries cover headless workers and bound TUI roots without delaying inbox delivery. A separate `recentlyExited` array/section retains status-aware Codex sidecars last seen within 60 minutes and confirmed gone; exit detection time is explicit.
+- **Experimental** `agent-peers send <target> --stdin [--label <label>] [--json]`: one one-way notice from a script or detached job to a claimed name, peer name or address. Each call sends from its own temporary inbox beside the target's, open only for the receipt window and removed on exit or SIGINT/SIGTERM/SIGHUP, with `from-name` `script:<label>` and a footer saying replies to that address do nothing. The result adds `outcome` (`sent`, `retry`, `unreachable`, `uncertain`, `rejected`) and `reply: false`, with exit codes 0, 3, 4, 5 and 1 ([reference](docs/reference.md#script-sends)).
+- Paid, out-of-CI `test/frame-trials.mjs`: isolated Codex app-servers, Claude-format lead inboxes, busy/idle reply requests, brief-gated corrections and a false-approval injection. Prints builds and keeps raw evidence outside the repository, under `AGENT_PEERS_TRIALS_DIR` (default `~/.local/share/agent-peers/frame-trials`).
+
+### Changed
+
+- **Experimental tool-result change:** Codex/opencode `list_peers` structured results and Hermes JSON text now return running `names` plus `namesNotRunning` by default; `all_names: true` returns every reservation, while `null`/empty-string padding is treated as absent. Status-aware tool rows carry compact `statusText` using the CLI's wording, plus status, non-empty waiting flags and terminal outcome/error class. Tool results omit epoch timestamps (including names' `claimedAt`) and top-level `now`; registry and CLI `--json` remain complete. CLI `--all-names` expands its text listing. Durable name ownership/takeover rules are unchanged.
+- Status text distinguishes waiting on user input or approval, uses activity-based state durations and relative outcome ages, and shows observation age only when stale. Unknown turn outcomes suppress state durations; matching completion/outcome ages appear once. Recently exited sidecars show their last-seen age.
+
+### Fixed
+
+- Newer live status reads supersede older registry observations. Failed background turn reads explicitly report unknown outcome/source with an eight-second timeout; successful polls omit routine debug-log lines. Observation stops on proven registry takeover and recovers after transient registry-read failures; unrelated notifications skip registry reads. Retained closed inboxes cannot reappear as running peers after PID reuse. Empty runtime waiting flags are omitted everywhere, and structured Codex listing notes preserve the actual inbox/discovery failure.
+- A `write-timeout` result no longer says the message was not delivered. The line may still have arrived, as the reference already said; the text now says so and asks the sender to check with the recipient before sending again.
+
 ## 1.0.0-rc.7 — 2026-10-17
 
 Seventh release candidate for 1.0.0, for the npm `next` tag. Adds **experimental opencode 2.x support** through a thin v2 plugin and one shared stdio bridge per opencode server. Also makes discovery's native-route reason per-kind and adds opencode rows to Codex listing. There is no 1.0.0-rc.5, and 1.0.0-rc.6 was cut locally but never published; their changes are included here. Deterministic suites pass, and after an independent Opus and Codex review round a live smoke run plus a three-host run (Claude Code, Codex and opencode on `claude-haiku-5-5`, `gpt-6-luna` and `deepseek/deepseek-flash`) passed; no opencode steering rate is claimed.

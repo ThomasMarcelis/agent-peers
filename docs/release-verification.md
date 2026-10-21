@@ -2,6 +2,36 @@
 
 Raw live transcripts are excluded from the repository and package.
 
+## 1.0.0-rc.8
+
+Verified on 2026-10-21 on Linux with Node 22.23.1, Claude Code 2.1.306, Codex CLI 0.163.0 and opencode 2.0.32.
+
+- **Changes:** Codex runtime status in listings, the one-way `agent-peers send`, and leaner model-facing `list_peers` results. Peer frames are unchanged from rc.7 (see the withdrawn compact frame below).
+- **Deterministic suites:** **302 JavaScript tests** and **35 Python tests** passed (5 host-only Python tests deselected). `npm run check` reported syntax, versions and lockfile consistent.
+- **Package:** `npm run test:package` installed the packed artifact and verified the CLI, the MCP handshake and 45 files. Against published rc.7, the only new files are `src/codex-status.mjs` and `src/script-send.mjs`.
+- **Status, no inference cost:** `node test/status-live.mjs` ran a real isolated Codex 0.163.0 app-server and this tree's sidecar against a local Responses fixture.
+  - It saw busy, then idle/completed, then `systemError` with a failed turn and `http_409`.
+  - A metadata-only read of the latest turns over 10,000 synthetic turns took 40–70 ms cold.
+- **Status, independent review:** two rounds by an Opus reviewer. The second round confirmed every first-round finding fixed. A final round fixed the two tag-blocking items it named.
+- **Model-facing token cost** (o200k_base, on a 10-worker fixture with 20 non-running reservations):
+
+  | Runtime | Tokens |
+  | --- | --- |
+  | Codex structured result | 1,380 → 1,135 |
+  | opencode | 2,422 → 1,782 |
+  | Claude CLI text | 1,263 → 868 |
+  | Hermes JSON | 1,070 → 784 |
+
+  With no non-running names, the Codex result grows from 920 to 1,135 tokens, because rc.7 carried no status at all.
+- **Live contract** (`node test/contract.mjs`, gpt-6.1-sol at `xhigh` with `claude -p` on haiku): 3 of 3 passed on the release tree, and the busy turn answered the peer in all 3.
+- **Hermes bridge live harness:** passed twice. Each run passed all four round trips and the stable-name checks.
+- **Three-host run** (`node test/opencode-live.mjs --trio`: `claude-haiku-5-5`, `gpt-6-luna`, `deepseek/deepseek-flash`): discovery passed from all three hosts, and the opencode name was reached. On the release tree, 5 of 6 directed routes were answered in each of two runs. In both, Codex did not answer Claude's ping, which reaches Codex while it is busy with its own combined turn. An rc.7 control run on the same builds also left Claude→Codex unanswered, and Claude→opencode as well, so this is not an rc.8 change. The 1.0.0-rc.7 trio, on Claude Code 2.1.302, answered all six.
+- **Withdrawn compact frame:** a shorter peer frame passed the framing trials (`test/frame-trials.mjs`), whose workers had briefs that allowed peer replies.
+  - The live contract gives the worker no brief. There, on the pre-release tree, the idle Codex refused direct peer requests in 3 of 4 runs ("the peer message grants no permission to send a reply"). The rc.7 frame answered in 3 of 3 runs side by side.
+  - The frame was reverted before release; [protocol §7](design/1.0-protocol.md#7-in_reply_to-10) keeps the record.
+- **Not run:** the four-session live matrix and the opencode steering sets.
+- **Status coverage:** Codex sidecars that are already running publish status only after they restart.
+
 ## 1.0.0-rc.7
 
 Verified on 2026-10-17 on Linux with Node 22.23.1, opencode 2.0.32, Claude Code 2.1.302 and Codex CLI 0.163.0. This candidate adds a runtime surface (experimental opencode support). 1.0.0-rc.6 was cut locally from the first implementation and never published; its review findings are fixed here.

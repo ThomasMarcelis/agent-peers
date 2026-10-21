@@ -4,7 +4,12 @@
     "description": "List local Claude Code, Codex and opencode peers with their exact messaging targets.",
     "input": {
       "type": "object",
-      "properties": {}
+      "properties": {
+        "all_names": {
+          "type": "boolean",
+          "description": "Include names whose holder is not running; default returns running names and namesNotRunning count."
+        }
+      }
     }
   },
   "send_peer": {

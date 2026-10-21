@@ -6,7 +6,7 @@ The latest release receives security fixes. During 0.x development, fixes may re
 
 ## Trust boundary
 
-agent-peers connects processes owned by the same local OS user. Socket permissions exclude other users; a malicious process already running as you can impersonate another peer. Names and reply addresses are not authenticated identities, and delivery receipts carry no authentication either. A receipt counts only if it names the inbox the message was written to. That stops stray and misrouted receipts, not a same-user process that forges one.
+agent-peers connects processes owned by the same local OS user. Socket permissions exclude other users; a malicious process already running as you can impersonate another peer. Names and reply addresses are not authenticated identities, and delivery receipts carry no authentication either. A receipt counts only if it names the inbox the message was written to. That stops stray and misrouted receipts, not a same-user process that forges one. The `script:<label>` from-name of `agent-peers send` is attribution in the same sense: any same-user process can choose any label.
 
 Peer messages are conversation input, not user approval. The receiving agent's permissions and inbound policy remain authoritative. Plugin injection can trigger a model turn and, in a gateway, a response to the original external chat. Enable it only for profiles where you want this behavior.
 

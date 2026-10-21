@@ -7,18 +7,23 @@ import { lstatSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:
 import { basename, dirname, join } from "node:path";
 import { AppServer, daemonSocket } from "./app-server.mjs";
 import { bindDelayMs, bindReporter } from "./bind-retry.mjs";
+import { CodexStatus, RECENT_EXIT_MS, statusFields } from "./codex-status.mjs";
 import { Admission, checkSocketPath, closeInbox, listenInbox, ownsSocket } from "./inbox.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
 import { claim, claimsOf } from "./names.mjs";
 import { VERSION } from "./version.mjs";
 import {
   address, codexPeers, ensurePrivateDir, generation, isSafePeerRecord, peerSocket, peersHome, processStart, readPeerRecord,
-  recordRunning, slug, socketDir, socketDirectories, validThreadId,
+  recordRunning, slug, socketDir, socketDirectories, validPid, validThreadId,
 } from "./wire.mjs";
 
 export { ownsSocket };
 const log = (event, fields = {}) => logEvent("codex-peer", event, fields);
-export const app = new AppServer();
+export const app = new AppServer((message) => statusObserver.notification(message), { onDisconnect: () => statusObserver.unavailable() });
+// Status reads have their own bounded connection: a failed/oversized metadata response cannot
+// close the connection carrying delivery RPCs or consume its pending-request allowance.
+const statusApp = new AppServer(undefined, { handshakeTimeoutMs: 1000, connectTimeoutMs: 1000, quietReads: true,
+  onDisconnect: () => statusObserver.unavailable() });
 
 const INBOXES_MAX = 16, ROOTS_MAX = 8, CONNECTION_MAX = 32;
 const START = processStart(process.pid);
@@ -27,6 +32,23 @@ const replaced = () => new Error("this inbox was replaced; restart this MCP conn
 // root threadId -> { threadId, rootId, name, subagent: false, registry, token, socket, address, identity, inboxes, ... }
 export const roots = new Map();
 export const isCurrent = (root) => roots.get(root?.threadId) === root;
+const statusObserver = new CodexStatus(statusApp, (id, data) => {
+  const root = roots.get(id);
+  if (!root) return;
+  root.statusData = data;
+  if (root.statusWrite) return;
+  root.statusWrite = setImmediate(() => {
+    root.statusWrite = undefined;
+    if (!isCurrent(root)) return;
+    const owned = ownsRegistry(root);
+    if (owned === false) statusObserver.forget(root.threadId);
+    if (owned !== true) return;
+    try { publishRegistry(root); } catch { /* Status storage cannot stop inbox delivery. */ }
+  });
+}, { owns: (id) => {
+  const root = roots.get(id);
+  return root ? ownsRegistry(root) : false;
+} });
 let handler = () => {};
 export const onInboxLine = (fn) => { handler = fn; };
 
@@ -84,6 +106,7 @@ async function bindNow(meta) {
   roots.set(threadId, root);
   try { publishRegistry(root); }
   catch (error) { unbind(root); throw error; }
+  statusObserver.watch(threadId, t);
   // At once: the registry now names this process, so the thread's names count as stopped until
   // they name it too, and another thread could take one over meanwhile.
   refreshClaims(root);
@@ -239,6 +262,9 @@ function publishRegistry(root) {
       name: root.name, address: root.address, addresses: [...root.inboxes.values()].map((inbox) => inbox.address),
       cwd: root.cwd, threadId: root.threadId, pid: process.pid, ...(root.procStart ? { procStart: root.procStart } : {}),
       generation: root.generation, startedAt: root.startedAt, token: root.token,
+      ...statusFields(root.statusData),
+      ...(root.statusData?.statusObservedAt ? { statusRecordedAt: Date.now() } : {}),
+      ...(root.inboxClosedAt ? { inboxClosedAt: root.inboxClosedAt } : {}),
     }), { mode: 0o600, flag: "wx" });
     renameSync(temporary, root.registry);
   } finally { rmSync(temporary, { force: true }); }
@@ -247,9 +273,12 @@ function publishRegistry(root) {
 export function ownsRegistry(root) {
   try {
     const entry = readPeerRecord(root.registry);
+    // Ownership evidence does not depend on which socket directories discovery can see.
+    if (!validPid(entry.pid) || typeof entry.token !== "string" || !entry.token ||
+        !validThreadId(entry.threadId) || typeof entry.address !== "string" || !entry.address) return undefined;
     return entry.pid === process.pid && entry.token === root.token &&
       entry.threadId === root.threadId && entry.address === root.address;
-  } catch { return false; }
+  } catch { return undefined; } // Unknown: pause status writes, retain observation for recovery.
 }
 
 const setPrimary = (root, inbox) => Object.assign(root, { socket: inbox.socket, address: inbox.address, identity: inbox.identity });
@@ -335,17 +364,26 @@ export function inboxFor(root, directory) {
   return root.aliasBinding = root.aliasBinding.then(bindAlias, bindAlias);
 }
 
-function unbind(root) {
+function unbind(root, retain = false) {
   if (!isCurrent(root)) return;
+  statusObserver.forget(root.threadId);
   roots.delete(root.threadId);
   log("inbox.unbound", { threadId: logIdentity(root.threadId), outcome: "closed" });
   for (const inbox of root.inboxes.values()) void closeInbox(inbox);
   try {
-    if (readPeerRecord(root.registry).token === root.token) rmSync(root.registry, { force: true });
+    if (readPeerRecord(root.registry).token === root.token) {
+      // Retain bounded recent-exit evidence. This is inbox closure, not a worker exit time;
+      // listings must separately prove the sidecar process is gone.
+      if (retain && root.statusData?.statusObservedAt) { root.inboxClosedAt = Date.now(); publishRegistry(root); }
+      else rmSync(root.registry, { force: true });
+    }
   } catch {}
   root.admission.clear();
 }
-export const unbindAll = () => { for (const root of [...roots.values()]) unbind(root); };
+export const unbindAll = () => {
+  for (const root of [...roots.values()]) unbind(root, true);
+  statusObserver.close(); statusApp.close();
+};
 
 // A hard-killed codex-peer leaves files behind. A record may only clean its own deterministic
 // inbox; a forged dead record must not remove some other peer's socket.
@@ -360,7 +398,9 @@ function dropDeadOwners() {
         const socket = peerSocket(addr);
         if (socket && basename(socket) === expected) rmSync(socket, { force: true });
       }
-      rmSync(join(peersHome(), f), { force: true });
+      if (!Number.isSafeInteger(entry.statusRecordedAt) || entry.statusRecordedAt > Date.now() || Date.now() - entry.statusRecordedAt > RECENT_EXIT_MS) {
+        rmSync(join(peersHome(), f), { force: true });
+      }
     } catch {}
   }
 }

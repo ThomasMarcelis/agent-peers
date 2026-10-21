@@ -8,7 +8,7 @@ import { once } from "node:events";
 import { join } from "node:path";
 import { test } from "node:test";
 import { MAX_LINE, address, alive, ancestorPids, inDiscoveryScope, whoami, claudeSessions, codexPeers, ensurePrivateDir, generation,
-  messageLine, nameLabel, peerSocket, post, processStart, readLines, recordRunning, socketDir, socketPath, stalePeers } from "../src/wire.mjs";
+  messageLine, nameLabel, peerSocket, post, processStart, readLines, recentlyExitedCodex, recordRunning, socketDir, socketPath, stalePeers } from "../src/wire.mjs";
 import { closeServer, listen } from "./listeners.mjs";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -98,6 +98,35 @@ test("registry records reject process groups, malformed identities, untrusted pa
   assert.deepEqual(codexPeers(), []);
   writeFileSync(join(f.claude, "sessions", "1.json"), JSON.stringify({ pid: process.pid, messagingSocketPath: join(f.sockets, "forged.sock") }));
   assert.equal(claudeSessions().length, 1);
+});
+
+test("registry status is additive; recent exits are bounded, confirmed and separate from routing", (t) => {
+  const f = fixture(t), now = Date.now();
+  const base = { pid: process.pid, name: "codex:test", threadId: "test", address: address(join(f.sockets, "codex-test.sock")) };
+  const path = join(f.peers, "codex-test.json");
+  writeFileSync(path, JSON.stringify(base));
+  assert.equal(codexPeers()[0].statusObservedAt, undefined);
+  assert.deepEqual(recentlyExitedCodex(now), []);
+  const status = { status: "idle", statusObservedAt: now, statusSource: "thread/read", statusRecordedAt: now - 1000,
+    lastTurn: { id: "turn", status: "failed", observedAt: now, completedAt: now - 2000, source: "thread/turns/list", errorClass: "server_overloaded" } };
+  writeFileSync(path, JSON.stringify({ ...base, ...status }));
+  assert.equal(codexPeers()[0].lastTurn.errorClass, "server_overloaded");
+  assert.deepEqual(recentlyExitedCodex(now), [], "a running process is never classified as exited");
+  writeFileSync(path, JSON.stringify({ ...base, ...status, inboxClosedAt: now }));
+  assert.deepEqual(codexPeers(), [], "a retained closed inbox cannot reappear, even with no process-start evidence");
+  assert.deepEqual(recentlyExitedCodex(now), [], "inbox closure alone does not prove process exit");
+  writeFileSync(path, JSON.stringify({ ...base, ...status, procStart: "different-process" }));
+  assert.deepEqual(codexPeers(), []);
+  const [exited] = recentlyExitedCodex(now);
+  assert.equal(exited.lastTurn.errorClass, "server_overloaded");
+  assert.equal(exited.exitObservedAt, now);
+  assert.equal(exited.lastSeenAt, now - 1000);
+  assert.equal(exited.address, undefined, "exited rows have no message route");
+  assert.deepEqual(recentlyExitedCodex(now + 60 * 60_000), []);
+  writeFileSync(path, JSON.stringify({ ...base, ...status, pid: 0x7fffffff }));
+  assert.equal(recentlyExitedCodex(now).length, 1, "a gone PID also proves exit");
+  writeFileSync(path, JSON.stringify({ ...base, ...status, procStart: "different-process", statusRecordedAt: now + 1000 }));
+  assert.deepEqual(recentlyExitedCodex(now), [], "future timestamps do not prove a recent exit");
 });
 
 test("framing applies the byte limit to each line, including its newline", () => {

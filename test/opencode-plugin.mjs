@@ -310,6 +310,11 @@ test("a send aborted before the request is written is a definite failure, and no
   assert.equal(result.metadata.structuredContent.reason, "bridge-unavailable");
   assert.match(result.content[0].text, /nothing was sent/);
   assert.equal(f.messages().some((message) => message.method === "tool"), false);
+  const listing = await f.ctx.tools.find((tool) => tool.name === "list_peers").execute({},
+    { sessionID: "ses_root", signal: controller.signal });
+  assert.deepEqual(listing.metadata.structuredContent.recentlyExited, []);
+  assert.equal(listing.metadata.structuredContent.namesNotRunning, 0);
+  assert.equal(Object.hasOwn(listing.metadata.structuredContent, "now"), false);
 });
 
 test("a send aborted after the request is written is unconfirmed/bridge-lost", async (t) => {

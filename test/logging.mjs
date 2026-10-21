@@ -47,6 +47,13 @@ test("logging and inspection are opt-in and read-only before the first event", (
   assert.equal(existsSync(dirname(config.location)), false);
 });
 
+test("turn-summary failures retain the app-server method in diagnostic logs", (t) => {
+  const dir = fixture(t);
+  process.env.AGENT_PEERS_LOG = join(dir, "events.jsonl");
+  logEvent("app-server", "rpc.request", { method: "thread/turns/list", outcome: "failed" });
+  assert.equal(JSON.parse(readFileSync(process.env.AGENT_PEERS_LOG, "utf8")).method, "thread/turns/list");
+});
+
 test("JSONL events exclude payloads and raw errors while retaining safe correlation", (t) => {
   const dir = fixture(t);
   process.env.AGENT_PEERS_LOG = join(dir, "events.jsonl");
