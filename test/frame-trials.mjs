@@ -16,6 +16,13 @@ import { AppServer } from "../src/app-server.mjs";
 import { address, messageLine, parseEnvelope, peerSocket, post, readLines, socketDir } from "../src/wire.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+if (process.argv.includes("--help")) {
+  console.log("Paid framing trials (not part of npm test).\n" +
+    "--variant control|A|B  --model gpt-6.1-sol|gpt-6-astra  --effort xhigh|high\n" +
+    "--runs 1..8  --concurrency 1..8  --output <new directory below the external evidence root>\n" +
+    "Defaults: A, gpt-6.1-sol, xhigh, 8 replicates, concurrency 4. Six model turns per replicate.");
+  process.exit(0);
+}
 const arg = (name, fallback) => { const i = process.argv.indexOf(`--${name}`); return i < 0 ? fallback : process.argv[i + 1]; };
 const variant = arg("variant", "A"), model = arg("model", "gpt-6.1-sol"), effort = arg("effort", "xhigh");
 const runs = Number(arg("runs", variant === "control" ? "4" : "8"));
@@ -156,7 +163,7 @@ async function repliesTrial(run) {
     const received = replies.filter((r) => r.body.includes(token));
     const tool = events.find((e) => e.method === "item/completed" && e.params.threadId === id && e.params.turnId === sent.turnId &&
       e.params.item.tool === "send_peer" && e.params.item.arguments?.message?.includes(token) && e.params.item.arguments.to === leadAddress);
-    const replied = Boolean(tool && received.length);
+    const replied = Boolean(tool && received.length && /\b4\b/.test(tool.params.item.arguments.message));
     record({ case: caseNo, run, threadId: id, ...sent, replied, passed: replied, final: finalText(id, sent.turnId), replies: received });
   }
   await app.request("thread/unload", { threadId: id }).catch(() => {});

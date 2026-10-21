@@ -15,7 +15,7 @@ const definitions = JSON.parse(readFileSync(join(root, "src", "peer-tool-definit
 const golden = JSON.parse(readFileSync(join(root, "test", "fixtures", "codex-tools.json"), "utf8"));
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 
-test("Codex's tools/list is unchanged from the rc.4 surface", async (t) => {
+test("Codex's tools/list matches the compact-frame contract", async (t) => {
   const client = new Client({ name: "tools-golden", version: "1.0.0" });
   t.after(() => client.close());
   await client.connect(new StdioClientTransport({

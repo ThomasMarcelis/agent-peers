@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import plugin, { BridgeClient, cachedNode, findNode, nodeCandidates, subscribeEvents } from "../opencode/server.mjs";
 import { VERSION } from "../src/version.mjs";
+import { peerInstructions } from "../src/frame.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const fakeBridge = join(root, "test", "opencode-fake-bridge.mjs");
@@ -103,7 +104,10 @@ test("setup registers the four definitions immediately, before the bridge, and e
   const f = await fixture(t);
   assert.deepEqual(f.ctx.tools.map((tool) => tool.name), ["list_peers", "send_peer", "claim_name", "release_name"]);
   for (const tool of f.ctx.tools) {
-    assert.deepEqual({ name: tool.name, description: tool.description, input: tool.input }, definitions[tool.name]);
+    assert.deepEqual({ name: tool.name, description: tool.description, input: tool.input }, {
+      ...definitions[tool.name],
+      description: definitions[tool.name].description + (tool.name === "send_peer" ? " " + peerInstructions : ""),
+    });
     assert.equal(typeof tool.execute, "function");
     // opencode 2.x offers only codemode:false tools to the model directly (core/src/tool.ts).
     assert.deepEqual(tool.options, { codemode: false });

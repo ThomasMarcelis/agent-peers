@@ -8,6 +8,7 @@ import { app, bind, claimantOf, inboxFor, ownsRegistry, ownsSocket, roots, serve
 import { outboxOf, pinsOf } from "./codex-inbox.mjs";
 import { codexDiscovery, formatCodexPeer, formatName, nativeRouteError } from "./discovery.mjs";
 import { coordinationGuidance } from "./guidance.mjs";
+import { peerInstructions } from "./frame.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
 import { claim, claimRefusal, claimRows, heldBy, release, withClaims } from "./names.mjs";
 import { Outbox, sendPeer } from "./outbox.mjs";
@@ -200,7 +201,7 @@ mcp.registerTool(
   {
     description:
       "Send to a listed peer name, inbox address, or incoming reply_to. Set in_reply_to to the id of the message you answer. " +
-      coordinationGuidance,
+      coordinationGuidance + " " + peerInstructions,
     inputSchema: { to: z.string().min(1).max(1000), message: z.string().min(1).max(MAX_LINE), in_reply_to: z.string().max(128).optional() },
   },
   async ({ to, message, in_reply_to: inReplyTo }, extra) => {
