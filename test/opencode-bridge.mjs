@@ -610,6 +610,13 @@ test("opencode names: claim, refresh, dead takeover, live refusal, cross-kind sc
   const dead = { kind: "opencode", owner: generation("opencode", "ses_dead"), generation: generation("opencode", "ses_dead", "old"),
     address: root.address, holder: { pid: 0x7ffffffe, procStart: "old", autoName: "opencode:dead-bbbbbb", threadId: "ses_dead", addresses: [root.address] } };
   assert.equal(claim("opencode:proj/dead", dead).status, "claimed");
+  const compact = await call("list_peers", {});
+  assert.match(compact.text, /\+1 reserved names not running/);
+  assert.doesNotMatch(compact.text, /opencode:proj\/dead/);
+  const expanded = await call("list_peers", { all_names: true });
+  assert.match(expanded.text, /opencode:proj\/dead  not running/);
+  assert.deepEqual(compact.structuredContent.names, expanded.structuredContent.names);
+  assert.equal((await call("list_peers", { all_names: "true" })).structuredContent.reason, "invalid-request");
   assert.equal((await call("release_name", { name: "opencode:proj/dead" })).structuredContent.status, "released");
   // The bridge restart refresh: a record for the same owner with an old generation.
   const nameFile = join(f.peers, "names", `n-${(await import("node:crypto")).createHash("sha256").update("opencode:proj/restart").digest("hex").slice(0, 32)}.json`);

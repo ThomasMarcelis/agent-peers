@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { codexDiscovery, formatCodexPeer, formatSessionPeer, nativeRouteError } from "../src/discovery.mjs";
+import { codexDiscovery, formatCodexPeer, formatExited, formatNames, formatPeerStatus, formatSessionPeer, nativeRouteError } from "../src/discovery.mjs";
 
 const self = { threadId: "root-a", rootId: "root-a", address: "uds:/tmp/root-a.sock" };
 const peer = (id) => ({ kind: "codex", name: `codex:${id}`, threadId: id, address: `uds:/tmp/${id}.sock`, cwd: "/work" });
@@ -132,4 +132,30 @@ test("only idle non-root agents advertise followup_task", () => {
   }
   assert.match(nativeRouteError("/root", rows), /does not start an idle turn for the root agent/);
   assert.doesNotMatch(nativeRouteError("/root", rows), /unsupported for subagents/);
+});
+
+test("list rows compactly show proven status, observation age and the last failed turn", () => {
+  const now = Date.parse("2026-10-21T14:14:00Z");
+  const p = { ...peer("worker"), status: "idle", statusObservedAt: now - 12 * 60_000, statusSource: "thread/status/changed",
+    lastTurn: { id: "turn", status: "failed", completedAt: now - 12 * 60_000, observedAt: now - 12 * 60_000,
+      source: "thread/turns/list", errorClass: "http_409" } };
+  assert.equal(formatPeerStatus(p, now), "idle · seen 12m ago · last turn failed 14:02Z (http_409)");
+  assert.match(formatSessionPeer(p), /last turn failed 14:02Z \(http_409\)/);
+  const [row] = codexDiscovery([p], [], self);
+  assert.deepEqual(row.lastTurn, p.lastTurn);
+  assert.match(formatCodexPeer(row), /last turn failed 14:02Z \(http_409\)/);
+  assert.equal(formatPeerStatus({ ...p, status: "active" }, now).split(" · ")[0], "busy");
+  assert.equal(formatPeerStatus(peer("legacy"), now), "");
+  assert.match(formatExited([{ ...p, exitObservedAt: now }]).join("\n"), /exit observed 14:14Z · last turn failed/);
+});
+
+test("names text hides only non-running holders, with an explicit all_names escape hatch", () => {
+  const names = [{ name: "codex:proj/live", running: true, address: "uds:/tmp/live.sock" },
+    { name: "codex:proj/reserved", running: false }];
+  const compact = formatNames(names, { sendPeer: true }).join("\n");
+  assert.match(compact, /codex:proj\/live/);
+  assert.match(compact, /\+1 reserved names not running/);
+  assert.doesNotMatch(compact, /codex:proj\/reserved/);
+  assert.match(formatNames(names, { allNames: true }).join("\n"), /codex:proj\/reserved  not running/);
+  assert.equal(names.length, 2, "formatting does not mutate durable reservations");
 });

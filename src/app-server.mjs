@@ -78,6 +78,7 @@ export class AppServer {
       connection.pending.clear();
       rejectReady(error);
       connection.ws?.terminate();
+      try { this.#options.onDisconnect?.(); } catch { /* Observation cannot break RPC cleanup. */ }
     };
     try {
       const ws = connection.ws = new WebSocket(`ws+unix://${daemonSocket()}:/`, {
@@ -130,11 +131,11 @@ export class AppServer {
     this.#connection?.fail(new Error("app-server client is closed"));
   }
 
-  async loadedThreads() {
+  async loadedThreads(timeoutMs) {
     const ids = [], cursors = new Set();
     let cursor;
     do {
-      const result = await this.request("thread/loaded/list", cursor ? { cursor } : {});
+      const result = await this.request("thread/loaded/list", cursor ? { cursor } : {}, timeoutMs);
       if (!result || !Array.isArray(result.data) || result.data.some((id) => typeof id !== "string")) {
         throw new Error("invalid app-server loaded-thread list");
       }
@@ -155,11 +156,19 @@ export class AppServer {
     return result.data;
   }
 
-  async readThread(threadId) {
-    const result = await this.request("thread/read", { threadId });
+  async readThread(threadId, timeoutMs) {
+    const result = await this.request("thread/read", { threadId }, timeoutMs);
     if (!result?.thread || typeof result.thread !== "object" || Array.isArray(result.thread)) {
       throw new Error("invalid app-server thread response");
     }
     return result.thread;
+  }
+
+  async latestTurns(threadId) {
+    const result = await this.request("thread/turns/list", {
+      threadId, limit: 2, sortDirection: "desc", itemsView: "notLoaded",
+    }, 1000);
+    if (!Array.isArray(result?.data) || result.data.length > 2) throw new Error("invalid app-server turn summaries");
+    return result.data;
   }
 }

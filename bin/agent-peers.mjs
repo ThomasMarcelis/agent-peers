@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { dirname } from "node:path";
-import { MAX_LINE, agentProcess, allPeers, ancestorPids, claudeSessionAt, exchange, inDiscoveryScope, probePeers, whoami } from "../src/wire.mjs";
-import { formatName, formatSessionPeer } from "../src/discovery.mjs";
+import { MAX_LINE, agentProcess, allPeers, ancestorPids, claudeSessionAt, exchange, inDiscoveryScope, probePeers, recentlyExitedCodex, whoami } from "../src/wire.mjs";
+import { formatExited, formatNames, formatSessionPeer } from "../src/discovery.mjs";
 import { SCOPE, claim, claimRefusal, claimRows, claudeClaimant, heldBy, parseName, release, withClaims } from "../src/names.mjs";
 import { resolveTarget } from "../src/outbox.mjs";
 import { EXIT, LABEL, scriptSend } from "../src/script-send.mjs";
@@ -12,7 +12,7 @@ const usage = `agent-peers ${VERSION} — local agent messaging
 
 Usage: agent-peers <command> [options]
 
-  list [--json] [--no-probe]  Discover running Claude Code, Codex and opencode inboxes and claimed names; rows that refuse connections are marked stale
+  list [--json] [--no-probe] [--all-names]  Discover running inboxes, runtime status and names; --all-names includes non-running reservations in text
   whoami [--json]   Print the calling session's name and address (found through process ancestry)
   claim <name> [--json]     Claim a stable name, claude:<scope>/<claim>, for the calling Claude session
   release <name> [--json]   Release a name this session holds, or one whose holder is not running
@@ -197,7 +197,7 @@ async function main() {
     runOpencodeBridge();
     return;
   }
-  const allowed = cmd === "list" ? ["--json", "--no-probe"] : ["doctor", "logs", "whoami"].includes(cmd) ? ["--json"] : [];
+  const allowed = cmd === "list" ? ["--json", "--no-probe", "--all-names"] : ["doctor", "logs", "whoami"].includes(cmd) ? ["--json"] : [];
   if (!["list", "doctor", "logs", "whoami"].includes(cmd) || args.length > allowed.length ||
       new Set(args).size !== args.length || args.some((a) => !allowed.includes(a))) {
     throw new SyntaxError("unknown command or option; run agent-peers --help");
@@ -240,14 +240,15 @@ async function main() {
     return;
   }
   const caller = claudeCaller().session;
-  const { found, names } = inDiscoveryScope(() => ({ found: withClaims(allPeers()), names: claimRows({ directory: caller && dirname(caller.socket) }) }));
+  const { found, names, recentlyExited } = inDiscoveryScope(() => ({ found: withClaims(allPeers()),
+    names: claimRows({ directory: caller && dirname(caller.socket) }), recentlyExited: recentlyExitedCodex() }));
   const peers = args.includes("--no-probe") ? found : await probePeers(found);
-  if (args.includes("--json")) console.log(JSON.stringify({ peers, names }, null, 2));
+  if (args.includes("--json")) console.log(JSON.stringify({ peers, names, recentlyExited }, null, 2));
   else {
     if (!peers.length) console.log("No peer inboxes found. A Codex session opens its inbox a few seconds after it starts; if one is missing, call list_peers in it.");
     for (const peer of peers) console.log(formatSessionPeer(peer));
     if (peers.length) console.log("Codex native reachability depends on your session; call list_peers there for native targets.");
-    if (names.length) console.log(`Claimed names:\n${names.map((row) => `  ${formatName(row)}`).join("\n")}`);
+    for (const line of [...formatNames(names, { allNames: args.includes("--all-names") }), ...formatExited(recentlyExited)]) console.log(line);
   }
 }
 

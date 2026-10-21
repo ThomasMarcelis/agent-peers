@@ -4,6 +4,7 @@
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { AppServer } from "./app-server.mjs";
+import { observeStatus, statusFields } from "./codex-status.mjs";
 import { Admission, Receipts, checkSocketPath, closeInbox, listenInbox, readMessage } from "./inbox.mjs";
 import { errorFields, logEvent, logIdentity } from "./logging.mjs";
 import { SCOPE, claim, claimAt, claimRefusal, claimRows, claimsOf, heldBy, holds, parseName, release, withClaims } from "./names.mjs";
@@ -11,7 +12,7 @@ import { Outbox, Pins, sendPeer } from "./outbox.mjs";
 import { SendFailure, isError, nameResolvedStatusLine, readNameResolved } from "./status.mjs";
 import {
   MAX_LINE, address, allPeers, claudeSessions, existingSocket, generation, inDiscoveryScope, peerSocket, processStart, socketDir,
-  socketDirectories,
+  socketDirectories, recentlyExitedCodex,
 } from "./wire.mjs";
 
 const QUEUE_MAX = 50, TOTAL_QUEUE_MAX = 200, SOURCES_MAX = 256, SESSIONS_MAX = 256, HANDOFFS_MAX = 256, CONTACTS_MAX = 256,
@@ -310,8 +311,11 @@ export class HermesBridge {
       peers: rows.map((p) => ({
         name: p.name, kind: p.kind, cwd: p.cwd ?? null,
         status: live.get(p.threadId)?.status?.type ?? p.status ?? null, address: p.address, generation: p.generation, claims: p.claims,
+        ...statusFields(p),
+        ...(!p.statusObservedAt && live.has(p.threadId)
+          ? observeStatus({}, live.get(p.threadId).status, "thread/read", Date.now()) : {}),
       })),
-      names,
+      names, recentlyExited: recentlyExitedCodex(),
       ...(note ? { note } : {}),
     };
   }

@@ -4,7 +4,12 @@
     "description": "List local Claude Code and Codex peers, including your native Codex agents, with reachability and exact messaging targets.",
     "inputSchema": {
       "type": "object",
-      "properties": {},
+      "properties": {
+        "all_names": {
+          "type": "boolean",
+          "description": "Show reservations whose holder is not running in text; JSON always includes every name."
+        }
+      },
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "annotations": {

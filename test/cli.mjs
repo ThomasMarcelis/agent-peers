@@ -46,7 +46,7 @@ test("empty discovery and doctor are structured and do not create state", () => 
       AGENT_PEERS_CODEX_APP_SERVER: join(home, "missing.sock") };
     const listing = run(["list", "--json"], env);
     assert.equal(listing.status, 0, listing.stderr);
-    assert.deepEqual(JSON.parse(listing.stdout), { peers: [], names: [] });
+    assert.deepEqual(JSON.parse(listing.stdout), { peers: [], names: [], recentlyExited: [] });
     for (const args of [["resolve", "claude:x/y"], ["release", "x/y"]]) assert.equal(run(args, env).status, 1);
     const result = run(["doctor", "--json"], env);
     assert.equal(result.status, 0, result.stderr);
@@ -54,6 +54,29 @@ test("empty discovery and doctor are structured and do not create state", () => 
     assert.equal(report.ok, true);
     assert.equal(report.checks.find((c) => c.name === "codex daemon").status, "warning");
     assert.deepEqual(readdirSync(home), []);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("CLI keeps recent exited status-aware sidecars separate from peers and routing", () => {
+  const home = mkdtempSync(join(tmpdir(), "ap-cli-exit-")), now = Date.now();
+  const peers = join(home, "peers"), sockets = join(home, "cc-socks");
+  for (const path of [peers, sockets]) mkdirSync(path, { mode: 0o700 });
+  const env = { AGENT_PEERS_HOME: peers, CLAUDE_CONFIG_DIR: join(home, "claude"), XDG_RUNTIME_DIR: home };
+  try {
+    writeFileSync(join(peers, "codex-exited.json"), JSON.stringify({ pid: 0x7ffffffe, name: "codex:exited", threadId: "exited",
+      address: `uds:${join(sockets, "codex-exited.sock")}`, status: "systemError", statusSource: "thread/read",
+      statusObservedAt: now - 1000, statusRecordedAt: now - 1000,
+      lastTurn: { id: "turn", status: "failed", source: "thread/turns/list", observedAt: now - 2000,
+        completedAt: now - 2000, errorClass: "server_overloaded" } }));
+    const listed = JSON.parse(run(["list", "--json"], env).stdout);
+    assert.deepEqual(listed.peers, []);
+    assert.equal(listed.recentlyExited.length, 1);
+    assert.equal(listed.recentlyExited[0].lastTurn.errorClass, "server_overloaded");
+    assert.equal(listed.recentlyExited[0].address, undefined);
+    const text = run(["list"], env).stdout;
+    assert.match(text, /Recently exited Codex sidecars/);
+    assert.match(text, /codex:exited  exit observed .*last turn failed .*\(server_overloaded\)/);
+    assert.equal(JSON.parse(run(["resolve", "codex:exited", "--json"], env).stdout).reason, "not-running");
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
@@ -239,7 +262,9 @@ test("a dead claim stays listed as not running, and anyone may release it", asyn
     // The shell has exited, so the claim's holder is not running.
     const listed = JSON.parse(run(["list", "--json"], session.env).stdout);
     assert.deepEqual(listed.names.map((row) => [row.name, row.running, row.address, row.holder]), [["claude:proj/lead", false, null, null]]);
-    assert.match(run(["list"], session.env).stdout, /claude:proj\/lead  not running/);
+    assert.match(run(["list"], session.env).stdout, /\+1 reserved names not running/);
+    assert.doesNotMatch(run(["list"], session.env).stdout, /claude:proj\/lead/);
+    assert.match(run(["list", "--all-names"], session.env).stdout, /claude:proj\/lead  not running/);
     const resolved = run(["resolve", "claude:proj/lead"], session.env);
     assert.equal(resolved.status, 1);
     assert.match(resolved.stderr, /is claimed by claude:lead, a Claude session that is no longer running/);

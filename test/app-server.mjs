@@ -98,6 +98,15 @@ test("discovery rejects malformed data and repeated pagination cursors", async (
   await assert.rejects(f.app.readThread("a"), /invalid app-server thread/);
 });
 
+test("turn status reads request only the latest two turns with no items", async (t) => {
+  const f = await fixture(t, (ws, message) => {
+    if (message.method === "initialize") reply(ws, message, {});
+    else if (message.method === "thread/turns/list") reply(ws, message, { data: [{ id: "last", status: "failed" }] });
+  });
+  assert.deepEqual(await f.app.latestTurns("root"), [{ id: "last", status: "failed" }]);
+  assert.deepEqual(f.calls.at(-1).params, { threadId: "root", limit: 2, sortDirection: "desc", itemsView: "notLoaded" });
+});
+
 test("a JSON-RPC request from the server reaches the notification callback and cannot settle a pending call", async (t) => {
   const seen = [];
   let request;

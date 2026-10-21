@@ -20,10 +20,10 @@ import {
 } from "./names.mjs";
 import { Outbox, Pins, sendPeer } from "./outbox.mjs";
 import { SendFailure, isError, sendResult } from "./status.mjs";
-import { codexDiscovery, formatCodexPeer, formatName } from "./discovery.mjs";
+import { codexDiscovery, formatCodexPeer, formatExited, formatNames } from "./discovery.mjs";
 import {
   allPeers, address, ensurePrivateDir, generation, inDiscoveryScope, peerSocket, peersHome,
-  processStart, readPeerFile, readPeerRecord, recordRunning, socketDir, validSessionId,
+  processStart, readPeerFile, readPeerRecord, recordRunning, recentlyExitedCodex, socketDir, validSessionId,
 } from "./wire.mjs";
 import { VERSION } from "./version.mjs";
 
@@ -109,7 +109,7 @@ function sessionInfo(value, expectedID) {
 const registryPath = (sessionID) => join(peersHome(), `opencode-${sessionID}.json`);
 
 // A minimal JSON Schema check for the definitions in src/peer-tool-definitions.json: the four
-// tool inputs are flat objects of bounded strings. Unknown arguments are refused.
+// tool inputs are flat objects of bounded strings and optional booleans. Unknown arguments are refused.
 export function validateToolArgs(definition, args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return "arguments must be an object";
   const input = definition.input ?? {}, properties = input.properties ?? {};
@@ -119,6 +119,7 @@ export function validateToolArgs(definition, args) {
     const value = args[key];
     if (value === undefined) continue;
     if (schema.type === "string" && typeof value !== "string") return `${key} must be a string`;
+    if (schema.type === "boolean" && typeof value !== "boolean") return `${key} must be a boolean`;
     if (typeof value !== "string") continue;
     if (schema.minLength !== undefined && value.length < schema.minLength) return `${key} must be at least ${schema.minLength} characters`;
     if (schema.maxLength !== undefined && value.length > schema.maxLength) return `${key} must be at most ${schema.maxLength} characters`;
@@ -188,7 +189,7 @@ export class OpencodeBridge {
       const invalid = validateToolArgs(this.#definitions[name], args);
       if (invalid) throw new BridgeError("invalid-request", invalid);
       const caller = await this.#resolve(instance, sessionID);
-      if (name === "list_peers") return await this.#list(caller);
+      if (name === "list_peers") return await this.#list(caller, args.all_names);
       if (name === "send_peer") return await this.#sendPeer(caller, args);
       return this.#claimRequest(caller, name, args.name);
     } catch (error) {
@@ -759,24 +760,24 @@ export class OpencodeBridge {
     return { text: message, structuredContent: { status: "failed", reason: publicReason, text: message, peers: [], self: null, names: [] }, isError: true };
   }
 
-  async #list({ session, root, subagent, name }) {
+  async #list({ session, root, subagent, name }, allNames = false) {
     const self = {
       name, kind: "opencode", address: root.address, addresses: [root.address], generation: root.generation,
       threadId: root.sessionID, sessionID: session.id, subagent: subagent, claims: heldBy("opencode", root.generation),
     };
-    const { peers, names } = inDiscoveryScope(() => ({
+    const { peers, names, recentlyExited } = inDiscoveryScope(() => ({
       // Same caller-relative discovery and row shape as Codex: native/bridge fields, self excluded.
       peers: codexDiscovery(withClaims(allPeers()), [], { ...self, rootId: root.sessionID }),
-      names: claimRows(),
+      names: claimRows(), recentlyExited: recentlyExitedCodex(),
     }));
     root.pins.noteRows(peers);
     const lines = [`You are ${name}.`];
     for (const peer of peers) lines.push(formatCodexPeer(peer));
     if (!peers.length) lines.push("No other agents found.");
-    if (names.length) lines.push("Claimed names:", ...names.map((row) => `  ${formatName(row, { sendPeer: true })}`));
+    lines.push(...formatNames(names, { allNames, sendPeer: true }), ...formatExited(recentlyExited));
     return {
       text: lines.join("\n"), isError: false,
-      structuredContent: { peers, self, names },
+      structuredContent: { peers, self, names, recentlyExited },
     };
   }
 

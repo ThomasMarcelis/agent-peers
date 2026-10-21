@@ -4,7 +4,9 @@
     "description": "List local Claude Code, Codex and opencode peers with their exact messaging targets.",
     "input": {
       "type": "object",
-      "properties": {}
+      "properties": {
+        "all_names": { "type": "boolean", "description": "Show reservations whose holder is not running in text; JSON always includes every name." }
+      }
     }
   },
   "send_peer": {

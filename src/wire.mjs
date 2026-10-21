@@ -12,6 +12,7 @@ import { connect } from "node:net";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { errorFields, logEvent } from "./logging.mjs";
+import { RECENT_EXIT_MS, statusFields } from "./codex-status.mjs";
 
 export const TAG = "cross-session-message";
 export const MAX_LINE = 1_000_000;
@@ -329,9 +330,21 @@ function codexRecordScan() {
 
 const codexRow = (p) => ({ kind: "codex", name: p.name, address: p.address, socket: peerSocket(p.address), cwd: p.cwd,
   threadId: p.threadId, pid: p.pid, startedAt: p.startedAt, generation: generation("codex", p.threadId, p.procStart),
-  addresses: Array.isArray(p.addresses) ? p.addresses.slice(0, 16).filter((addr) => peerSocket(addr)) : [p.address] });
+  addresses: Array.isArray(p.addresses) ? p.addresses.slice(0, 16).filter((addr) => peerSocket(addr)) : [p.address],
+  ...statusFields(p) });
 
 export const codexPeers = () => inDiscoveryScope(() => codexRecordScan().filter((p) => p.running).map(codexRow));
+
+// A process observed alive when it wrote a status record within the last hour is proven to
+// have exited within that hour if its PID is now gone or reused. The exact exit time is unknown.
+// This separate view has no inbox routes and is never consulted by send/name resolution.
+export const recentlyExitedCodex = (now = Date.now()) => inDiscoveryScope(() => codexRecordScan().flatMap((p) => {
+  if (p.running || !Number.isSafeInteger(p.statusRecordedAt) || p.statusRecordedAt > now ||
+      now - p.statusRecordedAt > RECENT_EXIT_MS || !statusFields(p).statusObservedAt) return [];
+  return [{ name: p.name, kind: "codex", threadId: p.threadId, cwd: p.cwd,
+    ...statusFields(p), lastSeenAt: p.statusRecordedAt, exitObservedAt: now, exitBasis: "pid-gone-or-reused",
+    ...(Number.isSafeInteger(p.inboxClosedAt) && p.inboxClosedAt > 0 ? { inboxClosedAt: p.inboxClosedAt } : {}) }];
+}));
 
 // An opencode registry record is written by the one bridge child that serves the root session.
 // The record is the exclusive bind seat (opencode-bridge.mjs): a live bridge record means another
