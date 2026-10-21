@@ -29,7 +29,7 @@ The pinned Hermes host is reproducible in CI. It is a fork dependency, not a cla
 
 Upstream Hermes was inspected at [`5d3c05977bb3c8b7cfd6b3e39d96f6e35a9e0662`](https://github.com/NousResearch/hermes-agent/commit/5d3c05977bb3c8b7cfd6b3e39d96f6e35a9e0662). Its public `inject_message` API cannot atomically pin a late reply to the original conversation across reset and compression. Gateway and TUI injection queue busy-session input rather than steering it. The plugin therefore rejects sends on that host instead of weakening its routing contract.
 
-The experimental `status` field now also accepts `unknown` for loss of runtime observation; consumers must tolerate this enum value. Experimental tool listings (Codex, opencode and Hermes) now default to running names with `namesNotRunning`; `all_names: true` restores all reservations. CLI `--json` retains its complete names/evidence contract. Codex 0.163.0 passes only `structuredContent` to its model, so tool status uses a slim projection with top-level `now`; opencode reads both text blocks and Hermes reads JSON text.
+The experimental `status` field now also accepts `unknown` for loss of runtime observation; consumers must tolerate this enum value. Experimental tool listings (Codex, opencode and Hermes) now default to running names with `namesNotRunning`; `all_names: true` restores all reservations. CLI `--json` retains its complete names/evidence contract. Codex 0.163.0 passes only `structuredContent` to its model, so tool rows use compact `statusText` plus status, non-empty waiting flags and terminal outcome/error class. Tool listings omit epoch timestamps and top-level `now`; opencode reads both text blocks and Hermes reads JSON text.
 
 ## What to expect
 
